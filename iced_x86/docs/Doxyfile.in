@@ -1,0 +1,35 @@
+PROJECT_NAME           = "icedcpp"
+PROJECT_NUMBER         = "@PROJECT_VERSION@"
+OUTPUT_DIRECTORY       = "@CMAKE_CURRENT_BINARY_DIR@/out"
+CREATE_SUBDIRS         = NO
+
+INPUT                  = "@CMAKE_SOURCE_DIR@/include/iced_x86" "@CMAKE_SOURCE_DIR@/src/iced_x86/src" "@CMAKE_SOURCE_DIR@/examples" "@CMAKE_SOURCE_DIR@/README.md" "@CMAKE_SOURCE_DIR@/docs/mainpage.md"
+FILE_PATTERNS          = *.hpp *.cpp
+RECURSIVE              = YES
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = NO
+EXTRACT_STATIC         = YES
+JAVADOC_AUTOBRIEF      = YES
+MULTILINE_CPP_IS_BRIEF = YES
+USE_MDFILE_AS_MAINPAGE = "@CMAKE_SOURCE_DIR@/docs/mainpage.md"
+MARKDOWN_SUPPORT       = YES
+
+WARN_LOGFILE           = "@CMAKE_CURRENT_BINARY_DIR@/doxygen-warnings.log"
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = NO
+WARN_AS_ERROR          = NO
+
+HAVE_DOT               = @ICEDCPP_DOXYGEN_HAVE_DOT@
+CALL_GRAPH             = NO
+CALLER_GRAPH           = NO
+
+GENERATE_HTML          = YES
+HTML_OUTPUT            = html
+HTML_DYNAMIC_MENUS     = YES
+
+GENERATE_LATEX         = NO
+GENERATE_XML           = YES
+XML_OUTPUT             = xml
+
+WARN_IF_UNDOCUMENTED   = NO
+QUIET                  = YES
