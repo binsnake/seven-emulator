@@ -64,10 +64,10 @@ ExecutionResult handle_code_DIV_RM64(ExecutionContext& ctx) {
   }
   const auto low = detail::read_register(ctx.state, iced_x86::Register::RAX);
   const auto high = detail::read_register(ctx.state, iced_x86::Register::RDX);
-  const boost::multiprecision::uint128_t dividend =
-      (static_cast<boost::multiprecision::uint128_t>(high) << 64u) | static_cast<boost::multiprecision::uint128_t>(low);
-  const boost::multiprecision::uint128_t quotient = dividend / static_cast<boost::multiprecision::uint128_t>(divisor);
-  const boost::multiprecision::uint128_t remainder = dividend % static_cast<boost::multiprecision::uint128_t>(divisor);
+  const math::wide_integer::uint128_t dividend =
+      (static_cast<math::wide_integer::uint128_t>(high) << 64u) | static_cast<math::wide_integer::uint128_t>(low);
+  const math::wide_integer::uint128_t quotient = dividend / static_cast<math::wide_integer::uint128_t>(divisor);
+  const math::wide_integer::uint128_t remainder = dividend % static_cast<math::wide_integer::uint128_t>(divisor);
   if (quotient > std::numeric_limits<std::uint64_t>::max()) {
     return detail::divide_fault(ctx);
   }

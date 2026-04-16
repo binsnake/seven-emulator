@@ -54,8 +54,8 @@ ExecutionResult handle_code_MUL_RM64(ExecutionContext& ctx) {
     return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
   }
   const auto lhs = detail::read_register(ctx.state, iced_x86::Register::RAX);
-  const boost::multiprecision::uint128_t product =
-      static_cast<boost::multiprecision::uint128_t>(lhs) * static_cast<boost::multiprecision::uint128_t>(rhs);
+  const math::wide_integer::uint128_t product =
+      static_cast<math::wide_integer::uint128_t>(lhs) * static_cast<math::wide_integer::uint128_t>(rhs);
   const auto low = static_cast<std::uint64_t>(product);
   const auto high = static_cast<std::uint64_t>(product >> 64u);
   detail::write_register(ctx.state, iced_x86::Register::RAX, low, 8);

@@ -73,13 +73,13 @@ ExecutionResult handle_code_IDIV_RM64(ExecutionContext& ctx) {
   const auto low = detail::read_register(ctx.state, iced_x86::Register::RAX);
   const auto high = detail::read_register(ctx.state, iced_x86::Register::RDX);
   const auto dividend =
-      (static_cast<boost::multiprecision::int128_t>(static_cast<std::int64_t>(high)) << 64u) |
-      static_cast<boost::multiprecision::int128_t>(low);
+      (static_cast<math::wide_integer::int128_t>(static_cast<std::int64_t>(high)) << 64u) |
+      static_cast<math::wide_integer::int128_t>(low);
   const auto rhs = static_cast<std::int64_t>(divisor);
-  const auto quotient = dividend / static_cast<boost::multiprecision::int128_t>(rhs);
-  const auto remainder = dividend % static_cast<boost::multiprecision::int128_t>(rhs);
-  if (quotient < static_cast<boost::multiprecision::int128_t>(std::numeric_limits<std::int64_t>::min()) ||
-      quotient > static_cast<boost::multiprecision::int128_t>(std::numeric_limits<std::int64_t>::max())) {
+  const auto quotient = dividend / static_cast<math::wide_integer::int128_t>(rhs);
+  const auto remainder = dividend % static_cast<math::wide_integer::int128_t>(rhs);
+  if (quotient < static_cast<math::wide_integer::int128_t>(std::numeric_limits<std::int64_t>::min()) ||
+      quotient > static_cast<math::wide_integer::int128_t>(std::numeric_limits<std::int64_t>::max())) {
     return detail::divide_fault(ctx);
   }
   detail::write_register(ctx.state, iced_x86::Register::RAX, static_cast<std::uint64_t>(static_cast<std::int64_t>(quotient)), 8);

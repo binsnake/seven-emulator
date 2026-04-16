@@ -6,7 +6,6 @@
 #include <limits>
 #include <type_traits>
 
-#include <boost/multiprecision/cpp_int.hpp>
 #include <iced_x86/memory_size_info.hpp>
 
 #include "seven/handler_helpers.hpp"

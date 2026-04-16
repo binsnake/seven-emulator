@@ -16,6 +16,7 @@
 
 #include "seven/compat.hpp"
 #include "mini_test_framework.hpp"
+#include "uint_wide.h"
 
 namespace {
 
@@ -210,7 +211,7 @@ std::uint64_t mulx_low(std::uint64_t lhs, std::uint64_t rhs, std::size_t bits) {
   const unsigned __int128 product = static_cast<unsigned __int128>(lhs) * static_cast<unsigned __int128>(rhs);
   return static_cast<std::uint64_t>(product);
 #else
-  const auto product = boost::multiprecision::uint128_t(lhs) * boost::multiprecision::uint128_t(rhs);
+  const auto product = math::wide_integer::uint128_t(lhs) * math::wide_integer::uint128_t(rhs);
   return static_cast<std::uint64_t>(product);
 #endif
 }
@@ -228,7 +229,7 @@ std::uint64_t mulx_high(std::uint64_t lhs, std::uint64_t rhs, std::size_t bits) 
   const unsigned __int128 product = static_cast<unsigned __int128>(lhs) * static_cast<unsigned __int128>(rhs);
   return static_cast<std::uint64_t>(product >> 64);
 #else
-  const auto product = boost::multiprecision::uint128_t(lhs) * boost::multiprecision::uint128_t(rhs);
+  const auto product = math::wide_integer::uint128_t(lhs) * math::wide_integer::uint128_t(rhs);
   return static_cast<std::uint64_t>(product >> 64);
 #endif
 }

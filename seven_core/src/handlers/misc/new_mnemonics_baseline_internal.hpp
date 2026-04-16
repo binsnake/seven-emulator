@@ -2,14 +2,13 @@
 
 #include "seven/handler_helpers.hpp"
 #include <bit>
-#include <boost/multiprecision/cpp_int.hpp>
 #include <iced_x86/register.hpp>
 
 namespace seven::handlers {
 
 namespace {
-using boost::multiprecision::int128_t;
-using boost::multiprecision::uint128_t;
+using math::wide_integer::int128_t;
+using math::wide_integer::uint128_t;
 
 constexpr std::uint64_t width_mask(std::size_t width) {
   return width >= 8 ? ~0ull : ((1ull << (width * 8)) - 1ull);

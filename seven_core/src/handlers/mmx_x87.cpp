@@ -3,8 +3,6 @@
 #include <cmath>
 #include <cstring>
 
-#include <boost/multiprecision/cpp_int.hpp>
-
 #include "seven/handler_helpers.hpp"
 #include "seven/x87_helpers.hpp"
 
@@ -61,9 +59,9 @@ ExecutionResult validate_memory_span(ExecutionContext& ctx, std::uint64_t base, 
 std::uint64_t read_mmx(CpuState& state, iced_x86::Register reg);
 
 ExecutionResult pmovmskb(ExecutionContext& ctx, std::size_t src_bytes, bool use_mmx, std::size_t dst_bytes) {
-  boost::multiprecision::cpp_int src = 0;
+  SimdUint src = 0;
   if (use_mmx) {
-    src = boost::multiprecision::cpp_int(read_mmx(ctx.state, ctx.instr.op_register(1)));
+    src = SimdUint(read_mmx(ctx.state, ctx.instr.op_register(1)));
   } else {
     const auto src_reg = ctx.instr.op_register(1);
     src = ctx.state.vectors[vector_index(src_reg)].value;
@@ -71,8 +69,7 @@ ExecutionResult pmovmskb(ExecutionContext& ctx, std::size_t src_bytes, bool use_
 
   std::uint64_t mask = 0;
   for (std::size_t i = 0; i < src_bytes; ++i) {
-    const boost::multiprecision::cpp_int bit = (src >> ((i * 8) + 7)) & 1;
-    const std::uint64_t msb = (bit == 0) ? 0u : 1u;
+    const std::uint64_t msb = ((src >> ((i * 8) + 7)) & SimdUint(1)) != SimdUint(0) ? 1u : 0u;
     mask |= (msb << i);
   }
 

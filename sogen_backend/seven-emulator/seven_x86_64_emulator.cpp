@@ -17,7 +17,7 @@
 #include <utility>
 #include <vector>
 
-#include <boost/multiprecision/cpp_int.hpp>
+#include "uint_wide.h"
 
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
 #include <intrin.h>
@@ -645,11 +645,11 @@ class seven_x86_64_emulator final : public x86_64_emulator {
     size_t vec_width{};
     if (try_vector_index_width(r, vec_index, vec_width)) {
       std::array<uint8_t, 64> bytes{};
-      boost::multiprecision::export_bits(state_.vectors[vec_index].value, bytes.begin(), 8, false);
+      math::wide_integer::export_bits(state_.vectors[vec_index].value, bytes.begin(), 8, false);
       const auto write_size = std::min(size, vec_width);
       std::memcpy(bytes.data(), value, write_size);
       seven::SimdUint out{};
-      boost::multiprecision::import_bits(out, bytes.begin(), bytes.end(), 8, false);
+      math::wide_integer::import_bits(out, bytes.begin(), bytes.end(), 8, false);
       state_.vectors[vec_index].value = out;
       return write_size;
     }
@@ -749,7 +749,7 @@ class seven_x86_64_emulator final : public x86_64_emulator {
         size_t vec_width{};
         if (try_vector_index_width(r, vec_index, vec_width)) {
           std::array<uint8_t, 64> bytes{};
-          boost::multiprecision::export_bits(state_.vectors[vec_index].value, bytes.begin(), 8, false);
+          math::wide_integer::export_bits(state_.vectors[vec_index].value, bytes.begin(), 8, false);
           const auto read_size = std::min(size, vec_width);
           std::memcpy(value, bytes.data(), read_size);
           return read_size;
@@ -1080,7 +1080,7 @@ class seven_x86_64_emulator final : public x86_64_emulator {
     for (const auto& v : state_.vectors) {
       std::array<uint8_t, 64> bytes{};
       auto vv = v.value;
-      boost::multiprecision::export_bits(vv, bytes.begin(), 8, false);
+      math::wide_integer::export_bits(vv, bytes.begin(), 8, false);
       s.write(bytes.data(), bytes.size());
     }
 
@@ -1132,7 +1132,7 @@ class seven_x86_64_emulator final : public x86_64_emulator {
       std::array<uint8_t, 64> bytes{};
       d.read(bytes.data(), bytes.size());
       seven::SimdUint out{};
-      boost::multiprecision::import_bits(out, bytes.begin(), bytes.end(), 8, false);
+      math::wide_integer::import_bits(out, bytes.begin(), bytes.end(), 8, false);
       v.value = out;
     }
   }

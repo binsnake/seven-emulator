@@ -82,8 +82,8 @@ ExecutionResult handle_code_IMUL_R64_RM64(ExecutionContext& ctx) {
   if (!rhs_ok) {
     return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
   }
-  const auto product = static_cast<boost::multiprecision::int128_t>(static_cast<std::int64_t>(lhs)) *
-                       static_cast<boost::multiprecision::int128_t>(static_cast<std::int64_t>(rhs));
+  const auto product = static_cast<math::wide_integer::int128_t>(static_cast<std::int64_t>(lhs)) *
+                       static_cast<math::wide_integer::int128_t>(static_cast<std::int64_t>(rhs));
   const auto overflow = imul_overflow<std::int64_t>(product);
   detail::write_register(ctx.state, ctx.instr.op_register(0), static_cast<std::uint64_t>(static_cast<std::int64_t>(product)), 8);
   detail::set_multiply_flags(ctx.state, static_cast<std::uint64_t>(static_cast<std::int64_t>(product)), 8, overflow);
@@ -91,11 +91,11 @@ ExecutionResult handle_code_IMUL_R64_RM64(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_IMUL_R64_RM64_IMM32(ExecutionContext& ctx) {
-  return imul_reg_rm_imm<std::int64_t, boost::multiprecision::int128_t>(ctx, 8, 4);
+  return imul_reg_rm_imm<std::int64_t, math::wide_integer::int128_t>(ctx, 8, 4);
 }
 
 ExecutionResult handle_code_IMUL_R64_RM64_IMM8(ExecutionContext& ctx) {
-  return imul_reg_rm_imm<std::int64_t, boost::multiprecision::int128_t>(ctx, 8, 1);
+  return imul_reg_rm_imm<std::int64_t, math::wide_integer::int128_t>(ctx, 8, 1);
 }
 
 ExecutionResult handle_code_IMUL_RM8(ExecutionContext& ctx) {
@@ -152,8 +152,8 @@ ExecutionResult handle_code_IMUL_RM64(ExecutionContext& ctx) {
     return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
   }
   const auto lhs = detail::read_register(ctx.state, iced_x86::Register::RAX);
-  const auto product = static_cast<boost::multiprecision::int128_t>(static_cast<std::int64_t>(lhs)) *
-                       static_cast<boost::multiprecision::int128_t>(static_cast<std::int64_t>(rhs));
+  const auto product = static_cast<math::wide_integer::int128_t>(static_cast<std::int64_t>(lhs)) *
+                       static_cast<math::wide_integer::int128_t>(static_cast<std::int64_t>(rhs));
   detail::write_register(ctx.state, iced_x86::Register::RAX,
                          static_cast<std::uint64_t>(static_cast<std::int64_t>(product)), 8);
   detail::write_register(ctx.state, iced_x86::Register::RDX,

@@ -1,7 +1,5 @@
 #include <array>
 
-#include <boost/multiprecision/cpp_int.hpp>
-
 #include "seven/handler_helpers.hpp"
 
 namespace seven::handlers {

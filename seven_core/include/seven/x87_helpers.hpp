@@ -7,8 +7,6 @@
 #include <cstring>
 #include <limits>
 
-#include <boost/multiprecision/cpp_int.hpp>
-
 #include "seven/handler_helpers.hpp"
 #include "seven/x87_encoding.hpp"
 

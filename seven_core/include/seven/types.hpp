@@ -8,9 +8,9 @@
 #include <unordered_map>
 #include <utility>
 
-#include <boost/multiprecision/cpp_int.hpp>
 #include <boost/multiprecision/cpp_bin_float.hpp>
 #include <iced_x86/code.hpp>
+#include "uint_wide.h"
 
 namespace seven {
 
@@ -25,11 +25,11 @@ using X87Scalar = boost::multiprecision::cpp_bin_float_50;
 #endif
 
 #if SEVEN_VECTOR_BITS == 128
-using SimdUint = boost::multiprecision::uint128_t;
+using SimdUint = math::wide_integer::uint128_t;
 #elif SEVEN_VECTOR_BITS == 256
-using SimdUint = boost::multiprecision::uint256_t;
+using SimdUint = math::wide_integer::uint256_t;
 #elif SEVEN_VECTOR_BITS == 512
-using SimdUint = boost::multiprecision::uint512_t;
+using SimdUint = math::wide_integer::uint512_t;
 #else
 #error "SEVEN_VECTOR_BITS must be one of 128, 256, or 512"
 #endif

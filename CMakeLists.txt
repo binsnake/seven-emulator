@@ -71,7 +71,7 @@ set(SEVEN_BOOST_FULL_INCLUDE_DIR "")
 
 foreach(_dir IN LISTS BOOST_HINT_DIRS)
   if(EXISTS "${_dir}/boost/config.hpp")
-    if(EXISTS "${_dir}/boost/multiprecision/cpp_int.hpp")
+    if(EXISTS "${_dir}/boost/multiprecision/cpp_bin_float.hpp")
       set(SEVEN_BOOST_MULTIPRECISION_INCLUDE_DIR "${_dir}")
       set(SEVEN_BOOST_FULL_INCLUDE_DIR "${_dir}")
       break()
@@ -81,13 +81,13 @@ endforeach()
 
 if (NOT SEVEN_BOOST_MULTIPRECISION_INCLUDE_DIR)
   find_path(SEVEN_BOOST_MULTIPRECISION_INCLUDE_DIR
-    NAMES "boost/multiprecision/cpp_int.hpp"
+    NAMES "boost/multiprecision/cpp_bin_float.hpp"
     PATHS ${BOOST_MULTIPRECISION_HINT_DIRS}
   )
 endif()
 
 if (NOT SEVEN_BOOST_MULTIPRECISION_INCLUDE_DIR)
-  message(FATAL_ERROR "Could not locate boost/multiprecision headers. Set BOOST_ROOT to an installation that contains boost/multiprecision.")
+  message(FATAL_ERROR "Could not locate boost/multiprecision/cpp_bin_float.hpp. Set BOOST_ROOT to an installation that contains boost/multiprecision.")
 endif()
 
 if (NOT SEVEN_BOOST_FULL_INCLUDE_DIR AND
@@ -95,7 +95,7 @@ if (NOT SEVEN_BOOST_FULL_INCLUDE_DIR AND
   message(WARNING "Using standalone boost multiprecision headers: ${SEVEN_BOOST_MULTIPRECISION_INCLUDE_DIR}. Define BOOST_INCLUDE_DIR for full Boost.Config headers to avoid this.")
 endif()
 
-message(STATUS "Using boost multiprecision headers from: ${SEVEN_BOOST_MULTIPRECISION_INCLUDE_DIR}")
+message(STATUS "Using boost/multiprecision/cpp_bin_float.hpp from: ${SEVEN_BOOST_MULTIPRECISION_INCLUDE_DIR}")
 
 if(MSVC)
   add_compile_options(/permissive- /EHsc /Zc:__cplusplus /W4 /wd5311 /FS)
@@ -159,6 +159,7 @@ file(GLOB_RECURSE SEVEN_CORE_SOURCES CONFIGURE_DEPENDS
 
 add_library(seven_core STATIC ${SEVEN_CORE_SOURCES})
 target_include_directories(seven_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/seven_core/include")
+target_include_directories(seven_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_include_directories(seven_core PUBLIC "${SEVEN_BOOST_MULTIPRECISION_INCLUDE_DIR}")
 target_link_libraries(seven_core PUBLIC iced_x86)
 target_compile_definitions(seven_core PUBLIC
@@ -198,6 +199,7 @@ add_library(seven_core_bmi2 STATIC
   tests/kubera_bmi2_executor.cpp
 )
 target_include_directories(seven_core_bmi2 PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/seven_core/include")
+target_include_directories(seven_core_bmi2 PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_include_directories(seven_core_bmi2 PUBLIC "${SEVEN_BOOST_MULTIPRECISION_INCLUDE_DIR}")
 target_link_libraries(seven_core_bmi2 PUBLIC iced_x86)
 target_compile_definitions(seven_core_bmi2 PUBLIC
