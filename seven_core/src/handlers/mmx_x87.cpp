@@ -185,7 +185,7 @@ ExecutionResult load_x87_env(ExecutionContext& ctx, std::uint64_t base) {
 
 void write_fxsave_st(ExecutionContext& ctx, std::uint64_t base, std::size_t phys, X87Scalar value) {
   std::array<std::uint8_t, 16> raw{};
-  std::memcpy(raw.data(), &value, std::min(sizeof(value), raw.size()));
+  x87_encoding::encode_ext80(value, raw.data());
   const auto slot = base + 32 + (phys * 16);
   for (std::size_t i = 0; i < raw.size(); ++i) {
     ctx.memory.write(slot + i, &raw[i], 1);
@@ -198,9 +198,7 @@ X87Scalar read_fxsave_st(ExecutionContext& ctx, std::uint64_t base, std::size_t 
   for (std::size_t i = 0; i < raw.size(); ++i) {
     ctx.memory.read(slot + i, &raw[i], 1);
   }
-  X87Scalar value = 0;
-  std::memcpy(&value, raw.data(), std::min(sizeof(value), raw.size()));
-  return value;
+  return x87_encoding::decode_ext80(raw.data());
 }
 
 void write_fpu_state(ExecutionContext& ctx, std::uint64_t base, std::size_t offset) {
@@ -412,14 +410,14 @@ ExecutionResult handle_code_FCHS(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_FABS(ExecutionContext& ctx) {
-  return x87_unary_st0(ctx, [](X87Scalar v) { return boost::multiprecision::abs(v); });
+  return x87_unary_st0(ctx, [](X87Scalar v) { return seven::abs(v); });
 }
 
 ExecutionResult handle_code_FSQRT(ExecutionContext& ctx) {
   if (ctx.state.x87_is_empty(0)) return x87_stack_underflow(ctx);
   const X87Scalar value = ctx.state.x87_get(0);
   if (value < 0) return x87_exception(ctx, kX87ExceptionInvalid);
-  const X87Scalar result = boost::multiprecision::sqrt(value);
+  const X87Scalar result = seven::sqrt(value);
   if (value != 0 && result == 0) {
     auto r = x87_exception(ctx, static_cast<std::uint16_t>(kX87ExceptionUnderflow | kX87ExceptionPrecision));
     if (!r.ok()) return r;
@@ -448,7 +446,7 @@ ExecutionResult handle_code_FRNDINT(ExecutionContext& ctx) {
 ExecutionResult handle_code_FSIN(ExecutionContext& ctx) {
   if (ctx.state.x87_is_empty(0)) return x87_stack_underflow(ctx);
   const X87Scalar value = ctx.state.x87_get(0);
-  const X87Scalar result = boost::multiprecision::sin(value);
+  const X87Scalar result = seven::sin(value);
   if (value != 0 && result == 0) {
     auto r = x87_exception(ctx, static_cast<std::uint16_t>(kX87ExceptionUnderflow | kX87ExceptionPrecision));
     if (!r.ok()) return r;
@@ -464,7 +462,7 @@ ExecutionResult handle_code_FSIN(ExecutionContext& ctx) {
 ExecutionResult handle_code_FCOS(ExecutionContext& ctx) {
   if (ctx.state.x87_is_empty(0)) return x87_stack_underflow(ctx);
   const X87Scalar value = ctx.state.x87_get(0);
-  const X87Scalar result = boost::multiprecision::cos(value);
+  const X87Scalar result = seven::cos(value);
   if (value != 0 && result == 0) {
     auto r = x87_exception(ctx, static_cast<std::uint16_t>(kX87ExceptionUnderflow | kX87ExceptionPrecision));
     if (!r.ok()) return r;
@@ -480,8 +478,8 @@ ExecutionResult handle_code_FCOS(ExecutionContext& ctx) {
 ExecutionResult handle_code_FSINCOS(ExecutionContext& ctx) {
   if (ctx.state.x87_is_empty(0)) return x87_stack_underflow(ctx);
   const X87Scalar x = ctx.state.x87_get(0);
-  const X87Scalar cosine = boost::multiprecision::cos(x);
-  const X87Scalar sine = boost::multiprecision::sin(x);
+  const X87Scalar cosine = seven::cos(x);
+  const X87Scalar sine = seven::sin(x);
   if (x != 0 && (cosine == 0 || sine == 0)) {
     auto r = x87_exception(ctx, static_cast<std::uint16_t>(kX87ExceptionUnderflow | kX87ExceptionPrecision));
     if (!r.ok()) return r;
@@ -498,7 +496,7 @@ ExecutionResult handle_code_FSINCOS(ExecutionContext& ctx) {
 ExecutionResult handle_code_FPTAN(ExecutionContext& ctx) {
   if (ctx.state.x87_is_empty(0)) return x87_stack_underflow(ctx);
   const X87Scalar value = ctx.state.x87_get(0);
-  const X87Scalar result = boost::multiprecision::tan(value);
+  const X87Scalar result = seven::tan(value);
   if (value != 0 && result == 0) {
     auto r = x87_exception(ctx, static_cast<std::uint16_t>(kX87ExceptionUnderflow | kX87ExceptionPrecision));
     if (!r.ok()) return r;
@@ -516,7 +514,7 @@ ExecutionResult handle_code_FPATAN(ExecutionContext& ctx) {
   if (ctx.state.x87_is_empty(0) || ctx.state.x87_is_empty(1)) return x87_stack_underflow(ctx);
   const X87Scalar y = ctx.state.x87_get(1);
   const X87Scalar x = ctx.state.x87_get(0);
-  ctx.state.x87_set(1, boost::multiprecision::atan2(y, x));
+  ctx.state.x87_set(1, seven::atan2(y, x));
   if (!ctx.state.x87_pop()) return x87_stack_underflow(ctx);
   return {};
 }
@@ -525,7 +523,7 @@ ExecutionResult handle_code_F2XM1(ExecutionContext& ctx) {
   if (ctx.state.x87_is_empty(0)) return x87_stack_underflow(ctx);
   const X87Scalar value = ctx.state.x87_get(0);
   if (value < -1 || value > 1) return x87_exception(ctx, kX87ExceptionInvalid);
-  const X87Scalar result = boost::multiprecision::pow(2, value) - 1;
+  const X87Scalar result = seven::pow(X87Scalar(2), value) - X87Scalar(1);
   if (value != 0 && result == 0) {
     auto r = x87_exception(ctx, static_cast<std::uint16_t>(kX87ExceptionUnderflow | kX87ExceptionPrecision));
     if (!r.ok()) return r;
@@ -543,7 +541,7 @@ ExecutionResult handle_code_FYL2X(ExecutionContext& ctx) {
   const X87Scalar y = ctx.state.x87_get(1);
   const X87Scalar x = ctx.state.x87_get(0);
   if (x <= 0) return x87_exception(ctx, kX87ExceptionInvalid);
-  const X87Scalar result = y * boost::multiprecision::log2(x);
+  const X87Scalar result = y * seven::log2(x);
   if (y != 0 && result == 0) {
     auto r = x87_exception(ctx, static_cast<std::uint16_t>(kX87ExceptionUnderflow | kX87ExceptionPrecision));
     if (!r.ok()) return r;
@@ -562,7 +560,7 @@ ExecutionResult handle_code_FYL2XP1(ExecutionContext& ctx) {
   const X87Scalar y = ctx.state.x87_get(1);
   const X87Scalar x = ctx.state.x87_get(0);
   if (x <= -1) return x87_exception(ctx, kX87ExceptionInvalid);
-  const X87Scalar result = y * boost::multiprecision::log2(x + 1);
+  const X87Scalar result = y * seven::log2(x + 1);
   if (y != 0 && result == 0) {
     auto r = x87_exception(ctx, static_cast<std::uint16_t>(kX87ExceptionUnderflow | kX87ExceptionPrecision));
     if (!r.ok()) return r;
@@ -580,7 +578,7 @@ ExecutionResult handle_code_FSCALE(ExecutionContext& ctx) {
   if (ctx.state.x87_is_empty(0) || ctx.state.x87_is_empty(1)) return x87_stack_underflow(ctx);
   const X87Scalar a = ctx.state.x87_get(0);
   const X87Scalar b = ctx.state.x87_get(1);
-  const X87Scalar result = boost::multiprecision::ldexp(a, static_cast<int>(boost::multiprecision::trunc(b)));
+  const X87Scalar result = seven::ldexp(a, static_cast<int>(seven::trunc(b)));
   if (a != 0 && result == 0) {
     auto r = x87_exception(ctx, static_cast<std::uint16_t>(kX87ExceptionUnderflow | kX87ExceptionPrecision));
     if (!r.ok()) return r;

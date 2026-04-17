@@ -44,7 +44,7 @@ std::size_t vector_width(iced_x86::Register reg) {
 }
 
 big_uint mask(std::size_t width) {
-  if (width >= kZmmWidth) return ~big_uint(0);
+  if (width >= kZmmWidth) { big_uint _all_ones(0); return ~_all_ones; }
   return (big_uint(1) << (width * 8)) - 1;
 }
 
@@ -72,7 +72,7 @@ big_uint read_vec(CpuState& state, iced_x86::Register reg) {
 
 void write_vec(CpuState& state, iced_x86::Register reg, big_uint value, std::size_t width, bool zero_upper) {
   auto& slot = state.vectors[vector_index(reg)].value;
-  const auto m = mask(width);
+  auto m = mask(width);
   if (zero_upper) {
     slot = value & m;
   } else {
@@ -159,7 +159,7 @@ ExecutionResult merge_high_move(ExecutionContext& ctx, std::uint32_t dst, std::u
   if (!ok) return detail::memory_fault(ctx, detail::memory_address(ctx));
   const auto dst_reg = ctx.instr.op_register(dst);
   const auto merge_value = read_vec(ctx.state, ctx.instr.op_register(merge));
-  const auto shifted = mask(width) << (width * 8);
+  auto shifted = mask(width) << (width * 8);
   const auto updated = (merge_value & ~shifted) | ((value << (width * 8)) & shifted);
   write_vec(ctx.state, dst_reg, updated, vector_width(dst_reg), zero_upper);
   return {};

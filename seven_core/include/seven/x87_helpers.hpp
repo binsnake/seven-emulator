@@ -284,7 +284,7 @@ inline ExecutionResult x87_store_to_memory(ExecutionContext& ctx, std::size_t wi
 inline ExecutionResult x87_store_integer(ExecutionContext& ctx, std::size_t width, bool pop, bool truncate_only) {
   if (ctx.state.x87_is_empty(0)) return x87_stack_underflow(ctx);
   const auto value = ctx.state.x87_get(0);
-  const auto rounded = truncate_only ? boost::multiprecision::trunc(value) : x87_round_to_control(ctx.state, value);
+  const auto rounded = truncate_only ? seven::trunc(value) : x87_round_to_control(ctx.state, value);
   std::uint16_t exceptions = 0;
   if (rounded != value) {
     exceptions |= kX87ExceptionPrecision;
@@ -304,7 +304,7 @@ inline ExecutionResult x87_store_integer(ExecutionContext& ctx, std::size_t widt
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   X87Scalar stored = rounded;
-  if (boost::multiprecision::isnan(rounded) || boost::multiprecision::isinf(rounded) || rounded < lower || rounded > upper) {
+  if (seven::isnan(rounded) || seven::isinf(rounded) || rounded < lower || rounded > upper) {
     exceptions |= kX87ExceptionInvalid;
     stored = lower;
   }
@@ -351,21 +351,21 @@ inline ExecutionResult x87_load_integer(ExecutionContext& ctx, std::size_t width
 }
 
 inline X87Scalar x87_round_half_even(X87Scalar value) {
-  const X87Scalar flo = boost::multiprecision::floor(value);
+  const X87Scalar flo = seven::floor(value);
   const X87Scalar frac = value - flo;
   const X87Scalar half = X87Scalar(0.5);
   if (frac < half) return flo;
   if (frac > half) return flo + 1;
-  const X87Scalar parity = boost::multiprecision::fmod(boost::multiprecision::abs(flo), 2);
+  const X87Scalar parity = seven::fmod(seven::abs(flo), X87Scalar(2));
   return parity == 0 ? flo : flo + 1;
 }
 
 inline X87Scalar x87_round_to_control(const CpuState& state, X87Scalar value) {
   switch ((state.get_x87_control_word() >> 10) & 0x3u) {
     case 0: return x87_round_half_even(value);
-    case 1: return boost::multiprecision::floor(value);
-    case 2: return boost::multiprecision::ceil(value);
-    default: return boost::multiprecision::trunc(value);
+    case 1: return seven::floor(value);
+    case 2: return seven::ceil(value);
+    default: return seven::trunc(value);
   }
 }
 
@@ -382,7 +382,7 @@ inline ExecutionResult x87_reg_move(ExecutionContext& ctx, std::uint32_t dst, st
 }
 
 inline int x87_cmp(X87Scalar a, X87Scalar b, bool quiet, std::uint16_t& exceptions) {
-  if (boost::multiprecision::isnan(a) || boost::multiprecision::isnan(b)) {
+  if (seven::isnan(a) || seven::isnan(b)) {
     if (!quiet) {
       exceptions |= kX87ExceptionInvalid;
     }
@@ -577,16 +577,16 @@ inline std::uint16_t x87_fxam_class_bits(const X87Scalar& value, bool empty) {
   if (empty) {
     return static_cast<std::uint16_t>(0x4100u);
   }
-  if (boost::multiprecision::isnan(value)) {
+  if (seven::isnan(value)) {
     return static_cast<std::uint16_t>(0x0100u);
   }
-  if (boost::multiprecision::isinf(value)) {
+  if (seven::isinf(value)) {
     return static_cast<std::uint16_t>(0x0500u);
   }
   if (value == 0) {
     return static_cast<std::uint16_t>(0x4000u);
   }
-  const X87Scalar abs_value = boost::multiprecision::abs(value);
+  const X87Scalar abs_value = seven::abs(value);
   const X87Scalar min_normal = std::numeric_limits<X87Scalar>::min();
   if (abs_value < min_normal) {
     return static_cast<std::uint16_t>(0x4400u);
@@ -600,25 +600,25 @@ inline bool x87_exceptions_masked(const CpuState& state, std::uint16_t exception
 
 inline std::uint16_t x87_classify_result(const X87Scalar& result, const X87Scalar& lhs, const X87Scalar& rhs) {
   std::uint16_t exceptions = 0;
-  if (boost::multiprecision::isnan(result)) {
+  if (seven::isnan(result)) {
     exceptions |= kX87ExceptionInvalid;
   }
-  if (boost::multiprecision::isinf(result)) {
+  if (seven::isinf(result)) {
     exceptions |= kX87ExceptionOverflow;
   }
-  const X87Scalar abs_result = boost::multiprecision::abs(result);
+  const X87Scalar abs_result = seven::abs(result);
   const X87Scalar min_normal = std::numeric_limits<X87Scalar>::min();
   if (result != 0 && abs_result < min_normal) {
     exceptions |= kX87ExceptionUnderflow;
   }
-  if ((lhs != 0 && boost::multiprecision::abs(lhs) < min_normal) || (rhs != 0 && boost::multiprecision::abs(rhs) < min_normal) || (result != 0 && abs_result < min_normal)) {
+  if ((lhs != 0 && seven::abs(lhs) < min_normal) || (rhs != 0 && seven::abs(rhs) < min_normal) || (result != 0 && abs_result < min_normal)) {
     exceptions |= kX87ExceptionDenormal;
   }
   return exceptions;
 }
 
 inline std::uint16_t x87_precision_from_binary(const X87Scalar& lhs, const X87Scalar& rhs, const X87Scalar& result) {
-  if (boost::multiprecision::isnan(result) || boost::multiprecision::isinf(result)) {
+  if (seven::isnan(result) || seven::isinf(result)) {
     return 0;
   }
   const bool add_exact = (result - lhs == rhs) || (result - rhs == lhs);
@@ -674,7 +674,7 @@ inline void x87_set_fxam_flags(ExecutionContext& ctx, const X87Scalar& value, bo
   auto sw = ctx.state.get_x87_status_word();
   sw &= static_cast<std::uint16_t>(~0x4700u);
   sw |= x87_fxam_class_bits(value, empty);
-  if (boost::multiprecision::signbit(value)) {
+  if (seven::signbit(value)) {
     sw |= static_cast<std::uint16_t>(0x0200u);
   }
   ctx.state.set_x87_status_word(sw);

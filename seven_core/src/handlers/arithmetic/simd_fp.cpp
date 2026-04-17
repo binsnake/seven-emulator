@@ -55,7 +55,7 @@ std::size_t vector_width(iced_x86::Register reg) {
 }
 
 big_uint mask(std::size_t bytes) {
-  if (bytes >= sizeof(big_uint)) return ~big_uint(0);
+  if (bytes >= sizeof(big_uint)) { big_uint _all_ones(0); return ~_all_ones; }
   return (big_uint(1) << (bytes * 8)) - 1;
 }
 
@@ -65,7 +65,7 @@ big_uint read_vec(const CpuState& state, iced_x86::Register reg) {
 
 void write_vec(CpuState& state, iced_x86::Register reg, big_uint value, bool zero_upper = false) {
   auto& slot = state.vectors[xmm_index(reg)].value;
-  const auto m = mask(vector_width(reg));
+  auto m = mask(vector_width(reg));
   if (zero_upper) {
     slot = value & m;
   } else {
@@ -390,7 +390,7 @@ ExecutionResult packed_logic(ExecutionContext& ctx, std::uint32_t lhs_index, std
   }
   bool ok = false;
   const auto dst_reg = ctx.instr.op_register(0);
-  const auto lhs = read_operand(ctx, lhs_index, vector_width(dst_reg), &ok);
+  auto lhs = read_operand(ctx, lhs_index, vector_width(dst_reg), &ok);
   if (!ok) return detail::memory_fault(ctx, detail::memory_address(ctx));
   const auto rhs = read_operand(ctx, rhs_index, vector_width(dst_reg), &ok);
   if (!ok) return detail::memory_fault(ctx, detail::memory_address(ctx));

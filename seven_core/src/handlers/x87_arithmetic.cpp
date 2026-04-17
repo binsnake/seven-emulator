@@ -18,7 +18,7 @@ inline std::pair<X87Scalar, std::uint16_t> x87_div_pair(X87Scalar lhs, X87Scalar
       return {std::numeric_limits<X87Scalar>::quiet_NaN(), kX87ExceptionInvalid};
     }
     const X87Scalar inf = std::numeric_limits<X87Scalar>::infinity();
-    const bool negative = boost::multiprecision::signbit(dividend) ^ boost::multiprecision::signbit(divisor);
+    const bool negative = seven::signbit(dividend) ^ seven::signbit(divisor);
     return {negative ? -inf : inf, kX87ExceptionZeroDiv};
   }
   const X87Scalar value = reverse ? rhs / lhs : lhs / rhs;
@@ -108,8 +108,8 @@ ExecutionResult handle_code_FIDIV_M16INT(ExecutionContext& ctx) { return x87_bin
 ExecutionResult handle_code_FIDIV_M32INT(ExecutionContext& ctx) { return x87_binary_mem_int_st0_with_status(ctx, 4, [](X87Scalar a, X87Scalar b) { return x87_div_pair(a, b, false); }); }
 ExecutionResult handle_code_FIDIVR_M16INT(ExecutionContext& ctx) { return x87_binary_mem_int_st0_with_status(ctx, 2, [](X87Scalar a, X87Scalar b) { return x87_div_pair(a, b, true); }); }
 ExecutionResult handle_code_FIDIVR_M32INT(ExecutionContext& ctx) { return x87_binary_mem_int_st0_with_status(ctx, 4, [](X87Scalar a, X87Scalar b) { return x87_div_pair(a, b, true); }); }
-ExecutionResult handle_code_FPREM(ExecutionContext& ctx) { return x87_binary_st_regs(ctx, 0, 1, [](X87Scalar a, X87Scalar b) { return boost::multiprecision::fmod(a, b); }); }
-ExecutionResult handle_code_FPREM1(ExecutionContext& ctx) { return x87_binary_st_regs(ctx, 0, 1, [](X87Scalar a, X87Scalar b) { return boost::multiprecision::remainder(a, b); }); }
+ExecutionResult handle_code_FPREM(ExecutionContext& ctx) { return x87_binary_st_regs(ctx, 0, 1, [](X87Scalar a, X87Scalar b) { return seven::fmod(a, b); }); }
+ExecutionResult handle_code_FPREM1(ExecutionContext& ctx) { return x87_binary_st_regs(ctx, 0, 1, [](X87Scalar a, X87Scalar b) { return seven::remainder(a, b); }); }
 
 }  // namespace seven::handlers
 

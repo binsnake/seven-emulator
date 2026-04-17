@@ -8,13 +8,13 @@
 #include <unordered_map>
 #include <utility>
 
-#include <boost/multiprecision/cpp_bin_float.hpp>
 #include <iced_x86/code.hpp>
 #include "uint_wide.h"
+#include "seven/float80.hpp"
 
 namespace seven {
 
-using X87Scalar = boost::multiprecision::cpp_bin_float_50;
+using X87Scalar = seven::Float80;
 
 #ifndef SEVEN_VECTOR_BITS
 #define SEVEN_VECTOR_BITS 512

@@ -48,54 +48,46 @@ if(NOT GTest_FOUND)
   FetchContent_MakeAvailable(googletest)
 endif()
 
-set(BOOST_HINT_DIRS
-  "${CMAKE_CURRENT_SOURCE_DIR}/../dbemu/vcpkg_installed/x64-windows-static/x64-windows-static/include"
-  "${CMAKE_CURRENT_SOURCE_DIR}/../dbemu/vcpkg_installed/x64-windows-static/include"
-  "${CMAKE_CURRENT_SOURCE_DIR}/../dbemu/vcpkg_installed/x64-windows-static/vcpkg/pkgs/boost-multiprecision_x64-windows-static/include"
+FetchContent_Declare(
+  softfloat
+  GIT_REPOSITORY https://github.com/ucb-bar/berkeley-softfloat-3.git
+  GIT_TAG        master
 )
-
-set(BOOST_MULTIPRECISION_HINT_DIRS
-  ${BOOST_HINT_DIRS}
-  "${CMAKE_CURRENT_SOURCE_DIR}/../kubera/deps/boost_multiprecision/include"
-  "${CMAKE_CURRENT_SOURCE_DIR}/../minkubera/deps/boost_multiprecision/include"
-  "${CMAKE_CURRENT_SOURCE_DIR}/../Mona/KUBERA/deps/boost_multiprecision/include"
-  "$ENV{BOOST_ROOT}/include"
-)
-
-if(NOT DEFINED CACHE{SEVEN_BOOST_MULTIPRECISION_INCLUDE_DIR} OR "$CACHE{SEVEN_BOOST_MULTIPRECISION_INCLUDE_DIR}" STREQUAL "")
-  set(SEVEN_BOOST_MULTIPRECISION_INCLUDE_DIR "")
-else()
-  set(SEVEN_BOOST_MULTIPRECISION_INCLUDE_DIR "$CACHE{SEVEN_BOOST_MULTIPRECISION_INCLUDE_DIR}")
-endif()
-set(SEVEN_BOOST_FULL_INCLUDE_DIR "")
-
-foreach(_dir IN LISTS BOOST_HINT_DIRS)
-  if(EXISTS "${_dir}/boost/config.hpp")
-    if(EXISTS "${_dir}/boost/multiprecision/cpp_bin_float.hpp")
-      set(SEVEN_BOOST_MULTIPRECISION_INCLUDE_DIR "${_dir}")
-      set(SEVEN_BOOST_FULL_INCLUDE_DIR "${_dir}")
-      break()
-    endif()
-  endif()
-endforeach()
-
-if (NOT SEVEN_BOOST_MULTIPRECISION_INCLUDE_DIR)
-  find_path(SEVEN_BOOST_MULTIPRECISION_INCLUDE_DIR
-    NAMES "boost/multiprecision/cpp_bin_float.hpp"
-    PATHS ${BOOST_MULTIPRECISION_HINT_DIRS}
+FetchContent_GetProperties(softfloat)
+if(NOT softfloat_POPULATED)
+  FetchContent_Populate(softfloat)
+  file(GLOB SOFTFLOAT_SOURCES_ALL
+    "${softfloat_SOURCE_DIR}/source/*.c"
+    "${softfloat_SOURCE_DIR}/source/8086/*.c"
   )
+  # With SOFTFLOAT_FAST_INT64, the *M.c multi-word variants must be excluded.
+  list(FILTER SOFTFLOAT_SOURCES_ALL EXCLUDE REGEX "M\\.c$")
+  list(FILTER SOFTFLOAT_SOURCES_ALL EXCLUDE REGEX "M_")
+  set(SOFTFLOAT_SOURCES ${SOFTFLOAT_SOURCES_ALL})
+  # Generate a platform.h appropriate for the current compiler/platform
+  set(_sf_platform_dir "${CMAKE_BINARY_DIR}/softfloat_platform")
+  file(MAKE_DIRECTORY "${_sf_platform_dir}")
+  if(MSVC)
+    file(WRITE "${_sf_platform_dir}/platform.h"
+      "#define LITTLEENDIAN 1\n#define INLINE __forceinline\n")
+  else()
+    file(WRITE "${_sf_platform_dir}/platform.h"
+      "#define LITTLEENDIAN 1\n#define INLINE static inline\n"
+      "#define SOFTFLOAT_BUILTIN_CLZ 1\n")
+  endif()
+
+  add_library(softfloat STATIC ${SOFTFLOAT_SOURCES})
+  target_include_directories(softfloat PUBLIC
+    "${softfloat_SOURCE_DIR}/source/include"
+    "${softfloat_SOURCE_DIR}/source/8086"
+  )
+  target_include_directories(softfloat PRIVATE "${_sf_platform_dir}")
+  target_compile_definitions(softfloat PUBLIC SOFTFLOAT_FAST_INT64)
+  if(MSVC)
+    target_compile_options(softfloat PRIVATE /WX- /wd4146 /wd4244 /wd4267)
+  endif()
 endif()
 
-if (NOT SEVEN_BOOST_MULTIPRECISION_INCLUDE_DIR)
-  message(FATAL_ERROR "Could not locate boost/multiprecision/cpp_bin_float.hpp. Set BOOST_ROOT to an installation that contains boost/multiprecision.")
-endif()
-
-if (NOT SEVEN_BOOST_FULL_INCLUDE_DIR AND
-    EXISTS "${SEVEN_BOOST_MULTIPRECISION_INCLUDE_DIR}/boost/multiprecision/detail/standalone_config.hpp")
-  message(WARNING "Using standalone boost multiprecision headers: ${SEVEN_BOOST_MULTIPRECISION_INCLUDE_DIR}. Define BOOST_INCLUDE_DIR for full Boost.Config headers to avoid this.")
-endif()
-
-message(STATUS "Using boost/multiprecision/cpp_bin_float.hpp from: ${SEVEN_BOOST_MULTIPRECISION_INCLUDE_DIR}")
 
 if(MSVC)
   add_compile_options(/permissive- /EHsc /Zc:__cplusplus /W4 /wd5311 /FS)
@@ -160,8 +152,7 @@ file(GLOB_RECURSE SEVEN_CORE_SOURCES CONFIGURE_DEPENDS
 add_library(seven_core STATIC ${SEVEN_CORE_SOURCES})
 target_include_directories(seven_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/seven_core/include")
 target_include_directories(seven_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
-target_include_directories(seven_core PUBLIC "${SEVEN_BOOST_MULTIPRECISION_INCLUDE_DIR}")
-target_link_libraries(seven_core PUBLIC iced_x86)
+target_link_libraries(seven_core PUBLIC iced_x86 softfloat)
 target_compile_definitions(seven_core PUBLIC
   SEVEN_SIMD_PROFILE_${SEVEN_SIMD_PROFILE}=1
   SEVEN_ENABLE_AVX=${SEVEN_ENABLE_AVX}
@@ -169,6 +160,7 @@ target_compile_definitions(seven_core PUBLIC
   SEVEN_ENABLE_AVX512=${SEVEN_ENABLE_AVX512}
   SEVEN_VECTOR_BITS=${SEVEN_VECTOR_BITS}
   SEVEN_MAX_VECTOR_BYTES=${SEVEN_MAX_VECTOR_BYTES}
+  SOFTFLOAT_FAST_INT64
 )
 if(MSVC)
   target_compile_options(seven_core PRIVATE /WX-)
@@ -200,8 +192,7 @@ add_library(seven_core_bmi2 STATIC
 )
 target_include_directories(seven_core_bmi2 PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/seven_core/include")
 target_include_directories(seven_core_bmi2 PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
-target_include_directories(seven_core_bmi2 PUBLIC "${SEVEN_BOOST_MULTIPRECISION_INCLUDE_DIR}")
-target_link_libraries(seven_core_bmi2 PUBLIC iced_x86)
+target_link_libraries(seven_core_bmi2 PUBLIC iced_x86 softfloat)
 target_compile_definitions(seven_core_bmi2 PUBLIC
   SEVEN_SIMD_PROFILE_${SEVEN_SIMD_PROFILE}=1
   SEVEN_ENABLE_AVX=${SEVEN_ENABLE_AVX}
@@ -209,6 +200,7 @@ target_compile_definitions(seven_core_bmi2 PUBLIC
   SEVEN_ENABLE_AVX512=${SEVEN_ENABLE_AVX512}
   SEVEN_VECTOR_BITS=${SEVEN_VECTOR_BITS}
   SEVEN_MAX_VECTOR_BYTES=${SEVEN_MAX_VECTOR_BYTES}
+  SOFTFLOAT_FAST_INT64
 )
 
 add_executable(seven_bmi2_tests tests/kubera_bmi2_tests.cpp)
