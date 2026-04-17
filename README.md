@@ -7,7 +7,8 @@ An x86 emulator library written in C++23. Decodes and executes x86 machine code 
 **Requirements:**
 - CMake 3.24+
 - C++23 compiler (MSVC 2022, GCC 13+, Clang 16+)
-- Boost.Multiprecision headers (for wide integer and x87 float types)
+- Berkeley Soft-Float for 80-bit floating point emulation
+- wide-integer for representing large bitwidth types (included as part of repository)
 
 ```sh
 cmake -B build -DSEVEN_SIMD_PROFILE=AVX512 -DBOOST_ROOT=/path/to/boost
@@ -211,5 +212,6 @@ Test suites:
 | Dependency | Source |
 |-|-|
 | [iced-x86](https://github.com/icedland/iced) | Bundled in `iced_x86/` |
-| [Boost.Multiprecision](https://www.boost.org/libs/multiprecision/) | External (headers only) |
+| [wide-integer](https://github.com/ckormanyos/wide-integer) | External (headers only) |
+| [Berkeley SoftFloat3](https://github.com/ucb-bar/berkeley-softfloat-3) | Fetched by CMake if absent |
 | [Google Test 1.14](https://github.com/google/googletest) | Fetched by CMake if absent |
