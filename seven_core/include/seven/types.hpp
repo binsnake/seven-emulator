@@ -104,7 +104,8 @@ struct CpuState {
   std::array<std::uint64_t, 16> gpr{};
   std::array<std::uint64_t, 8> mmx{};
   std::array<std::uint16_t, 6> sreg{};  // ES,CS,SS,DS,FS,GS selectors
-  std::array<std::uint64_t, 16> cr{};
+  // cr[0]=CR0, cr[4]=CR4 — Windows 10/11 x64 typical values
+  std::array<std::uint64_t, 16> cr{0x80050033u, 0, 0, 0, 0x370678u};
   std::array<std::uint64_t, 16> dr{};
   std::array<std::uint64_t, 8> tr{};
   std::uint64_t rip = 0;
@@ -114,7 +115,11 @@ struct CpuState {
   std::uint64_t gs_base = 0;
   DescriptorTableRegister gdtr{};
   DescriptorTableRegister idtr{};
-  std::unordered_map<std::uint32_t, std::uint64_t> msr{};
+  // EFER (LME+LMA+NXE+SCE) and STAR (syscall CS/SS) — Windows 10/11 x64 typical values
+  std::unordered_map<std::uint32_t, std::uint64_t> msr{
+    {0xC0000080u, 0x0000'0000'0000'0D01u},  // EFER
+    {0xC0000081u, 0x0023'0010'0000'0000u},  // STAR
+  };
   std::array<std::uint64_t, 2> xcr{3u, 0u};
   std::uint32_t mxcsr = 0x1F80;
   std::uint16_t x87_control_word = 0x037F;
