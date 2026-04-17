@@ -24,6 +24,16 @@ Memory::PageEntry* Memory::lookup_page(std::uint64_t page_index) const noexcept 
   return slot.entry;
 }
 
+void Memory::set_passthrough(PassthroughReadFn read_fn, PassthroughWriteFn write_fn) {
+  passthrough_read_  = std::move(read_fn);
+  passthrough_write_ = std::move(write_fn);
+}
+
+void Memory::clear_passthrough() {
+  passthrough_read_  = nullptr;
+  passthrough_write_ = nullptr;
+}
+
 void Memory::map(std::uint64_t base, std::size_t size, MemoryPermissionMask permissions) {
   ++page_epoch_;
   ++code_epoch_;
@@ -110,6 +120,7 @@ bool Memory::has_permissions(std::uint64_t address, std::size_t size, MemoryPerm
 }
 
 bool Memory::read(std::uint64_t address, void* dst, std::size_t size, MemoryAccessKind kind) const {
+  if (passthrough_read_) return passthrough_read_(address, dst, size);
   // Fast path: most reads in real workloads are entirely within a single page
   // and target a non-MMIO address with no access hooks installed. Inline that
   // case to skip every dynamic check besides the TLB lookup itself.
@@ -204,6 +215,7 @@ bool Memory::read_unchecked(std::uint64_t address, void* dst, std::size_t size) 
 }
 
 bool Memory::read_code_page(std::uint64_t page_base, void* dst) const {
+  if (passthrough_read_) return passthrough_read_(page_base, dst, kPageSize);
   if ((page_base % kPageSize) != 0) {
     return false;
   }
@@ -216,6 +228,7 @@ bool Memory::read_code_page(std::uint64_t page_base, void* dst) const {
 }
 
 bool Memory::write(std::uint64_t address, const void* src, std::size_t size, MemoryAccessKind kind) {
+  if (passthrough_write_) return passthrough_write_(address, src, size);
   // Fast path: no hooks, no MMIO, single-page access. Bypasses access_allowed
   // and all multi-page bookkeeping. We still maintain code_epoch for write
   // through executable pages so the decode cache stays correct.

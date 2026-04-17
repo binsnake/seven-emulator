@@ -32,11 +32,14 @@ struct ExecutionContext {
 class Executor {
  public:
   using HookId = std::uint64_t;
+  using ContextSyncCallback = std::function<bool(CpuState&)>;
 
   Executor();
 
   [[nodiscard]] ExecutionResult step(CpuState& state, Memory& memory);
   [[nodiscard]] ExecutionResult run(CpuState& state, Memory& memory, std::size_t max_instructions);
+  void set_context_read_callback(ContextSyncCallback fn);
+  void set_context_write_callback(ContextSyncCallback fn);
   void request_stop() noexcept;
   void clear_stop_request() noexcept;
   [[nodiscard]] bool stop_requested() const noexcept;
@@ -128,6 +131,8 @@ class Executor {
   bool trace_openkey_probe_ = false;
   bool trace_strrchr_ = false;
   bool collect_code_stats_ = false;
+  ContextSyncCallback context_read_cb_{};
+  ContextSyncCallback context_write_cb_{};
   bool stop_requested_ = false;
   bool has_violation_ = false;
   std::uint64_t violation_ip_ = 0;

@@ -427,6 +427,14 @@ std::uint64_t Executor::total_retired() const noexcept {
   return total_retired_;
 }
 
+void Executor::set_context_read_callback(ContextSyncCallback fn) {
+  context_read_cb_ = std::move(fn);
+}
+
+void Executor::set_context_write_callback(ContextSyncCallback fn) {
+  context_write_cb_ = std::move(fn);
+}
+
 void Executor::request_stop() noexcept {
   stop_requested_ = true;
 }
@@ -471,6 +479,11 @@ ExecutionResult Executor::step(CpuState& state, Memory& memory) {
     notify_stop_hooks(state, memory, stopped, state.rip);
     return stopped;
   }
+  if (context_read_cb_) context_read_cb_(state);
+  struct WriteSync {
+    Executor& self; CpuState& state;
+    ~WriteSync() { if (self.context_write_cb_) self.context_write_cb_(state); }
+  } write_sync{*this, state};
   state.rip = mask_instruction_pointer(state, state.rip);
   state.gpr[4] = mask_stack_pointer(state, state.gpr[4]);
   const auto instruction_start_rip = state.rip;

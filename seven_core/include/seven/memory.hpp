@@ -63,6 +63,8 @@ class Memory {
   using AccessHook = std::function<bool(const MemoryAccessEvent&)>;
   using MmioReadCallback = std::function<bool(std::uint64_t offset, void* dst, std::size_t size)>;
   using MmioWriteCallback = std::function<bool(std::uint64_t offset, const void* src, std::size_t size)>;
+  using PassthroughReadFn  = std::function<bool(std::uint64_t addr, void* dst, std::size_t size)>;
+  using PassthroughWriteFn = std::function<bool(std::uint64_t addr, const void* src, std::size_t size)>;
   struct MmioRegionSnapshot {
     HookId id = 0;
     std::uint64_t base = 0;
@@ -97,6 +99,10 @@ class Memory {
   void restore_pages(const std::vector<PageSnapshot>& pages);
   [[nodiscard]] std::vector<MmioRegionSnapshot> snapshot_mmio_regions() const;
   void restore_mmio_regions(const std::vector<MmioRegionSnapshot>& regions, const MmioResolver& resolver);
+  void set_passthrough(PassthroughReadFn read_fn, PassthroughWriteFn write_fn);
+  void clear_passthrough();
+  [[nodiscard]] bool has_passthrough() const noexcept { return static_cast<bool>(passthrough_read_); }
+
   [[nodiscard]] bool has_access_hooks() const noexcept {
     return has_any_access_hooks_;
   }
@@ -177,6 +183,8 @@ class Memory {
   bool has_any_access_hooks_ = false;
   MemoryAccessKindMask active_access_hook_kinds_ = 0;
   std::vector<MmioRegion> mmio_regions_;
+  PassthroughReadFn  passthrough_read_{};
+  PassthroughWriteFn passthrough_write_{};
   HookId next_hook_id_ = 1;
   std::uint64_t page_epoch_ = 1;
   std::uint64_t code_epoch_ = 1;
