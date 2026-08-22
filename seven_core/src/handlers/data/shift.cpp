@@ -171,24 +171,40 @@ namespace {
   return 1ull << ((width * 8) - 1);
 }
 
-ExecutionResult rotate_left(ExecutionContext& ctx, std::size_t width, std::uint64_t count) {
+// x86 ROL/ROR flag semantics, matched to real hardware (measured on an i9-11900K):
+//  * The count is masked with 0x1F (0x3F for 64-bit operands) -- NOT (width-1). The effective
+//    rotation is that masked count modulo the operand size, but CF/OF depend on the masked count.
+//  * CF is written whenever the masked count is non-zero (CF = LSB of result for ROL, MSB for ROR).
+//  * OF is architecturally defined only for a masked count of 1, but real silicon writes it in more
+//    cases -- and the exact set is operand-form dependent (this is an undefined-flag quirk that
+//    VMProtect probes to detect emulators). Measured on the i9-11900K for masked count > 1:
+//      - CL-count encodings           : always write OF (any non-zero masked count).
+//      - imm/1 encodings, REGISTER dst : leave OF unchanged (preserved).
+//      - imm/1 encodings, MEMORY   dst : write OF (the memory execution path differs from register!)
+//    The written value is always the count==1 value derived from the *original* operand's edge bits:
+//    ROL: OF = msb ^ (msb-1);  ROR: OF = lsb ^ msb.
+ExecutionResult rotate_left(ExecutionContext& ctx, std::size_t width, std::uint64_t count, bool count_is_cl = false) {
   bool ok = false;
   const auto value = detail::read_operand(ctx, 0, width, &ok);
   if (!ok) {
     return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
   }
   const auto bits = static_cast<unsigned>(width * 8);
-  const auto shift = static_cast<unsigned>(count & (bits - 1));
-  if (shift == 0) {
+  const auto count_mask = static_cast<unsigned>(bits == 64 ? 0x3Fu : 0x1Fu);
+  const auto masked = static_cast<unsigned>(count) & count_mask;
+  if (masked == 0) {
     return {};
   }
+  const auto shift = masked % bits;
   const auto m = width_mask(width);
-  const auto result = ((value << shift) | (value >> (bits - shift))) & m;
+  const auto result = (shift == 0) ? (value & m) : (((value << shift) | (value >> (bits - shift))) & m);
   const auto cf = (result & 1ull) != 0ull;
   detail::set_flag(ctx.state.rflags, kFlagCF, cf);
-  if (shift == 1) {
-    const auto of = ((result & msb_mask(width)) != 0ull) ^ cf;
-    detail::set_flag(ctx.state.rflags, kFlagOF, of);
+  const bool op0_is_mem = ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER;
+  if (masked == 1 || count_is_cl || op0_is_mem) {
+    const auto old_msb = (value & msb_mask(width)) != 0ull;
+    const auto old_next = (value & (msb_mask(width) >> 1)) != 0ull;
+    detail::set_flag(ctx.state.rflags, kFlagOF, old_msb ^ old_next);
   }
   if (!detail::write_operand(ctx, 0, result, width)) {
     return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
@@ -196,25 +212,28 @@ ExecutionResult rotate_left(ExecutionContext& ctx, std::size_t width, std::uint6
   return {};
 }
 
-ExecutionResult rotate_right(ExecutionContext& ctx, std::size_t width, std::uint64_t count) {
+ExecutionResult rotate_right(ExecutionContext& ctx, std::size_t width, std::uint64_t count, bool count_is_cl = false) {
   bool ok = false;
   const auto value = detail::read_operand(ctx, 0, width, &ok);
   if (!ok) {
     return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
   }
   const auto bits = static_cast<unsigned>(width * 8);
-  const auto shift = static_cast<unsigned>(count & (bits - 1));
-  if (shift == 0) {
+  const auto count_mask = static_cast<unsigned>(bits == 64 ? 0x3Fu : 0x1Fu);
+  const auto masked = static_cast<unsigned>(count) & count_mask;
+  if (masked == 0) {
     return {};
   }
+  const auto shift = masked % bits;
   const auto m = width_mask(width);
-  const auto result = ((value >> shift) | (value << (bits - shift))) & m;
+  const auto result = (shift == 0) ? (value & m) : (((value >> shift) | (value << (bits - shift))) & m);
   const auto cf = ((result & msb_mask(width)) != 0ull);
   detail::set_flag(ctx.state.rflags, kFlagCF, cf);
-  if (shift == 1) {
-    const auto msb = (result & msb_mask(width)) != 0ull;
-    const auto second_msb = (result & (msb_mask(width) >> 1)) != 0ull;
-    detail::set_flag(ctx.state.rflags, kFlagOF, msb ^ second_msb);
+  const bool op0_is_mem = ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER;
+  if (masked == 1 || count_is_cl || op0_is_mem) {
+    const auto old_lsb = (value & 1ull) != 0ull;
+    const auto old_msb = (value & msb_mask(width)) != 0ull;
+    detail::set_flag(ctx.state.rflags, kFlagOF, old_lsb ^ old_msb);
   }
   if (!detail::write_operand(ctx, 0, result, width)) {
     return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
@@ -371,10 +390,10 @@ ExecutionResult handle_code_ROL_RM8_1(ExecutionContext& ctx) { return rotate_lef
 ExecutionResult handle_code_ROL_RM16_1(ExecutionContext& ctx) { return rotate_left(ctx, 2, 1); }
 ExecutionResult handle_code_ROL_RM32_1(ExecutionContext& ctx) { return rotate_left(ctx, 4, 1); }
 ExecutionResult handle_code_ROL_RM64_1(ExecutionContext& ctx) { return rotate_left(ctx, 8, 1); }
-ExecutionResult handle_code_ROL_RM8_CL(ExecutionContext& ctx) { return rotate_left(ctx, 1, detail::read_register(ctx.state, iced_x86::Register::CL)); }
-ExecutionResult handle_code_ROL_RM16_CL(ExecutionContext& ctx) { return rotate_left(ctx, 2, detail::read_register(ctx.state, iced_x86::Register::CL)); }
-ExecutionResult handle_code_ROL_RM32_CL(ExecutionContext& ctx) { return rotate_left(ctx, 4, detail::read_register(ctx.state, iced_x86::Register::CL)); }
-ExecutionResult handle_code_ROL_RM64_CL(ExecutionContext& ctx) { return rotate_left(ctx, 8, detail::read_register(ctx.state, iced_x86::Register::CL)); }
+ExecutionResult handle_code_ROL_RM8_CL(ExecutionContext& ctx) { return rotate_left(ctx, 1, detail::read_register(ctx.state, iced_x86::Register::CL), true); }
+ExecutionResult handle_code_ROL_RM16_CL(ExecutionContext& ctx) { return rotate_left(ctx, 2, detail::read_register(ctx.state, iced_x86::Register::CL), true); }
+ExecutionResult handle_code_ROL_RM32_CL(ExecutionContext& ctx) { return rotate_left(ctx, 4, detail::read_register(ctx.state, iced_x86::Register::CL), true); }
+ExecutionResult handle_code_ROL_RM64_CL(ExecutionContext& ctx) { return rotate_left(ctx, 8, detail::read_register(ctx.state, iced_x86::Register::CL), true); }
 ExecutionResult handle_code_ROL_RM8_IMM8(ExecutionContext& ctx) { return rotate_left(ctx, 1, ctx.instr.immediate8()); }
 ExecutionResult handle_code_ROL_RM16_IMM8(ExecutionContext& ctx) { return rotate_left(ctx, 2, ctx.instr.immediate8()); }
 ExecutionResult handle_code_ROL_RM32_IMM8(ExecutionContext& ctx) { return rotate_left(ctx, 4, ctx.instr.immediate8()); }
@@ -384,10 +403,10 @@ ExecutionResult handle_code_ROR_RM8_1(ExecutionContext& ctx) { return rotate_rig
 ExecutionResult handle_code_ROR_RM16_1(ExecutionContext& ctx) { return rotate_right(ctx, 2, 1); }
 ExecutionResult handle_code_ROR_RM32_1(ExecutionContext& ctx) { return rotate_right(ctx, 4, 1); }
 ExecutionResult handle_code_ROR_RM64_1(ExecutionContext& ctx) { return rotate_right(ctx, 8, 1); }
-ExecutionResult handle_code_ROR_RM8_CL(ExecutionContext& ctx) { return rotate_right(ctx, 1, detail::read_register(ctx.state, iced_x86::Register::CL)); }
-ExecutionResult handle_code_ROR_RM16_CL(ExecutionContext& ctx) { return rotate_right(ctx, 2, detail::read_register(ctx.state, iced_x86::Register::CL)); }
-ExecutionResult handle_code_ROR_RM32_CL(ExecutionContext& ctx) { return rotate_right(ctx, 4, detail::read_register(ctx.state, iced_x86::Register::CL)); }
-ExecutionResult handle_code_ROR_RM64_CL(ExecutionContext& ctx) { return rotate_right(ctx, 8, detail::read_register(ctx.state, iced_x86::Register::CL)); }
+ExecutionResult handle_code_ROR_RM8_CL(ExecutionContext& ctx) { return rotate_right(ctx, 1, detail::read_register(ctx.state, iced_x86::Register::CL), true); }
+ExecutionResult handle_code_ROR_RM16_CL(ExecutionContext& ctx) { return rotate_right(ctx, 2, detail::read_register(ctx.state, iced_x86::Register::CL), true); }
+ExecutionResult handle_code_ROR_RM32_CL(ExecutionContext& ctx) { return rotate_right(ctx, 4, detail::read_register(ctx.state, iced_x86::Register::CL), true); }
+ExecutionResult handle_code_ROR_RM64_CL(ExecutionContext& ctx) { return rotate_right(ctx, 8, detail::read_register(ctx.state, iced_x86::Register::CL), true); }
 ExecutionResult handle_code_ROR_RM8_IMM8(ExecutionContext& ctx) { return rotate_right(ctx, 1, ctx.instr.immediate8()); }
 ExecutionResult handle_code_ROR_RM16_IMM8(ExecutionContext& ctx) { return rotate_right(ctx, 2, ctx.instr.immediate8()); }
 ExecutionResult handle_code_ROR_RM32_IMM8(ExecutionContext& ctx) { return rotate_right(ctx, 4, ctx.instr.immediate8()); }
