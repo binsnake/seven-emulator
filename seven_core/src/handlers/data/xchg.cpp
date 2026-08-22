@@ -57,6 +57,17 @@ ExecutionResult handle_code_XCHG_RM64_R64(ExecutionContext& ctx) {
   return xchg_rm_r(ctx, 8);
 }
 
+// XCHG with (r)AX via the 90+r opcode form. The 16/32-bit variants (66-prefixed / default in
+// 64-bit with REX.B, e.g. `xchg r8w, ax`) were missing, so they fell through to unsupported and
+// did nothing. Only XCHG_R64_RAX was handled.
+ExecutionResult handle_code_XCHG_R16_AX(ExecutionContext& ctx) {
+  return xchg_r_r(ctx, 2);
+}
+
+ExecutionResult handle_code_XCHG_R32_EAX(ExecutionContext& ctx) {
+  return xchg_r_r(ctx, 4);
+}
+
 ExecutionResult handle_code_XCHG_R64_RAX(ExecutionContext& ctx) {
   return xchg_r_r(ctx, 8);
 }
