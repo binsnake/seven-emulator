@@ -269,6 +269,10 @@ ExecutionResult handle_code_CMOVO_R32_RM32(ExecutionContext& ctx) {
     return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
   }
   if (!eval_cond(ctx.state, Cond::o)) {
+    // A 32-bit CMOV that is not taken still performs its 32-bit destination write,
+    // which zero-extends the upper 32 bits of the 64-bit register.
+    detail::write_register(ctx.state, ctx.instr.op_register(0),
+                           detail::read_register(ctx.state, ctx.instr.op_register(0)) & 0xFFFFFFFFull, 4);
     return {};
   }
   detail::write_register(ctx.state, ctx.instr.op_register(0), src, 4);
@@ -282,6 +286,10 @@ ExecutionResult handle_code_CMOVNO_R32_RM32(ExecutionContext& ctx) {
     return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
   }
   if (!eval_cond(ctx.state, Cond::no)) {
+    // A 32-bit CMOV that is not taken still performs its 32-bit destination write,
+    // which zero-extends the upper 32 bits of the 64-bit register.
+    detail::write_register(ctx.state, ctx.instr.op_register(0),
+                           detail::read_register(ctx.state, ctx.instr.op_register(0)) & 0xFFFFFFFFull, 4);
     return {};
   }
   detail::write_register(ctx.state, ctx.instr.op_register(0), src, 4);
@@ -295,6 +303,10 @@ ExecutionResult handle_code_CMOVB_R32_RM32(ExecutionContext& ctx) {
     return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
   }
   if (!eval_cond(ctx.state, Cond::b)) {
+    // A 32-bit CMOV that is not taken still performs its 32-bit destination write,
+    // which zero-extends the upper 32 bits of the 64-bit register.
+    detail::write_register(ctx.state, ctx.instr.op_register(0),
+                           detail::read_register(ctx.state, ctx.instr.op_register(0)) & 0xFFFFFFFFull, 4);
     return {};
   }
   detail::write_register(ctx.state, ctx.instr.op_register(0), src, 4);
@@ -308,6 +320,10 @@ ExecutionResult handle_code_CMOVAE_R32_RM32(ExecutionContext& ctx) {
     return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
   }
   if (!eval_cond(ctx.state, Cond::ae)) {
+    // A 32-bit CMOV that is not taken still performs its 32-bit destination write,
+    // which zero-extends the upper 32 bits of the 64-bit register.
+    detail::write_register(ctx.state, ctx.instr.op_register(0),
+                           detail::read_register(ctx.state, ctx.instr.op_register(0)) & 0xFFFFFFFFull, 4);
     return {};
   }
   detail::write_register(ctx.state, ctx.instr.op_register(0), src, 4);
@@ -321,6 +337,10 @@ ExecutionResult handle_code_CMOVE_R32_RM32(ExecutionContext& ctx) {
     return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
   }
   if (!eval_cond(ctx.state, Cond::e)) {
+    // A 32-bit CMOV that is not taken still performs its 32-bit destination write,
+    // which zero-extends the upper 32 bits of the 64-bit register.
+    detail::write_register(ctx.state, ctx.instr.op_register(0),
+                           detail::read_register(ctx.state, ctx.instr.op_register(0)) & 0xFFFFFFFFull, 4);
     return {};
   }
   detail::write_register(ctx.state, ctx.instr.op_register(0), src, 4);
@@ -334,6 +354,10 @@ ExecutionResult handle_code_CMOVNE_R32_RM32(ExecutionContext& ctx) {
     return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
   }
   if (!eval_cond(ctx.state, Cond::ne)) {
+    // A 32-bit CMOV that is not taken still performs its 32-bit destination write,
+    // which zero-extends the upper 32 bits of the 64-bit register.
+    detail::write_register(ctx.state, ctx.instr.op_register(0),
+                           detail::read_register(ctx.state, ctx.instr.op_register(0)) & 0xFFFFFFFFull, 4);
     return {};
   }
   detail::write_register(ctx.state, ctx.instr.op_register(0), src, 4);
@@ -347,6 +371,10 @@ ExecutionResult handle_code_CMOVBE_R32_RM32(ExecutionContext& ctx) {
     return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
   }
   if (!eval_cond(ctx.state, Cond::be)) {
+    // A 32-bit CMOV that is not taken still performs its 32-bit destination write,
+    // which zero-extends the upper 32 bits of the 64-bit register.
+    detail::write_register(ctx.state, ctx.instr.op_register(0),
+                           detail::read_register(ctx.state, ctx.instr.op_register(0)) & 0xFFFFFFFFull, 4);
     return {};
   }
   detail::write_register(ctx.state, ctx.instr.op_register(0), src, 4);
@@ -360,6 +388,10 @@ ExecutionResult handle_code_CMOVA_R32_RM32(ExecutionContext& ctx) {
     return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
   }
   if (!eval_cond(ctx.state, Cond::a)) {
+    // A 32-bit CMOV that is not taken still performs its 32-bit destination write,
+    // which zero-extends the upper 32 bits of the 64-bit register.
+    detail::write_register(ctx.state, ctx.instr.op_register(0),
+                           detail::read_register(ctx.state, ctx.instr.op_register(0)) & 0xFFFFFFFFull, 4);
     return {};
   }
   detail::write_register(ctx.state, ctx.instr.op_register(0), src, 4);
@@ -373,6 +405,10 @@ ExecutionResult handle_code_CMOVS_R32_RM32(ExecutionContext& ctx) {
     return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
   }
   if (!eval_cond(ctx.state, Cond::s)) {
+    // A 32-bit CMOV that is not taken still performs its 32-bit destination write,
+    // which zero-extends the upper 32 bits of the 64-bit register.
+    detail::write_register(ctx.state, ctx.instr.op_register(0),
+                           detail::read_register(ctx.state, ctx.instr.op_register(0)) & 0xFFFFFFFFull, 4);
     return {};
   }
   detail::write_register(ctx.state, ctx.instr.op_register(0), src, 4);
@@ -386,6 +422,10 @@ ExecutionResult handle_code_CMOVNS_R32_RM32(ExecutionContext& ctx) {
     return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
   }
   if (!eval_cond(ctx.state, Cond::ns)) {
+    // A 32-bit CMOV that is not taken still performs its 32-bit destination write,
+    // which zero-extends the upper 32 bits of the 64-bit register.
+    detail::write_register(ctx.state, ctx.instr.op_register(0),
+                           detail::read_register(ctx.state, ctx.instr.op_register(0)) & 0xFFFFFFFFull, 4);
     return {};
   }
   detail::write_register(ctx.state, ctx.instr.op_register(0), src, 4);
@@ -399,6 +439,10 @@ ExecutionResult handle_code_CMOVP_R32_RM32(ExecutionContext& ctx) {
     return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
   }
   if (!eval_cond(ctx.state, Cond::p)) {
+    // A 32-bit CMOV that is not taken still performs its 32-bit destination write,
+    // which zero-extends the upper 32 bits of the 64-bit register.
+    detail::write_register(ctx.state, ctx.instr.op_register(0),
+                           detail::read_register(ctx.state, ctx.instr.op_register(0)) & 0xFFFFFFFFull, 4);
     return {};
   }
   detail::write_register(ctx.state, ctx.instr.op_register(0), src, 4);
@@ -412,6 +456,10 @@ ExecutionResult handle_code_CMOVNP_R32_RM32(ExecutionContext& ctx) {
     return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
   }
   if (!eval_cond(ctx.state, Cond::np)) {
+    // A 32-bit CMOV that is not taken still performs its 32-bit destination write,
+    // which zero-extends the upper 32 bits of the 64-bit register.
+    detail::write_register(ctx.state, ctx.instr.op_register(0),
+                           detail::read_register(ctx.state, ctx.instr.op_register(0)) & 0xFFFFFFFFull, 4);
     return {};
   }
   detail::write_register(ctx.state, ctx.instr.op_register(0), src, 4);
@@ -425,6 +473,10 @@ ExecutionResult handle_code_CMOVL_R32_RM32(ExecutionContext& ctx) {
     return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
   }
   if (!eval_cond(ctx.state, Cond::l)) {
+    // A 32-bit CMOV that is not taken still performs its 32-bit destination write,
+    // which zero-extends the upper 32 bits of the 64-bit register.
+    detail::write_register(ctx.state, ctx.instr.op_register(0),
+                           detail::read_register(ctx.state, ctx.instr.op_register(0)) & 0xFFFFFFFFull, 4);
     return {};
   }
   detail::write_register(ctx.state, ctx.instr.op_register(0), src, 4);
@@ -438,6 +490,10 @@ ExecutionResult handle_code_CMOVGE_R32_RM32(ExecutionContext& ctx) {
     return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
   }
   if (!eval_cond(ctx.state, Cond::ge)) {
+    // A 32-bit CMOV that is not taken still performs its 32-bit destination write,
+    // which zero-extends the upper 32 bits of the 64-bit register.
+    detail::write_register(ctx.state, ctx.instr.op_register(0),
+                           detail::read_register(ctx.state, ctx.instr.op_register(0)) & 0xFFFFFFFFull, 4);
     return {};
   }
   detail::write_register(ctx.state, ctx.instr.op_register(0), src, 4);
@@ -451,6 +507,10 @@ ExecutionResult handle_code_CMOVLE_R32_RM32(ExecutionContext& ctx) {
     return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
   }
   if (!eval_cond(ctx.state, Cond::le)) {
+    // A 32-bit CMOV that is not taken still performs its 32-bit destination write,
+    // which zero-extends the upper 32 bits of the 64-bit register.
+    detail::write_register(ctx.state, ctx.instr.op_register(0),
+                           detail::read_register(ctx.state, ctx.instr.op_register(0)) & 0xFFFFFFFFull, 4);
     return {};
   }
   detail::write_register(ctx.state, ctx.instr.op_register(0), src, 4);
@@ -464,6 +524,10 @@ ExecutionResult handle_code_CMOVG_R32_RM32(ExecutionContext& ctx) {
     return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
   }
   if (!eval_cond(ctx.state, Cond::g)) {
+    // A 32-bit CMOV that is not taken still performs its 32-bit destination write,
+    // which zero-extends the upper 32 bits of the 64-bit register.
+    detail::write_register(ctx.state, ctx.instr.op_register(0),
+                           detail::read_register(ctx.state, ctx.instr.op_register(0)) & 0xFFFFFFFFull, 4);
     return {};
   }
   detail::write_register(ctx.state, ctx.instr.op_register(0), src, 4);
