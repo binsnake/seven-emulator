@@ -12,6 +12,57 @@ ExecutionResult read_rm64(ExecutionContext& ctx, std::uint64_t& value) {
   return {};
 }
 
+void clear_count_flags(CpuState& state);
+
+// 16/32-bit forms of POPCNT/TZCNT/LZCNT — the counting must happen at the
+// actual operand width (std::countl_zero of a 32-bit value differs from a
+// 64-bit value holding the same bits, since it counts leading zeros
+// relative to the type's own width) rather than reusing the 64-bit path on
+// a masked value.
+template <typename T>
+ExecutionResult popcnt_narrow(ExecutionContext& ctx, std::size_t width) {
+  std::uint64_t value = 0;
+  if (auto result = detail::read_operand_checked(ctx, 1, width, value); !result.ok()) {
+    return result;
+  }
+  const auto v = static_cast<T>(value);
+  const auto count = static_cast<std::uint64_t>(std::popcount(v));
+  detail::write_register(ctx.state, ctx.instr.op_register(0), count, width);
+  clear_count_flags(ctx.state);
+  detail::set_flag(ctx.state.rflags, kFlagZF, v == 0);
+  return {};
+}
+
+template <typename T>
+ExecutionResult tzcnt_narrow(ExecutionContext& ctx, std::size_t width) {
+  std::uint64_t value = 0;
+  if (auto result = detail::read_operand_checked(ctx, 1, width, value); !result.ok()) {
+    return result;
+  }
+  const auto v = static_cast<T>(value);
+  const auto count = static_cast<std::uint64_t>(std::countr_zero(v));
+  detail::write_register(ctx.state, ctx.instr.op_register(0), count, width);
+  clear_count_flags(ctx.state);
+  detail::set_flag(ctx.state.rflags, kFlagCF, v == 0);
+  detail::set_flag(ctx.state.rflags, kFlagZF, count == 0);
+  return {};
+}
+
+template <typename T>
+ExecutionResult lzcnt_narrow(ExecutionContext& ctx, std::size_t width) {
+  std::uint64_t value = 0;
+  if (auto result = detail::read_operand_checked(ctx, 1, width, value); !result.ok()) {
+    return result;
+  }
+  const auto v = static_cast<T>(value);
+  const auto count = static_cast<std::uint64_t>(std::countl_zero(v));
+  detail::write_register(ctx.state, ctx.instr.op_register(0), count, width);
+  clear_count_flags(ctx.state);
+  detail::set_flag(ctx.state.rflags, kFlagCF, v == 0);
+  detail::set_flag(ctx.state.rflags, kFlagZF, count == 0);
+  return {};
+}
+
 void clear_count_flags(CpuState& state) {
   detail::set_flag(state.rflags, kFlagCF, false);
   detail::set_flag(state.rflags, kFlagOF, false);
@@ -83,6 +134,13 @@ ExecutionResult crc32_impl(ExecutionContext& ctx) {
 }
 
 }  // namespace
+
+ExecutionResult handle_code_POPCNT_R16_RM16(ExecutionContext& ctx) { return popcnt_narrow<std::uint16_t>(ctx, 2); }
+ExecutionResult handle_code_POPCNT_R32_RM32(ExecutionContext& ctx) { return popcnt_narrow<std::uint32_t>(ctx, 4); }
+ExecutionResult handle_code_TZCNT_R16_RM16(ExecutionContext& ctx) { return tzcnt_narrow<std::uint16_t>(ctx, 2); }
+ExecutionResult handle_code_TZCNT_R32_RM32(ExecutionContext& ctx) { return tzcnt_narrow<std::uint32_t>(ctx, 4); }
+ExecutionResult handle_code_LZCNT_R16_RM16(ExecutionContext& ctx) { return lzcnt_narrow<std::uint16_t>(ctx, 2); }
+ExecutionResult handle_code_LZCNT_R32_RM32(ExecutionContext& ctx) { return lzcnt_narrow<std::uint32_t>(ctx, 4); }
 
 ExecutionResult handle_code_POPCNT_R64_RM64(ExecutionContext& ctx) {
   std::uint64_t value = 0;

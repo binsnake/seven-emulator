@@ -1,4 +1,5 @@
 #include "seven/handler_helpers.hpp"
+#include <bit>
 #include <iced_x86/op_kind.hpp>
 
 namespace seven::handlers {
@@ -12,8 +13,18 @@ ExecutionResult read_bt_base_value(ExecutionContext& ctx, std::size_t width, std
                                    std::uint64_t& bit_out) {
   const auto bit_span = 8ull * width;
   if (ctx.instr.op0_kind() == iced_x86::OpKind::MEMORY) {
-    const auto elem_index = bit_index / bit_span;
-    const auto address = detail::memory_address(ctx) + elem_index * width;
+    // bit_index is a signed two's-complement value (the caller sign-extends
+    // register-sourced indices to the operand width; immediate-sourced ones
+    // are already small and non-negative). Intel defines the effective
+    // address as base + floor(bit_index / bit_span) elements -- an
+    // arithmetic right shift by log2(bit_span) implements that floor
+    // division exactly, including for negative indices. Unsigned truncating
+    // division here previously sent register bit-indices to wildly
+    // out-of-bounds addresses (seven-fuzzer finding).
+    const auto shift = static_cast<unsigned>(std::countr_zero(bit_span));
+    const auto elem_index = static_cast<std::int64_t>(bit_index) >> shift;
+    const auto address = static_cast<std::uint64_t>(
+        static_cast<std::int64_t>(detail::memory_address(ctx)) + elem_index * static_cast<std::int64_t>(width));
     bit_out = bit_index & (bit_span - 1ull);
     return detail::read_memory_checked(ctx, address, &value_out, width);
   }
@@ -43,7 +54,7 @@ ExecutionResult handle_code_BT_RM16_IMM8(ExecutionContext& ctx) {
 ExecutionResult handle_code_BT_RM16_R16(ExecutionContext& ctx) {
   std::uint64_t value = 0;
   std::uint64_t bit = 0;
-  const auto rr = read_bt_base_value(ctx, 2, detail::read_register(ctx.state, ctx.instr.op_register(1)), value, bit);
+  const auto rr = read_bt_base_value(ctx, 2, detail::sign_extend(detail::read_register(ctx.state, ctx.instr.op_register(1)), 2), value, bit);
   if (!rr.ok()) {
     return rr;
   }
@@ -67,7 +78,7 @@ ExecutionResult handle_code_BT_RM32_IMM8(ExecutionContext& ctx) {
 ExecutionResult handle_code_BT_RM32_R32(ExecutionContext& ctx) {
   std::uint64_t value = 0;
   std::uint64_t bit = 0;
-  const auto rr = read_bt_base_value(ctx, 4, detail::read_register(ctx.state, ctx.instr.op_register(1)), value, bit);
+  const auto rr = read_bt_base_value(ctx, 4, detail::sign_extend(detail::read_register(ctx.state, ctx.instr.op_register(1)), 4), value, bit);
   if (!rr.ok()) {
     return rr;
   }

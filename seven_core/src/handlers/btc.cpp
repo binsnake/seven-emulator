@@ -1,4 +1,5 @@
 #include "seven/handler_helpers.hpp"
+#include <bit>
 #include <iced_x86/op_kind.hpp>
 
 namespace seven::handlers {
@@ -15,8 +16,12 @@ ExecutionResult btc_rmw(ExecutionContext& ctx, std::size_t width, std::uint64_t 
   std::uint64_t address = 0;
 
   if (ctx.instr.op0_kind() == iced_x86::OpKind::MEMORY) {
-    const auto elem_index = bit_index / bit_span;
-    address = detail::memory_address(ctx) + elem_index * width;
+    // See bt.cpp's read_bt_base_value for why this needs to be a signed
+    // floor division (arithmetic shift), not unsigned truncating division.
+    const auto shift = static_cast<unsigned>(std::countr_zero(bit_span));
+    const auto elem_index = static_cast<std::int64_t>(bit_index) >> shift;
+    address = static_cast<std::uint64_t>(
+        static_cast<std::int64_t>(detail::memory_address(ctx)) + elem_index * static_cast<std::int64_t>(width));
     bit = bit_index & (bit_span - 1ull);
     const auto rr = detail::read_memory_checked(ctx, address, &value, width);
     if (!rr.ok()) {
@@ -53,7 +58,7 @@ ExecutionResult handle_code_BTC_RM16_IMM8(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_BTC_RM16_R16(ExecutionContext& ctx) {
-  return btc_rmw(ctx, 2, detail::read_register(ctx.state, ctx.instr.op_register(1)));
+  return btc_rmw(ctx, 2, detail::sign_extend(detail::read_register(ctx.state, ctx.instr.op_register(1)), 2));
 }
 
 ExecutionResult handle_code_BTC_RM32_IMM8(ExecutionContext& ctx) {
@@ -61,7 +66,7 @@ ExecutionResult handle_code_BTC_RM32_IMM8(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_BTC_RM32_R32(ExecutionContext& ctx) {
-  return btc_rmw(ctx, 4, detail::read_register(ctx.state, ctx.instr.op_register(1)));
+  return btc_rmw(ctx, 4, detail::sign_extend(detail::read_register(ctx.state, ctx.instr.op_register(1)), 4));
 }
 
 ExecutionResult handle_code_BTC_RM64_IMM8(ExecutionContext& ctx) {
