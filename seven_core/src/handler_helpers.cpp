@@ -635,7 +635,17 @@ void set_sub_flags(CpuState& state, std::uint64_t lhs, std::uint64_t rhs, std::u
   rhs &= mask;
   result &= mask;
   const auto borrow = static_cast<std::uint64_t>(borrow_in ? 1 : 0);
-  set_flag(state.rflags, kFlagCF, lhs < (rhs + borrow));
+  // At width==8, rhs+borrow can overflow the uint64_t container itself
+  // (rhs==UINT64_MAX with borrow_in set) and silently wrap to 0, making the
+  // comparison below always false regardless of lhs. The effective
+  // (unbounded) subtrahend there is 2^64, which always exceeds any 64-bit
+  // lhs, so a borrow is unconditionally required -- mirrors set_add_flags's
+  // analogous handling of carry_in overflowing the container for ADD/ADC.
+  // Not reachable for width<8: rhs+borrow is at most 2^32, which never
+  // overflows a 64-bit container. Hardware-confirmed via seven-fuzzer
+  // (SBB RM64,R64 with rhs=UINT64_MAX, incoming CF=1).
+  const bool subtrahend_overflowed = width == 8 && borrow_in && rhs == mask;
+  set_flag(state.rflags, kFlagCF, subtrahend_overflowed || (lhs < (rhs + borrow)));
   set_flag(state.rflags, kFlagAF, ((lhs ^ rhs ^ result) & 0x10) != 0);
   set_flag(state.rflags, kFlagZF, result == 0);
   set_flag(state.rflags, kFlagSF, (result & sign_bit_for_width(width)) != 0);
