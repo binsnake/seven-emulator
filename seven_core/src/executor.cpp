@@ -793,7 +793,12 @@ ExecutionResult Executor::step(CpuState& state, Memory& memory) {
     }
 
     ExecutionResult result{};
-    const auto code = instr.code();
+    // Dispatch on the NORMALIZED code, not the raw iced code. iced reports `68 imm32` / `6a imm8` as
+    // PUSHD_IMM32 / PUSHD_IMM8 (dword operand size), but in 64-bit mode PUSH imm defaults to a 64-bit
+    // stack slot (rsp -= 8). normalize_reported_code maps those to the PUSHQ_* forms; previously that
+    // mapping only affected the *reported* code while dispatch used the raw code, so seven executed the
+    // 4-byte handler (rsp -= 4) -- corrupting the stack for any VMProtect VM that pushes an imm.
+    const auto code = reported_code;
     switch (code) {
 #define KUBERA_CODE(code) \
     case iced_x86::Code::code: result = handlers::handle_code_##code(ctx); break;
