@@ -13,6 +13,16 @@ namespace seven {
 namespace detail {
 
 void set_flag(std::uint64_t& rflags, std::uint64_t bit, bool value);
+
+// Flag-write elimination for the block liveness pass (see seven/ir.hpp). set_flag() silently
+// drops a write to any bit set in the current mask instead of touching rflags at all -- callers
+// must only ever mark a bit dead when nothing between this write and the next write to that same
+// bit (or the end of the translated block) can observe it. Scoped to just the six ALU status bits
+// (CF/PF/AF/ZF/SF/OF); every other rflags bit (IF/TF/DF/...) is never masked. Defaults to 0 (mask
+// nothing, i.e. identical to pre-liveness behavior) so every existing call site is unaffected
+// unless the block lifter explicitly opts in for the instruction currently dispatching.
+void set_dead_flags_mask(std::uint64_t mask) noexcept;
+[[nodiscard]] std::uint64_t dead_flags_mask() noexcept;
 std::uint64_t read_msr(CpuState& state, std::uint32_t index);
 void write_msr(CpuState& state, std::uint32_t index, std::uint64_t value);
 std::uint64_t read_xcr(CpuState& state, std::uint32_t index);

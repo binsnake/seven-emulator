@@ -272,6 +272,11 @@ constexpr std::uint64_t kFlagDF = 1ull << 10;
 constexpr std::uint64_t kFlagOF = 1ull << 11;
 constexpr std::uint64_t kFlagRF = 1ull << 16;
 
+// The ALU status flags eligible for the block liveness pass's dead-write elimination (see
+// seven/ir.hpp). Deliberately excludes control bits (TF/IF/DF/RF/...) -- those are never
+// dead-code-eliminated, only ever set explicitly by the instructions that own them.
+constexpr std::uint64_t kAluStatusFlagsMask = kFlagCF | kFlagPF | kFlagAF | kFlagZF | kFlagSF | kFlagOF;
+
 [[nodiscard]] constexpr std::uint64_t mask_for_width(std::size_t width) noexcept {
   return width >= 8 ? ~0ull : ((1ull << (width * 8)) - 1ull);
 }

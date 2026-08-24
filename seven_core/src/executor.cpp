@@ -11,9 +11,11 @@
 
 #include <iced_x86/code.hpp>
 #include <iced_x86/decoder.hpp>
+#include <iced_x86/flow_control.hpp>
 #include <iced_x86/instruction_info.hpp>
 #include <iced_x86/memory_size_info.hpp>
 
+#include "seven/flag_liveness.hpp"
 #include "seven/handler_helpers.hpp"
 #include "seven/handlers_fwd.hpp"
 
@@ -470,7 +472,50 @@ StopReason Executor::violation_reason() const noexcept {
   return violation_reason_;
 }
 
+// flag_liveness.cpp no longer relies on this vendored iced_x86 fork's stub
+// InstructionExtensions::rflags_read/rflags_modified -- it has its own flags_info_for_code()
+// table, hand-verified against seven's own handler source. That resolved the DATA half of the
+// blocker. Turning masking on with just that fix broke 2 tests: cross-instruction masking
+// (skipping instruction A's flag write because a *later* instruction in the same lifted block
+// unconditionally overwrites it) is only sound if that later instruction is GUARANTEED to actually
+// run before anything external -- the step() caller, a fault hook, a debugger -- can observe
+// rflags. Three separate things can break that guarantee, all now handled:
+//   1. The caller simply not calling step() again (a bare step() call, a debugger single-stepping,
+//      devirt-suite's tracer). Fixed by never trusting the cache's mask on a raw step() call --
+//      only step_impl's allow_masking=true path (used exclusively by run()'s own internal loop,
+//      which really does keep advancing) may apply it.
+//   2. A FAULT partway through the covering span (page fault on a memory operand, a divide error)
+//      -- exposes state to a fault hook or the caller before the cover happens, and this is not
+//      hypothetical: VMProtect-style guard pages and SEH-based obfuscation routinely fault as
+//      normal operation, and exception handlers commonly read the full CONTEXT/EFlags. Fixed in
+//      flag_liveness.cpp: any fault-capable instruction (can_fault()) is treated as reading every
+//      flag, which forces liveness back to "everything live" at that point and makes masking
+//      across it impossible by construction.
+//   3. Runtime conditions that can interrupt a block mid-way regardless of what got lifted: the
+//      single-step trap flag (TF) and hardware execute breakpoints (DR7), plus a hook registered
+//      after the block was already cached. Fixed by re-checking all of these at every dispatch,
+//      not just at lift time -- see step_impl's masking_safe_now.
+// One narrow, accepted residual: an async request_stop() landing exactly mid-span can still
+// surface a stale masked value on that abort path. Not fixed -- treated the same as any other
+// best-effort-soon abort semantics. See Flag Liveness Execution Model Problem.md.
+constexpr bool kFlagLivenessTablesTrustworthy = true;
+
+bool Executor::block_liveness_eligible(const Memory& memory) const noexcept {
+  // Instruction/code hooks and memory-access hooks get full ExecutionContext (state.rflags)
+  // access at points mid-block that iced's per-instruction rflags tables don't know about -- see
+  // flag_liveness.hpp and Hook and Instrumentation Model.md. Trap and execution hooks don't have
+  // that problem (execution hooks only ever get an address, not state; trap-kind instructions are
+  // always block-terminal under the boundary rules below) and are deliberately not checked here.
+  return !has_instruction_hooks_ && !has_code_hooks_ &&
+         !has_execution_hooks_ && !has_execution_address_hooks_ &&
+         !memory.has_access_hooks();
+}
+
 ExecutionResult Executor::step(CpuState& state, Memory& memory) {
+  return step_impl(state, memory, false);
+}
+
+ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_masking) {
   clear_violation();
   if (collect_code_stats_) { ++total_steps_; }
   if (stop_requested_) {
@@ -622,6 +667,73 @@ ExecutionResult Executor::step(CpuState& state, Memory& memory) {
       cache_entry.trap_kind = trap.has_value() ? static_cast<std::uint8_t>(*trap) : 0xFFu;
       cache_entry.instruction_length = std::max<std::uint32_t>(1u, cache_entry.instr.length());
       cache_entry.valid = can_use_decode_cache;
+      cache_entry.dead_flags_mask = 0;
+
+      // Opportunistically lift the rest of this basic block (straight-line run up to the first
+      // control-flow/trap/hooked-address boundary) so the backward flag liveness pass has more
+      // than one instruction to work with. This only pre-populates decode_cache_ entries for
+      // instructions step() would decode-cache anyway on its next few calls; it doesn't change
+      // what gets executed now or batch dispatch in any way. See IR and Flag Liveness.md.
+      if (fetched && cache_entry.valid && cache_entry.trap_kind == 0xFFu && cache_entry.simd_allowed &&
+          iced_x86::InstructionExtensions::flow_control(cache_entry.instr) == iced_x86::FlowControl::NEXT) {
+        std::array<std::size_t, kMaxBlockLiftLength> lifted_indices{};
+        lifted_indices[0] = cache_index;
+        std::size_t lifted_count = 1;
+        while (lifted_count < kMaxBlockLiftLength) {
+          const auto next_decoded = decoder.decode();
+          if (!next_decoded.has_value()) {
+            break;
+          }
+          const auto next_rip = next_decoded.value().ip();
+          if (has_execution_address_hooks_ && execution_address_hooks_.contains(next_rip)) {
+            break;
+          }
+          const auto next_index = static_cast<std::size_t>((next_rip >> 1) & (kDecodeCacheSize - 1));
+          // The cache index folds two consecutive addresses (rip, rip+1) onto the same slot
+          // whenever rip is even, so a short enough run of 1-byte instructions can collide with
+          // a slot already claimed earlier in *this* lift -- including slot 0, which is
+          // cache_entry itself, still pending dispatch below. Stop rather than let a later
+          // instruction overwrite an earlier one's entry out from under it.
+          bool collides = false;
+          for (std::size_t i = 0; i < lifted_count; ++i) {
+            if (lifted_indices[i] == next_index) {
+              collides = true;
+              break;
+            }
+          }
+          if (collides) {
+            break;
+          }
+          auto& next_entry = (*decode_cache_)[next_index];
+          next_entry.rip = next_rip;
+          next_entry.code_epoch = code_epoch;
+          next_entry.mode = state.mode;
+          next_entry.instr = next_decoded.value();
+          next_entry.simd_allowed = simd_profile_allows(next_entry.instr);
+          next_entry.reported_code = normalize_reported_code(next_entry.instr.code());
+          const auto next_trap = trap_kind_for_code(next_entry.instr.code());
+          next_entry.trap_kind = next_trap.has_value() ? static_cast<std::uint8_t>(*next_trap) : 0xFFu;
+          next_entry.instruction_length = std::max<std::uint32_t>(1u, next_entry.instr.length());
+          next_entry.dead_flags_mask = 0;
+          next_entry.valid = true;
+          lifted_indices[lifted_count++] = next_index;
+          const bool is_boundary = !next_entry.simd_allowed || next_entry.trap_kind != 0xFFu ||
+              iced_x86::InstructionExtensions::flow_control(next_entry.instr) != iced_x86::FlowControl::NEXT;
+          if (is_boundary) {
+            break;
+          }
+        }
+        if (kFlagLivenessTablesTrustworthy && lifted_count > 1 && block_liveness_eligible(memory)) {
+          std::array<FlagLivenessInstr, kMaxBlockLiftLength> liveness{};
+          for (std::size_t i = 0; i < lifted_count; ++i) {
+            liveness[i].instr = &(*decode_cache_)[lifted_indices[i]].instr;
+          }
+          compute_flag_liveness(std::span<FlagLivenessInstr>(liveness.data(), lifted_count));
+          for (std::size_t i = 0; i < lifted_count; ++i) {
+            (*decode_cache_)[lifted_indices[i]].dead_flags_mask = liveness[i].dead_flags_mask;
+          }
+        }
+      }
     }
 
     const auto& instr = cache_entry.instr;
@@ -799,6 +911,19 @@ ExecutionResult Executor::step(CpuState& state, Memory& memory) {
     // mapping only affected the *reported* code while dispatch used the raw code, so seven executed the
     // 4-byte handler (rsp -= 4) -- corrupting the stack for any VMProtect VM that pushes an imm.
     const auto code = reported_code;
+    // The precomputed mask is only actually trustworthy right now if: (1) the caller guarantees
+    // it will keep draining through the rest of the block (allow_masking -- only run() promises
+    // this, and only with enough budget headroom left, see run() below); (2) the single-step trap
+    // flag isn't active (TF means the CPU model wants to stop after *this* instruction, same as a
+    // bare step() call -- masking across instructions that won't run yet is exactly what's
+    // unsound); (3) no debug registers are armed (conservatively -- an execute breakpoint mid-span
+    // is the same hazard as TF); (4) no hook got registered after this block was lifted (hooks are
+    // checked once at lift time in block_liveness_eligible(), but a cached block's mask persists
+    // across dispatches -- hooks added later must still disable it). See
+    // Flag Liveness Execution Model Problem.md.
+    const bool masking_safe_now = allow_masking && (state.rflags & kFlagTF) == 0 &&
+                                   state.dr[7] == 0 && block_liveness_eligible(memory);
+    detail::set_dead_flags_mask(masking_safe_now ? cache_entry.dead_flags_mask : 0);
     switch (code) {
 #define KUBERA_CODE(code) \
     case iced_x86::Code::code: result = handlers::handle_code_##code(ctx); break;
@@ -879,7 +1004,13 @@ ExecutionResult Executor::run(CpuState& state, Memory& memory, std::size_t max_i
       notify_stop_hooks(state, memory, stopped, state.rip);
       return stopped;
     }
-    last = step(state, memory);
+    // Only allow masking when there's enough budget left that ANY lifted block started now
+    // (bounded by kMaxBlockLiftLength) is guaranteed to finish inside this call, so run() never
+    // returns to its own caller mid-span -- see step_impl's masking_safe_now and
+    // Flag Liveness Execution Model Problem.md. Near the tail of the budget this falls back to
+    // the same always-safe unmasked dispatch a bare step() call gets.
+    const bool allow_masking = (max_instructions - i) >= kMaxBlockLiftLength;
+    last = step_impl(state, memory, allow_masking);
     if (last.reason != StopReason::none) {
       last.retired += i;
       return last;

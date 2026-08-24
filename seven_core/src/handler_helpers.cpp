@@ -62,7 +62,28 @@ void write_xcr(CpuState& state, std::uint32_t index, std::uint64_t value) {
   }
 }
 
+namespace {
+// Set (never read) by the current instruction's cached liveness result just before its handler
+// dispatches, and consulted here on every flag write. thread_local so concurrent Executors on
+// separate threads never see each other's mask.
+thread_local std::uint64_t g_dead_flags_mask = 0;
+}  // namespace
+
+void set_dead_flags_mask(std::uint64_t mask) noexcept {
+  g_dead_flags_mask = mask & kAluStatusFlagsMask;
+}
+
+std::uint64_t dead_flags_mask() noexcept {
+  return g_dead_flags_mask;
+}
+
 void set_flag(std::uint64_t& rflags, std::uint64_t bit, bool value) {
+  if ((bit & g_dead_flags_mask) != 0) {
+    // Provably dead per the block liveness pass: nothing before the next write to this bit (or
+    // the end of the translated block) reads it. Drop the write entirely rather than compute
+    // `value` differently -- this must stay a pure skip, never an approximation.
+    return;
+  }
   if (value) {
     rflags |= bit;
   } else {

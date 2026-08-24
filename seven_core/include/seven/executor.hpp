@@ -78,6 +78,13 @@ class Executor {
   void refresh_hook_flags() noexcept;
 
   static ExecutionResult unsupported(ExecutionContext& ctx);
+  // The shared dispatch core behind both step() and run()'s internal loop. `allow_masking` gates
+  // whether a cached block's precomputed dead_flags_mask may actually be applied -- see its call
+  // sites and Flag Liveness Execution Model Problem.md for why this can never just be "trust the
+  // cache": a bare step() call never guarantees the caller will keep advancing through the rest of
+  // a lifted block, so the public step() always passes false. Only run()'s own internal loop,
+  // which does guarantee that (given enough budget headroom), passes true.
+  [[nodiscard]] ExecutionResult step_impl(CpuState& state, Memory& memory, bool allow_masking);
   static constexpr std::size_t kDecodeCacheSize = 8192;
   static constexpr std::size_t kCodePageCacheSize = 64;
   struct CachedCodePageEntry {
@@ -96,7 +103,13 @@ class Executor {
     std::uint32_t instruction_length = 0;
     iced_x86::Code reported_code = iced_x86::Code::INVALID;
     iced_x86::Instruction instr{};
+    // ALU status flags (subset of kAluStatusFlagsMask) this instruction writes that the block
+    // liveness pass proved dead -- see seven/flag_liveness.hpp. 0 for every instruction outside a
+    // liveness-eligible block (the correct, always-safe default: compute every flag).
+    std::uint64_t dead_flags_mask = 0;
   };
+  static constexpr std::size_t kMaxBlockLiftLength = 64;
+  [[nodiscard]] bool block_liveness_eligible(const Memory& memory) const noexcept;
   std::uint64_t total_steps_ = 0;
   std::uint64_t total_retired_ = 0;
   std::vector<std::uint64_t> code_execution_counts_;
