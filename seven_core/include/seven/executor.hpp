@@ -144,6 +144,11 @@ class Executor {
   bool trace_openkey_probe_ = false;
   bool trace_strrchr_ = false;
   bool collect_code_stats_ = false;
+  // Resolved once at construction, not per-dispatch: std::getenv() is not a cheap call (measured
+  // ~2.4us on this machine, backed by a linear scan and possibly a lock in some CRTs) and this used
+  // to be evaluated on every single step_impl() dispatch, dwarfing the actual cost of decoding and
+  // executing an instruction.
+  bool decode_cache_disabled_by_env_ = false;
   ContextSyncCallback context_read_cb_{};
   ContextSyncCallback context_write_cb_{};
   bool stop_requested_ = false;

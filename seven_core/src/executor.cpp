@@ -39,6 +39,7 @@ Executor::Executor()
   trace_openkey_probe_ = env_flag_set("SEVEN_TRACE_OPENKEY");
   trace_strrchr_ = env_flag_set("SEVEN_TRACE_STRRCHR");
   collect_code_stats_ = env_flag_set("SEVEN_COLLECT_CODE_STATS");
+  decode_cache_disabled_by_env_ = env_flag_set("SEVEN_DISABLE_DECODE_CACHE");
 }
 
 namespace {
@@ -575,7 +576,7 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
     };
 
     const auto code_epoch = memory.code_epoch();
-    const bool can_use_decode_cache = !memory.has_fetch_access_hooks() && std::getenv("SEVEN_DISABLE_DECODE_CACHE") == nullptr;
+    const bool can_use_decode_cache = !memory.has_fetch_access_hooks() && !decode_cache_disabled_by_env_;
     const auto cache_index = static_cast<std::size_t>((state.rip >> 1) & (kDecodeCacheSize - 1));
     auto& cache_entry = (*decode_cache_)[cache_index];
     const bool cache_hit = can_use_decode_cache &&
