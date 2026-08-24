@@ -246,7 +246,7 @@ ExecutionResult handle_code_UNPCKHPD_XMM_XMMM128(ExecutionContext& ctx) {
   });
 }
 
-ExecutionResult handle_code_SHUFPS_XMM_XMMM128(ExecutionContext& ctx) {
+ExecutionResult handle_code_SHUFPS_XMM_XMMM128_IMM8(ExecutionContext& ctx) {
   const auto imm = ctx.instr.immediate8();
   return legacy_binary_lanewise<float, 4>(ctx, kXmmBytes, [imm](const auto& lhs, const auto& rhs) {
     return std::array<float, 4>{

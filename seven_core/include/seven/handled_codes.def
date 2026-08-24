@@ -1729,4 +1729,19 @@ KUBERA_CODE(PREFETCHWT1_M8)
 KUBERA_CODE(PREFETCHNTA_M8)
 KUBERA_CODE(PREFETCHT0_M8)
 KUBERA_CODE(PREFETCHT1_M8)
+
+// Orphaned handlers found by a handle_code_* vs. handled_codes.def sweep
+// (seven-fuzzer, 2026-08-24). Only entries individually confirmed against
+// iced_x86's real Code enum (iced_x86/include/iced_x86/code.hpp) are
+// registered here -- the sweep's naive function-name diff produced a much
+// longer candidate list (ENTERD/Q/W, FIST_M64INT, LDMXCSR, STMXCSR,
+// PUSH_IMM8/32, the VEX YMM-width shift family, and the whole EVEX
+// K1Z-masked shuffle/unpack/pack family), but most of those handler
+// functions turn out to be misnamed relative to the actual enum value they
+// were meant to implement (e.g. missing an _IMM8/_B32 suffix, or a different
+// operand count than the name implies), which only surfaces as a hard
+// compile error if guessed at blindly. Left unregistered pending per-name
+// verification -- not attempted here to avoid shipping more guesses.
+KUBERA_CODE(SHUFPS_XMM_XMMM128_IMM8)
+KUBERA_CODE(VEX_ANDN_R64_R64_RM64)
 KUBERA_CODE(PREFETCHT2_M8)

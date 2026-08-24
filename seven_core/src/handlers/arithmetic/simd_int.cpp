@@ -344,21 +344,21 @@ ExecutionResult vex_bitwise(ExecutionContext& ctx, Fn&& fn, bool zero_upper = tr
 }
 
 template <typename T>
-T shift_left_lane(T value, unsigned count) {
+T shift_left_lane(T value, std::uint64_t count) {
   if (count >= sizeof(T) * 8) return T{0};
   using u = std::make_unsigned_t<T>;
   return static_cast<T>(static_cast<u>(value) << count);
 }
 
 template <typename T>
-T shift_right_logical_lane(T value, unsigned count) {
+T shift_right_logical_lane(T value, std::uint64_t count) {
   if (count >= sizeof(T) * 8) return T{0};
   using u = std::make_unsigned_t<T>;
   return static_cast<T>(static_cast<u>(value) >> count);
 }
 
 template <typename T>
-T shift_right_arithmetic_lane(T value, unsigned count) {
+T shift_right_arithmetic_lane(T value, std::uint64_t count) {
   if (count >= sizeof(T) * 8) return value < 0 ? static_cast<T>(-1) : T{0};
   return static_cast<T>(value >> count);
 }
@@ -368,12 +368,18 @@ ExecutionResult legacy_shift_reg(ExecutionContext& ctx, Fn&& fn, bool zero_upper
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
-  if (ctx.instr.op_kind(1) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(1))) {
-    return detail::memory_fault(ctx, detail::memory_address(ctx));
-  }
-  const auto count_bits = read_vec(ctx.state, ctx.instr.op_register(1));
-  const auto count = static_cast<unsigned>(count_bits & 0xFFu);
+  // The count source (operand 1) is xmm-or-m128 for the legacy 2-operand
+  // form, not register-only -- read_operand() handles both, matching every
+  // sibling *_reg function in this file. A prior register-only check here
+  // rejected the valid memory form outright and faulted on a mapped address.
+  bool ok = false;
   const auto dst_reg = ctx.instr.op_register(0);
+  const auto count_bits = read_operand(ctx, 1, vector_width(dst_reg), &ok);
+  if (!ok) return detail::memory_fault(ctx, detail::memory_address(ctx));
+  // Real hardware compares the full low 64 bits of the count source against
+  // the per-element saturation threshold, not just the low byte -- a count
+  // like 0x100 must saturate to zero, not wrap to a truncated real shift.
+  const auto count = lane_load<std::uint64_t>(count_bits, 0);
   const auto src_bits = read_vec(ctx.state, dst_reg);
   big_uint out = 0;
   for (std::size_t lane = 0; lane < vector_width(dst_reg); lane += sizeof(T)) {
@@ -430,7 +436,9 @@ ExecutionResult vex_shift_reg(ExecutionContext& ctx, Fn&& fn, bool zero_upper = 
   bool ok = false;
   const auto count_bits = read_operand(ctx, 2, sizeof(std::uint64_t), &ok);
   if (!ok) return detail::memory_fault(ctx, detail::memory_address(ctx));
-  const auto count = static_cast<unsigned>(count_bits & 0xFFu);
+  // See legacy_shift_reg above -- the full low 64 bits of the count source
+  // matter for the saturation threshold, not just the low byte.
+  const auto count = lane_load<std::uint64_t>(count_bits, 0);
   const auto dst_reg = ctx.instr.op_register(0);
   const auto original = read_vec(ctx.state, dst_reg);
   const auto src_bits = read_vec(ctx.state, ctx.instr.op_register(1));
