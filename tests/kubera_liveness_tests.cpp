@@ -107,3 +107,34 @@ TEST(KuberaLiveness, TrapFlagDisablesMaskingViaRun) {
   EXPECT_NE(state.rflags & seven::kFlagCF, 0u);
   EXPECT_NE(state.rflags & seven::kFlagZF, 0u);
 }
+
+TEST(KuberaLiveness, JitBypassEligibleReflectsHooksAndTrapState) {
+  // jit_bypass_eligible() is a narrow public surface for an external native-codegen consumer (see
+  // seven-jit's JitExecutor) to ask "can I run my own code for a span of instructions without
+  // going through step()/step_impl() at all" -- it needs to say no for exactly the same reasons
+  // flag-liveness masking does: a hook that needs full per-instruction visibility, or a runtime
+  // condition (trap flag, active hardware breakpoint) that requires per-instruction stepping
+  // regardless of hooks.
+  seven::CpuState state{};
+  seven::Memory memory{};
+  seven::Executor executor{};
+  state.mode = seven::ExecutionMode::long64;
+
+  EXPECT_TRUE(executor.jit_bypass_eligible(state, memory));
+
+  const auto hook_id = executor.add_instruction_hook(
+      [](seven::InstructionHookContext&) { return seven::InstructionHookResult{}; });
+  EXPECT_FALSE(executor.jit_bypass_eligible(state, memory));
+  ASSERT_TRUE(executor.remove_hook(hook_id));
+  EXPECT_TRUE(executor.jit_bypass_eligible(state, memory));
+
+  state.rflags |= seven::kFlagTF;
+  EXPECT_FALSE(executor.jit_bypass_eligible(state, memory));
+  state.rflags &= ~seven::kFlagTF;
+  EXPECT_TRUE(executor.jit_bypass_eligible(state, memory));
+
+  state.dr[7] = 1;
+  EXPECT_FALSE(executor.jit_bypass_eligible(state, memory));
+  state.dr[7] = 0;
+  EXPECT_TRUE(executor.jit_bypass_eligible(state, memory));
+}

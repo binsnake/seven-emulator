@@ -516,6 +516,15 @@ ExecutionResult Executor::step(CpuState& state, Memory& memory) {
   return step_impl(state, memory, false);
 }
 
+bool Executor::jit_bypass_eligible(const CpuState& state, const Memory& memory) const noexcept {
+  // Reuses block_liveness_eligible's hook check -- it's already exactly "can something skip
+  // step_impl's normal per-instruction machinery here," which is what flag-liveness masking and an
+  // external codegen bypass both need, for an overlapping reason. Trap flag and DR7 additionally
+  // gate this the same way they gate masking_safe_now below: single-stepping (real or debug-driven)
+  // has to keep landing on every instruction boundary regardless of hooks.
+  return (state.rflags & kFlagTF) == 0 && state.dr[7] == 0 && block_liveness_eligible(memory);
+}
+
 ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_masking) {
   clear_violation();
   if (collect_code_stats_) { ++total_steps_; }

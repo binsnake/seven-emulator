@@ -63,6 +63,14 @@ class Executor {
   [[nodiscard]] std::uint64_t total_steps() const noexcept;
   [[nodiscard]] std::uint64_t total_retired() const noexcept;
   void reset_stats();
+  // True if it's currently safe for an external consumer (e.g. a native-codegen layer sitting on
+  // top of this Executor) to run its own code for a span of instructions starting at `state.rip`
+  // without going through step()/step_impl() at all -- meaning no hook that needs full
+  // per-instruction visibility is registered, and the CPU isn't in a state (trap flag set, active
+  // hardware execute breakpoint) that requires per-instruction interpreter dispatch regardless of
+  // hooks. If this returns false, every instruction in that span must go through step() so hooks
+  // and traps keep firing at the granularity callers already depend on.
+  [[nodiscard]] bool jit_bypass_eligible(const CpuState& state, const Memory& memory) const noexcept;
 
  private:
   using CodeIndex = std::size_t;
