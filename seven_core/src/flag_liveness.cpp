@@ -302,6 +302,20 @@ struct FlagsInfo {
     case iced_x86::Code::IDIV_RM8: case iced_x86::Code::IDIV_RM16:
     case iced_x86::Code::IDIV_RM32: case iced_x86::Code::IDIV_RM64:
       return true;  // divide error is a property of the VALUE, independent of operand kind
+
+    // CALL/RET push/pop the return address on the stack as an implicit side effect -- the operand
+    // loop above only sees the branch target (BRANCH-kind for direct forms, REGISTER-kind for a
+    // register-indirect call), never the stack access itself, so this needs its own list the same
+    // way DIV/IDIV does. Far-through-memory forms (CALL_M16xx) already have an explicit MEMORY
+    // operand and are caught above; listed here anyway would just be a harmless duplicate.
+    case iced_x86::Code::CALL_REL16: case iced_x86::Code::CALL_REL32_32: case iced_x86::Code::CALL_REL32_64:
+    case iced_x86::Code::CALL_RM16: case iced_x86::Code::CALL_RM32: case iced_x86::Code::CALL_RM64:
+    case iced_x86::Code::CALL_PTR1616: case iced_x86::Code::CALL_PTR1632:
+    case iced_x86::Code::RETNW: case iced_x86::Code::RETND: case iced_x86::Code::RETNQ:
+    case iced_x86::Code::RETNW_IMM16: case iced_x86::Code::RETND_IMM16: case iced_x86::Code::RETNQ_IMM16:
+    case iced_x86::Code::RETFW: case iced_x86::Code::RETFD: case iced_x86::Code::RETFQ:
+    case iced_x86::Code::RETFW_IMM16: case iced_x86::Code::RETFD_IMM16: case iced_x86::Code::RETFQ_IMM16:
+      return true;
     default:
       return false;
   }
