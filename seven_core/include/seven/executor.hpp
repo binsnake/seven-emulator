@@ -79,6 +79,15 @@ class Executor {
   // dispatch_handler(). An external caller doing its own dispatch_handler() call needs this to
   // know which codes it can't just hand off the same way.
   [[nodiscard]] static bool is_trap_instruction(iced_x86::Code code) noexcept;
+  // True if this instruction's SIMD encoding/register width is allowed under the compiled-in
+  // AVX/AVX-512/max-vector-width profile (SEVEN_ENABLE_AVX, SEVEN_ENABLE_AVX512,
+  // SEVEN_MAX_VECTOR_BYTES) -- the same gate step_impl() applies before ever calling
+  // dispatch_handler() for a SIMD instruction (see kEnableAvx/kEnableAvx512/kVectorBytes in
+  // executor.cpp). dispatch_handler() itself does NOT re-check this internally, so an external
+  // caller invoking it directly for a vector-register instruction (e.g. a native-codegen callout
+  // bridge) MUST call this first, the same way step_impl() does, or a disabled/oversized SIMD op
+  // would silently run anyway.
+  [[nodiscard]] static bool simd_profile_allows(const iced_x86::Instruction& instr) noexcept;
 
  private:
   using CodeIndex = std::size_t;

@@ -64,23 +64,6 @@ constexpr std::size_t kZmmWidth = 64;
   return 0;
 }
 
-[[nodiscard]] bool simd_profile_allows(const iced_x86::Instruction& instr) noexcept {
-  const auto encoding = iced_x86::InstructionExtensions::encoding(instr);
-  if (encoding == iced_x86::EncodingKind::EVEX && !kEnableAvx512) {
-    return false;
-  }
-  if (encoding == iced_x86::EncodingKind::VEX && !kEnableAvx) {
-    return false;
-  }
-  for (std::uint32_t i = 0; i < instr.op_count(); ++i) {
-    if (instr.op_kind(i) == iced_x86::OpKind::REGISTER &&
-        vector_width_for_register(instr.op_register(i)) > kVectorBytes) {
-      return false;
-    }
-  }
-  return true;
-}
-
 [[nodiscard]] iced_x86::Code normalize_reported_code(iced_x86::Code code) noexcept {
   switch (code) {
     case iced_x86::Code::PUSHD_IMM8:
@@ -1362,6 +1345,23 @@ ExecutionResult Executor::unsupported(ExecutionContext& ctx) {
 
 bool Executor::is_trap_instruction(iced_x86::Code code) noexcept {
   return trap_kind_for_code(code).has_value();
+}
+
+bool Executor::simd_profile_allows(const iced_x86::Instruction& instr) noexcept {
+  const auto encoding = iced_x86::InstructionExtensions::encoding(instr);
+  if (encoding == iced_x86::EncodingKind::EVEX && !kEnableAvx512) {
+    return false;
+  }
+  if (encoding == iced_x86::EncodingKind::VEX && !kEnableAvx) {
+    return false;
+  }
+  for (std::uint32_t i = 0; i < instr.op_count(); ++i) {
+    if (instr.op_kind(i) == iced_x86::OpKind::REGISTER &&
+        vector_width_for_register(instr.op_register(i)) > kVectorBytes) {
+      return false;
+    }
+  }
+  return true;
 }
 
 // forceinline so step_impl's dispatch stays as fast as before this got pulled out of it
