@@ -114,12 +114,9 @@ class Memory {
     return (active_access_hook_kinds_ & bit(MemoryAccessKind::instruction_fetch)) != 0;
   }
   [[nodiscard]] std::uint64_t code_epoch() const noexcept { return code_epoch_; }
-  // Per-page counterpart to code_epoch(): lets a caller (a native code cache keyed by more than
-  // one instruction) invalidate only the pages a compiled span actually covers instead of the
-  // whole cache on any executable-page write anywhere. Values come from the same shared counter
-  // as code_epoch_, so they're globally comparable and never reused across a page's lifetime, even
-  // across an unmap()+map() at the same address -- a page that's currently unmapped (or has never
-  // been mapped) reads back 0, which never collides with a real stamped value (those start at 1).
+  // Per-page version of code_epoch() -- lets a cache invalidate just the pages it covers instead
+  // of everything. Values share code_epoch_'s counter so a remapped page never reuses an old one's
+  // epoch; an unmapped page reads back 0.
   [[nodiscard]] std::uint64_t page_code_epoch(std::uint64_t page_index) const noexcept {
     const auto* entry = lookup_page(page_index);
     return entry != nullptr ? entry->code_epoch : 0;

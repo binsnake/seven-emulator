@@ -71,14 +71,9 @@ class Executor {
   // hooks. If this returns false, every instruction in that span must go through step() so hooks
   // and traps keep firing at the granularity callers already depend on.
   [[nodiscard]] bool jit_bypass_eligible(const CpuState& state, const Memory& memory) const noexcept;
-  // The same per-opcode handler switch step_impl() itself dispatches through, exposed so an
-  // external codegen layer can route ONE instruction it doesn't compile natively through the exact
-  // same handler logic the interpreter uses (never a reimplementation), rather than having to fall
-  // back to interpreting everything from that point on. Doesn't touch any Executor instance state
-  // (hooks, stats, the decode cache) -- callers that need dead-flags masking active during the call
-  // must set it themselves via seven::detail::set_dead_flags_mask() first, and are responsible for
-  // committing `ctx.next_rip`/`ctx.control_flow_taken` into state.rip and masking state.gpr[4]
-  // afterward the same way step_impl does, since this only runs the handler itself.
+  // Same per-opcode dispatch step_impl() uses, for external callers that want to run one
+  // instruction through the real handler instead of reimplementing it. Just runs the handler --
+  // caller sets detail::set_dead_flags_mask() beforehand and commits rip/rsp afterward itself.
   [[nodiscard]] static ExecutionResult dispatch_handler(ExecutionContext& ctx, iced_x86::Code code);
 
  private:
