@@ -1360,7 +1360,8 @@ ExecutionResult Executor::unsupported(ExecutionContext& ctx) {
   return {StopReason::unsupported_instruction, 0, ExceptionInfo{StopReason::unsupported_instruction, ctx.state.rip, 0}, std::nullopt};
 }
 
-ExecutionResult Executor::dispatch_handler(ExecutionContext& ctx, iced_x86::Code code) {
+// forceinline so step_impl's dispatch stays as fast as before this got pulled out of it
+__forceinline ExecutionResult Executor::dispatch_handler(ExecutionContext& ctx, iced_x86::Code code) {
   switch (code) {
 #define KUBERA_CODE(code) \
     case iced_x86::Code::code: return handlers::handle_code_##code(ctx);
