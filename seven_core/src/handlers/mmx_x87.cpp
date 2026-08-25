@@ -742,10 +742,6 @@ ExecutionResult handle_code_FIST_M32INT(ExecutionContext& ctx) {
   return x87_store_integer(ctx, 4, false, false);
 }
 
-ExecutionResult handle_code_FIST_M64INT(ExecutionContext& ctx) {
-  return x87_store_integer(ctx, 8, false, false);
-}
-
 ExecutionResult handle_code_FISTP_M16INT(ExecutionContext& ctx) {
   return x87_store_integer(ctx, 2, true, false);
 }

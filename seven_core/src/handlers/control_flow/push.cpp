@@ -10,14 +10,6 @@ ExecutionResult handle_code_PUSH_RM64(ExecutionContext& ctx) {
   return push_operand_width(ctx, 8);
 }
 
-ExecutionResult handle_code_PUSH_IMM8(ExecutionContext& ctx) {
-  return push_imm_width(ctx, 1, 8, true);
-}
-
-ExecutionResult handle_code_PUSH_IMM32(ExecutionContext& ctx) {
-  return push_imm_width(ctx, 4, 8, true);
-}
-
 ExecutionResult handle_code_PUSHQ_IMM8(ExecutionContext& ctx) {
   return push_imm_width(ctx, 1, 8, true);
 }

@@ -1734,14 +1734,56 @@ KUBERA_CODE(PREFETCHT1_M8)
 // (seven-fuzzer, 2026-08-24). Only entries individually confirmed against
 // iced_x86's real Code enum (iced_x86/include/iced_x86/code.hpp) are
 // registered here -- the sweep's naive function-name diff produced a much
-// longer candidate list (ENTERD/Q/W, FIST_M64INT, LDMXCSR, STMXCSR,
-// PUSH_IMM8/32, the VEX YMM-width shift family, and the whole EVEX
-// K1Z-masked shuffle/unpack/pack family), but most of those handler
-// functions turn out to be misnamed relative to the actual enum value they
-// were meant to implement (e.g. missing an _IMM8/_B32 suffix, or a different
-// operand count than the name implies), which only surfaces as a hard
-// compile error if guessed at blindly. Left unregistered pending per-name
-// verification -- not attempted here to avoid shipping more guesses.
+// longer candidate list, but most of those handler functions turn out to be
+// misnamed relative to the actual enum value they were meant to implement
+// (e.g. missing an _IMM8/_B32 suffix, or a different operand count than the
+// name implies), which only surfaces as a hard compile error if guessed at
+// blindly. Left unregistered pending per-name verification -- not attempted
+// here to avoid shipping more guesses.
 KUBERA_CODE(SHUFPS_XMM_XMMM128_IMM8)
 KUBERA_CODE(VEX_ANDN_R64_R64_RM64)
 KUBERA_CODE(PREFETCHT2_M8)
+
+// Follow-up pass on the same sweep (2026-08-25): verified and registered the
+// remaining candidates whose handler bodies turned out to be correct once
+// renamed to match the real enum value -- VEX_VSHUFPS/VSHUFPD were missing
+// their trailing _IMM8 (the imm8 shuffle-control operand was already being
+// read correctly, just not reflected in the function name), and the VEX
+// packed-shift family's count-source operand is architecturally XMM-width
+// even for the YMM destination form (SDM: the variable shift count for
+// PSLL/PSRL/PSRA always comes from the low 64 bits of a 128-bit source,
+// never a full 256-bit one) -- the handler bodies already read the count
+// generically off the real decoded operand register, so this was a pure
+// naming fix, not a behavior change. Four more candidates (FIST_M64INT,
+// LDMXCSR, STMXCSR, PUSH_IMM8, PUSH_IMM32) turned out to be dead duplicate
+// code with no real Code counterpart at all -- FIST doesn't have a 64-bit
+// integer store form on real hardware (only FISTP/FISTTP do, both already
+// registered), MXCSR save/restore's real names carry an _M32 suffix
+// (STMXCSR_M32/LDMXCSR_M32, already registered with identical bodies), and
+// PUSH-immediate's real names are width-suffixed (PUSHW_IMM8/PUSHD_IMM8/
+// PUSHD_IMM32/PUSHQ_IMM8/PUSHQ_IMM32, all five already registered) -- these
+// were deleted rather than registered, since there's no unclaimed enum name
+// to register them under.
+//
+// The remaining candidates (the whole EVEX K1Z-masked shuffle/unpack/pack
+// family in simd_shuffle.cpp) are a genuinely deeper gap, not just a naming
+// one: unlike the packed-shift family in simd_int.cpp (which already
+// implements K1Z opmask merging/zeroing via apply_masked_lanes(), reading
+// ctx.instr.op_mask()/zeroing_masking()), the shuffle/unpack handlers never
+// call anything of the kind -- registering them under their real
+// K1Z/B32/B64-suffixed names would silently execute a real AVX-512 masked
+// or broadcast shuffle as if K1 were always all-ones/no-broadcast, wrong
+// whenever a real one isn't. Left unregistered until simd_shuffle.cpp gets
+// the same opmask/broadcast treatment simd_int.cpp already has.
+KUBERA_CODE(VEX_VSHUFPS_XMM_XMM_XMMM128_IMM8)
+KUBERA_CODE(VEX_VSHUFPS_YMM_YMM_YMMM256_IMM8)
+KUBERA_CODE(VEX_VSHUFPD_XMM_XMM_XMMM128_IMM8)
+KUBERA_CODE(VEX_VSHUFPD_YMM_YMM_YMMM256_IMM8)
+KUBERA_CODE(VEX_VPSLLW_YMM_YMM_XMMM128)
+KUBERA_CODE(VEX_VPSLLD_YMM_YMM_XMMM128)
+KUBERA_CODE(VEX_VPSLLQ_YMM_YMM_XMMM128)
+KUBERA_CODE(VEX_VPSRLW_YMM_YMM_XMMM128)
+KUBERA_CODE(VEX_VPSRLD_YMM_YMM_XMMM128)
+KUBERA_CODE(VEX_VPSRLQ_YMM_YMM_XMMM128)
+KUBERA_CODE(VEX_VPSRAW_YMM_YMM_XMMM128)
+KUBERA_CODE(VEX_VPSRAD_YMM_YMM_XMMM128)

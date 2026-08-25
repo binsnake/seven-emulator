@@ -350,6 +350,68 @@ TEST(KuberaSimd, LegacyMovntpsFaultsOnMisalignedMemoryOperand) {
   EXPECT_EQ(result.reason, seven::StopReason::general_protection);
 }
 
+TEST(KuberaSimd, VexVshufpsSelectsCorrectLanesFromBothSources) {
+  // Regression for a real orphaned-handler gap: this handler existed and was correct, but was
+  // registered under the wrong name (missing the trailing _IMM8 the real Code enum value has),
+  // so real VSHUFPS/VEX_VSHUFPS_..._IMM8 hit unsupported_instruction until it was renamed and
+  // wired into handled_codes.def.
+  //
+  // Hand-encoded (InstructionFactory can't produce an IMMEDIATE8 operand here -- iced_x86's
+  // get_immediate_op_kind() is a stub that always returns UNKNOWN_OP_KIND, so every with3/with4
+  // int32_t-immediate overload falls back to IMMEDIATE32, which the real encoder then rejects
+  // for an instruction whose Code value expects IMMEDIATE8; see iced_x86_rflags_stub notes).
+  // vshufps xmm0, xmm1, xmm2, 0xE4 -- VEX.128.0F.WIG C6 /r ib.
+  const auto bytes = seven::parse_hex_bytes("C5 F0 C6 C2 E4");
+
+  run_single(bytes,
+             [](seven::CpuState& state, seven::Memory&) {
+               set_xmm_u32x4(state, 1, 0x1111'1111u, 0x2222'2222u, 0x3333'3333u, 0x4444'4444u);
+               set_xmm_u32x4(state, 2, 0x5555'5555u, 0x6666'6666u, 0x7777'7777u, 0x8888'8888u);
+             },
+             [](const seven::ExecutionResult&, const seven::CpuState& state, const seven::Memory&) {
+               EXPECT_EQ(xmm_u32(state, 0, 0), 0x1111'1111u);  // lhs[0]
+               EXPECT_EQ(xmm_u32(state, 0, 1), 0x2222'2222u);  // lhs[1]
+               EXPECT_EQ(xmm_u32(state, 0, 2), 0x7777'7777u);  // rhs[2]
+               EXPECT_EQ(xmm_u32(state, 0, 3), 0x8888'8888u);  // rhs[3]
+             });
+}
+
+TEST(KuberaSimd, VexVpslldYmmShiftsBothLanesByXmmSourcedCount) {
+  // Regression for the same class of gap, plus the operand-width mismatch that made it: the real
+  // Code enum's count operand is XMM-width (VEX_VPSLLD_YMM_YMM_XMMM128), not YMM-width as the
+  // handler's original (wrong) name implied -- the SDM specifies the variable shift count for
+  // PSLL/PSRL/PSRA always comes from the low 64 bits of a 128-bit source even for the 256-bit
+  // destination form. Also verifies both 128-bit lanes of the YMM destination get shifted
+  // independently by the same count, per AVX's per-lane semantics for this instruction.
+  std::vector<std::uint8_t> bytes;
+  const auto instr = iced_x86::InstructionFactory::with3(
+      iced_x86::Code::VEX_VPSLLD_YMM_YMM_XMMM128,
+      iced_x86::Register::YMM0,
+      iced_x86::Register::YMM1,
+      iced_x86::Register::XMM2);
+  ASSERT_TRUE(encode_to_bytes(instr, bytes, "vpslld ymm0, ymm1, xmm2"));
+
+  run_single(bytes,
+             [](seven::CpuState& state, seven::Memory&) {
+               const seven::SimdUint lane0 = seven::SimdUint(0x00000001u) | (seven::SimdUint(0x00000002u) << 32) |
+                                             (seven::SimdUint(0x00000003u) << 64) | (seven::SimdUint(0x00000004u) << 96);
+               const seven::SimdUint lane1 = seven::SimdUint(0x00000005u) | (seven::SimdUint(0x00000006u) << 32) |
+                                             (seven::SimdUint(0x00000007u) << 64) | (seven::SimdUint(0x00000008u) << 96);
+               state.vectors[1].value = lane0 | (lane1 << 128);
+               set_xmm_u64(state, 2, 4, 0);  // shift count = 4, only the low 64 bits matter
+             },
+             [](const seven::ExecutionResult&, const seven::CpuState& state, const seven::Memory&) {
+               EXPECT_EQ(xmm_u32(state, 0, 0), 0x00000010u);
+               EXPECT_EQ(xmm_u32(state, 0, 1), 0x00000020u);
+               EXPECT_EQ(xmm_u32(state, 0, 2), 0x00000030u);
+               EXPECT_EQ(xmm_u32(state, 0, 3), 0x00000040u);
+               EXPECT_EQ(static_cast<std::uint32_t>((state.vectors[0].value >> 128) & seven::SimdUint(0xFFFFFFFFu)), 0x00000050u);
+               EXPECT_EQ(static_cast<std::uint32_t>((state.vectors[0].value >> 160) & seven::SimdUint(0xFFFFFFFFu)), 0x00000060u);
+               EXPECT_EQ(static_cast<std::uint32_t>((state.vectors[0].value >> 192) & seven::SimdUint(0xFFFFFFFFu)), 0x00000070u);
+               EXPECT_EQ(static_cast<std::uint32_t>((state.vectors[0].value >> 224) & seven::SimdUint(0xFFFFFFFFu)), 0x00000080u);
+             });
+}
+
 TEST(KuberaSimd, Sse42Crc32MatchesCastagnoliReference) {
   std::vector<std::uint8_t> bytes;
   const auto instr = iced_x86::InstructionFactory::with2(

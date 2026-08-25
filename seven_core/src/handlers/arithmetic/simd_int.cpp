@@ -919,14 +919,14 @@ KUBERA_VEX_PACKED_INT_BIT(VEX_VPAND_YMM_YMM_YMMM256, [](auto a, auto b) { return
 KUBERA_VEX_PACKED_INT_BIT(VEX_VPANDN_YMM_YMM_YMMM256, [](auto a, auto b) { return (~a) & b; })
 KUBERA_VEX_PACKED_INT_BIT(VEX_VPOR_YMM_YMM_YMMM256, [](auto a, auto b) { return a | b; })
 KUBERA_VEX_PACKED_INT_BIT(VEX_VPXOR_YMM_YMM_YMMM256, [](auto a, auto b) { return a ^ b; })
-ExecutionResult handle_code_VEX_VPSLLW_YMM_YMM_YMMM256(ExecutionContext& ctx) { return vex_shift_reg<std::uint16_t>(ctx, shift_left_lane<std::uint16_t>, true); }
-ExecutionResult handle_code_VEX_VPSLLD_YMM_YMM_YMMM256(ExecutionContext& ctx) { return vex_shift_reg<std::uint32_t>(ctx, shift_left_lane<std::uint32_t>, true); }
-ExecutionResult handle_code_VEX_VPSLLQ_YMM_YMM_YMMM256(ExecutionContext& ctx) { return vex_shift_reg<std::uint64_t>(ctx, shift_left_lane<std::uint64_t>, true); }
-ExecutionResult handle_code_VEX_VPSRLW_YMM_YMM_YMMM256(ExecutionContext& ctx) { return vex_shift_reg<std::uint16_t>(ctx, shift_right_logical_lane<std::uint16_t>, true); }
-ExecutionResult handle_code_VEX_VPSRLD_YMM_YMM_YMMM256(ExecutionContext& ctx) { return vex_shift_reg<std::uint32_t>(ctx, shift_right_logical_lane<std::uint32_t>, true); }
-ExecutionResult handle_code_VEX_VPSRLQ_YMM_YMM_YMMM256(ExecutionContext& ctx) { return vex_shift_reg<std::uint64_t>(ctx, shift_right_logical_lane<std::uint64_t>, true); }
-ExecutionResult handle_code_VEX_VPSRAW_YMM_YMM_YMMM256(ExecutionContext& ctx) { return vex_shift_reg<std::int16_t>(ctx, shift_right_arithmetic_lane<std::int16_t>, true); }
-ExecutionResult handle_code_VEX_VPSRAD_YMM_YMM_YMMM256(ExecutionContext& ctx) { return vex_shift_reg<std::int32_t>(ctx, shift_right_arithmetic_lane<std::int32_t>, true); }
+ExecutionResult handle_code_VEX_VPSLLW_YMM_YMM_XMMM128(ExecutionContext& ctx) { return vex_shift_reg<std::uint16_t>(ctx, shift_left_lane<std::uint16_t>, true); }
+ExecutionResult handle_code_VEX_VPSLLD_YMM_YMM_XMMM128(ExecutionContext& ctx) { return vex_shift_reg<std::uint32_t>(ctx, shift_left_lane<std::uint32_t>, true); }
+ExecutionResult handle_code_VEX_VPSLLQ_YMM_YMM_XMMM128(ExecutionContext& ctx) { return vex_shift_reg<std::uint64_t>(ctx, shift_left_lane<std::uint64_t>, true); }
+ExecutionResult handle_code_VEX_VPSRLW_YMM_YMM_XMMM128(ExecutionContext& ctx) { return vex_shift_reg<std::uint16_t>(ctx, shift_right_logical_lane<std::uint16_t>, true); }
+ExecutionResult handle_code_VEX_VPSRLD_YMM_YMM_XMMM128(ExecutionContext& ctx) { return vex_shift_reg<std::uint32_t>(ctx, shift_right_logical_lane<std::uint32_t>, true); }
+ExecutionResult handle_code_VEX_VPSRLQ_YMM_YMM_XMMM128(ExecutionContext& ctx) { return vex_shift_reg<std::uint64_t>(ctx, shift_right_logical_lane<std::uint64_t>, true); }
+ExecutionResult handle_code_VEX_VPSRAW_YMM_YMM_XMMM128(ExecutionContext& ctx) { return vex_shift_reg<std::int16_t>(ctx, shift_right_arithmetic_lane<std::int16_t>, true); }
+ExecutionResult handle_code_VEX_VPSRAD_YMM_YMM_XMMM128(ExecutionContext& ctx) { return vex_shift_reg<std::int32_t>(ctx, shift_right_arithmetic_lane<std::int32_t>, true); }
 ExecutionResult handle_code_VEX_VPSLLW_YMM_YMM_IMM8(ExecutionContext& ctx) { return vex_shift_imm<std::uint16_t>(ctx, shift_left_lane<std::uint16_t>, true); }
 ExecutionResult handle_code_VEX_VPSLLD_YMM_YMM_IMM8(ExecutionContext& ctx) { return vex_shift_imm<std::uint32_t>(ctx, shift_left_lane<std::uint32_t>, true); }
 ExecutionResult handle_code_VEX_VPSLLQ_YMM_YMM_IMM8(ExecutionContext& ctx) { return vex_shift_imm<std::uint64_t>(ctx, shift_left_lane<std::uint64_t>, true); }

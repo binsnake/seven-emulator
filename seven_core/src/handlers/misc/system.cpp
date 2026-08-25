@@ -151,26 +151,6 @@ ExecutionResult handle_code_ENDBR64(ExecutionContext&) {
   return {};
 }
 
-ExecutionResult handle_code_STMXCSR(ExecutionContext& ctx) {
-  if (!detail::write_operand(ctx, 0, ctx.state.mxcsr, 4)) {
-    return detail::memory_fault(ctx, detail::memory_address(ctx));
-  }
-  return {};
-}
-
-ExecutionResult handle_code_LDMXCSR(ExecutionContext& ctx) {
-  bool ok = false;
-  const auto value = detail::read_operand(ctx, 0, 4, &ok);
-  if (!ok) {
-    return detail::memory_fault(ctx, detail::memory_address(ctx));
-  }
-  if ((value >> 16) != 0) {
-    return {StopReason::general_protection, 0, ExceptionInfo{StopReason::general_protection, detail::memory_address(ctx), 0}, ctx.instr.code()};
-  }
-  ctx.state.mxcsr = static_cast<std::uint32_t>(value);
-  return {};
-}
-
 ExecutionResult handle_code_STMXCSR_M32(ExecutionContext& ctx) {
   if (!detail::write_operand(ctx, 0, ctx.state.mxcsr, 4)) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));

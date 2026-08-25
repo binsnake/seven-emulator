@@ -362,7 +362,7 @@ ExecutionResult handle_code_VEX_VUNPCKHPD_XMM_XMM_XMMM128(ExecutionContext& ctx)
   });
 }
 
-ExecutionResult handle_code_VEX_VSHUFPS_XMM_XMM_XMMM128(ExecutionContext& ctx) {
+ExecutionResult handle_code_VEX_VSHUFPS_XMM_XMM_XMMM128_IMM8(ExecutionContext& ctx) {
   const auto imm = ctx.instr.immediate8();
   return vex_binary_lanewise<float, 4>(ctx, kXmmBytes, [imm](const auto& lhs, const auto& rhs) {
     return std::array<float, 4>{
@@ -374,7 +374,7 @@ ExecutionResult handle_code_VEX_VSHUFPS_XMM_XMM_XMMM128(ExecutionContext& ctx) {
   });
 }
 
-ExecutionResult handle_code_VEX_VSHUFPD_XMM_XMM_XMMM128(ExecutionContext& ctx) {
+ExecutionResult handle_code_VEX_VSHUFPD_XMM_XMM_XMMM128_IMM8(ExecutionContext& ctx) {
   const auto imm = ctx.instr.immediate8();
   return vex_binary_lanewise<double, 2>(ctx, kXmmBytes, [imm](const auto& lhs, const auto& rhs) {
     return std::array<double, 2>{
@@ -424,7 +424,7 @@ ExecutionResult handle_code_VEX_VUNPCKHPD_YMM_YMM_YMMM256(ExecutionContext& ctx)
   });
 }
 
-ExecutionResult handle_code_VEX_VSHUFPS_YMM_YMM_YMMM256(ExecutionContext& ctx) {
+ExecutionResult handle_code_VEX_VSHUFPS_YMM_YMM_YMMM256_IMM8(ExecutionContext& ctx) {
   const auto imm = ctx.instr.immediate8();
   return vex_binary_lanewise<float, 4>(ctx, kXmmBytes, [imm](const auto& lhs, const auto& rhs) {
     return std::array<float, 4>{
@@ -436,7 +436,7 @@ ExecutionResult handle_code_VEX_VSHUFPS_YMM_YMM_YMMM256(ExecutionContext& ctx) {
   });
 }
 
-ExecutionResult handle_code_VEX_VSHUFPD_YMM_YMM_YMMM256(ExecutionContext& ctx) {
+ExecutionResult handle_code_VEX_VSHUFPD_YMM_YMM_YMMM256_IMM8(ExecutionContext& ctx) {
   const auto imm = ctx.instr.immediate8();
   return vex_binary_lanewise<double, 2>(ctx, kXmmBytes, [imm](const auto& lhs, const auto& rhs) {
     return std::array<double, 2>{
