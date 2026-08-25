@@ -274,6 +274,8 @@ struct FlagsInfo {
   }
 }
 
+}  // namespace
+
 // Whether this specific decoded instruction can fault (page fault on a memory operand, or a
 // data-dependent divide error). This matters for liveness beyond just read/write sets: a masked
 // write is only safe if the instruction that "covers" it is guaranteed to actually run. A fault
@@ -289,7 +291,7 @@ struct FlagsInfo {
 // the explicit divide-error sources. Checking the actual decoded instruction (not just its Code)
 // is what makes this precise: an RM-form instruction only faults on the specific encodings that
 // actually resolved to memory, not on every RM-form Code value.
-[[nodiscard]] bool can_fault(const iced_x86::Instruction& instr) noexcept {
+bool can_fault(const iced_x86::Instruction& instr) noexcept {
   const auto op_count = instr.op_count();
   for (std::uint32_t i = 0; i < op_count; ++i) {
     if (instr.op_kind(i) == iced_x86::OpKind::MEMORY) {
@@ -316,12 +318,23 @@ struct FlagsInfo {
     case iced_x86::Code::RETFW: case iced_x86::Code::RETFD: case iced_x86::Code::RETFQ:
     case iced_x86::Code::RETFW_IMM16: case iced_x86::Code::RETFD_IMM16: case iced_x86::Code::RETFQ_IMM16:
       return true;
+
+    // Same implicit-stack-access gap as CALL/RET, just for the rest of the instructions that push
+    // or pop through rsp without an explicit memory operand.
+    case iced_x86::Code::PUSH_R16: case iced_x86::Code::PUSH_R32: case iced_x86::Code::PUSH_R64:
+    case iced_x86::Code::POP_R16: case iced_x86::Code::POP_R32: case iced_x86::Code::POP_R64:
+    case iced_x86::Code::PUSH_IMM16: case iced_x86::Code::PUSHD_IMM32: case iced_x86::Code::PUSHQ_IMM32:
+    case iced_x86::Code::PUSHD_IMM8: case iced_x86::Code::PUSHQ_IMM8:
+    case iced_x86::Code::PUSHAW: case iced_x86::Code::PUSHAD:
+    case iced_x86::Code::POPAW: case iced_x86::Code::POPAD:
+    case iced_x86::Code::ENTERW_IMM16_IMM8: case iced_x86::Code::ENTERD_IMM16_IMM8: case iced_x86::Code::ENTERQ_IMM16_IMM8:
+    case iced_x86::Code::LEAVEW: case iced_x86::Code::LEAVED: case iced_x86::Code::LEAVEQ:
+    case iced_x86::Code::XLAT_M8:
+      return true;
     default:
       return false;
   }
 }
-
-}  // namespace
 
 void compute_flag_liveness(std::span<FlagLivenessInstr> insts) noexcept {
   // Live-out of the block is conservatively "every ALU status flag" -- Phase 1 does no
