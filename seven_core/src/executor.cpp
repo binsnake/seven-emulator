@@ -284,15 +284,6 @@ struct DebugMemoryAccess {
   }
 }
 
-[[nodiscard]] bool ranges_overlap(std::uint64_t a_base, std::size_t a_size, std::uint64_t b_base, std::size_t b_size) noexcept {
-  if (a_size == 0 || b_size == 0) {
-    return false;
-  }
-  const auto a_end = a_base + static_cast<std::uint64_t>(a_size - 1);
-  const auto b_end = b_base + static_cast<std::uint64_t>(b_size - 1);
-  return !(a_end < b_base || b_end < a_base);
-}
-
 [[nodiscard]] std::vector<DebugMemoryAccess> collect_debug_memory_accesses(CpuState& state, const iced_x86::Instruction& instr) {
   std::vector<DebugMemoryAccess> accesses;
   iced_x86::InstructionInfoFactory info_factory;

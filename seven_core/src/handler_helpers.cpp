@@ -183,7 +183,17 @@ std::uint64_t debug_data_breakpoint_hits(CpuState& state, std::uint64_t address,
   };
   auto ranges_overlap = [](std::uint64_t a_base, std::size_t a_size, std::uint64_t b_base, std::size_t b_size) noexcept {
     if (a_size == 0 || b_size == 0) return false;
-    return a_base < (b_base + b_size) && b_base < (a_base + a_size);
+    // b_base/b_size is the instruction's own memory access -- fully guest-controlled via register
+    // values, unlike the watchpoint side. A guest picking an address near the top of the address
+    // space (e.g. a 64-byte ZMM store) can make b_base + b_size wrap back down past zero, which
+    // the plain non-wrapping comparison below would then read as "no overlap" even when the
+    // access's real (wrapping) span does touch the watched range -- silently evading a hardware
+    // data breakpoint. Same risk on the a side in principle, so guard both: treat either wrap as
+    // "can't rule out overlap" rather than risk a false negative on a debug/security watchpoint.
+    const auto a_end = a_base + static_cast<std::uint64_t>(a_size);
+    const auto b_end = b_base + static_cast<std::uint64_t>(b_size);
+    if (a_end < a_base || b_end < b_base) return true;
+    return a_base < b_end && b_base < a_end;
   };
 
   std::uint64_t hit_bits = 0;
