@@ -79,6 +79,36 @@ class Memory {
     MemoryPermissionMask permissions = kMemoryPermissionAll;
   };
 
+  // JIT-visible fast-path memory TLB: a small, direct-mapped, PUBLIC cache a JIT consumer's
+  // generated code can read and populate directly via offsetof-computed addressing, entirely
+  // separate from Memory's own PRIVATE tlb_ (which only ever serves read()/write()/is_mapped()
+  // internally and is never touched by anything outside this class). Lets compiled code do a
+  // bounds+permission-checked load/store straight against host memory, skipping a trampoline call
+  // entirely on a hit. Memory's own methods never read or populate this -- keeping it coherent
+  // (invalidating it whenever a cached host_data pointer could go stale, gating it off whenever a
+  // hook/MMIO/passthrough could legitimately want to intercept an access) is entirely this class's
+  // job internally (see unmap()/reprotect()/restore_pages() and the hook/mmio/passthrough setters),
+  // but USING it is entirely the JIT layer's responsibility -- Memory itself never reads jit_tlb.
+  struct JitTlbSlot {
+    std::uint64_t guest_page = ~0ull;  // ~0 is never a valid page index (address space is 2^64/kPageSize wide, but a page this high is unreachable in long/legacy mode); doubles as "empty"
+    std::byte* host_data = nullptr;    // this page's raw byte array iff guest_page matches; nullptr otherwise
+    std::uint8_t permissions = 0;
+  };
+  static constexpr std::size_t kJitTlbSize = 16;  // power of two -- direct-mapped by guest_page & (kJitTlbSize-1)
+  std::array<JitTlbSlot, kJitTlbSize> jit_tlb{};
+  // True whenever an access hook, an MMIO region, or a passthrough callback is active -- any of
+  // which means SOME address might need to be intercepted rather than read/written directly, the
+  // same condition read()/write() themselves already gate their own internal fast path on. A JIT
+  // fast path MUST check this (kept up to date automatically, see refresh_jit_fast_path_blocked())
+  // before ever trusting jit_tlb, and treat "blocked" as "always take the slow path," never cache
+  // around it.
+  bool jit_fast_path_blocked = false;
+  // Diagnostic-only counter a JIT consumer's generated code may increment directly on a jit_tlb
+  // hit -- exists for the same reason JitExecutor's compile_count()/hint_hit_count() do: correct
+  // output alone can't prove the fast path engaged rather than the slow path happening to agree.
+  // Memory never reads or writes this itself.
+  std::uint64_t jit_fast_path_hits = 0;
+
   void map(std::uint64_t base, std::size_t size, MemoryPermissionMask permissions = kMemoryPermissionAll);
   void unmap(std::uint64_t base, std::size_t size);
   void reprotect(std::uint64_t base, std::size_t size, MemoryPermissionMask permissions);
@@ -120,6 +150,18 @@ class Memory {
   [[nodiscard]] std::uint64_t page_code_epoch(std::uint64_t page_index) const noexcept {
     const auto* entry = lookup_page(page_index);
     return entry != nullptr ? entry->code_epoch : 0;
+  }
+  // Exposes what lookup_page() already resolves internally, for a jit_tlb miss to populate a slot
+  // with. host_data is valid for as long as this page stays mapped (see unmap()/restore_pages()) --
+  // a caller populating jit_tlb from these is trusting the exact same invariant Memory's own
+  // internal tlb_ already depends on for the same pointer. Returns nullptr/0 if unmapped.
+  [[nodiscard]] std::byte* page_data(std::uint64_t page_index) const noexcept {
+    auto* entry = lookup_page(page_index);
+    return entry != nullptr ? entry->data.data() : nullptr;
+  }
+  [[nodiscard]] MemoryPermissionMask page_permissions(std::uint64_t page_index) const noexcept {
+    const auto* entry = lookup_page(page_index);
+    return entry != nullptr ? entry->permissions : MemoryPermissionMask{0};
   }
   template <typename T>
   [[nodiscard]] bool read(std::uint64_t address, T& value, MemoryAccessKind kind = MemoryAccessKind::data_read) const {
@@ -165,6 +207,14 @@ class Memory {
   };
   void apply_pending_access_hook_ops();
   void refresh_access_hook_state() noexcept;
+  // Recomputes jit_fast_path_blocked from the same three conditions read()/write() already check
+  // before taking their own internal fast path. Called from every access-hook/MMIO/passthrough
+  // mutator -- see jit_fast_path_blocked's doc comment.
+  void refresh_jit_fast_path_blocked() noexcept;
+  // Resets every jit_tlb slot to empty. Called anywhere a cached host_data pointer could go stale
+  // -- unmap() (erases the underlying PageEntry outright), restore_pages() (rebuilds pages_ from
+  // scratch), and reprotect() (permissions, also cached per-slot, could change either direction).
+  void clear_jit_tlb() noexcept { jit_tlb.fill(JitTlbSlot{}); }
   [[nodiscard]] const MmioRegion* find_mmio_region(std::uint64_t address, std::size_t size) const;
   [[nodiscard]] bool has_permission(MemoryPermissionMask permissions, MemoryAccessKind kind) const;
   [[nodiscard]] bool access_allowed(const MemoryAccessEvent& event) const;

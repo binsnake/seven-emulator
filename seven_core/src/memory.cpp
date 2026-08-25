@@ -27,11 +27,13 @@ Memory::PageEntry* Memory::lookup_page(std::uint64_t page_index) const noexcept 
 void Memory::set_passthrough(PassthroughReadFn read_fn, PassthroughWriteFn write_fn) {
   passthrough_read_  = std::move(read_fn);
   passthrough_write_ = std::move(write_fn);
+  refresh_jit_fast_path_blocked();
 }
 
 void Memory::clear_passthrough() {
   passthrough_read_  = nullptr;
   passthrough_write_ = nullptr;
+  refresh_jit_fast_path_blocked();
 }
 
 void Memory::map(std::uint64_t base, std::size_t size, MemoryPermissionMask permissions) {
@@ -42,6 +44,10 @@ void Memory::map(std::uint64_t base, std::size_t size, MemoryPermissionMask perm
   // negative cache entries (slots holding nullptr for previously-unmapped
   // pages) are refreshed.
   invalidate_tlb();
+  // jit_tlb also caches permissions (not just a pointer), which map() can change on an
+  // already-mapped page (try_emplace below is a no-op then, but permissions still get
+  // overwritten) -- clear rather than risk a stale cached permission bit surviving this call.
+  clear_jit_tlb();
   const auto first_page = base / kPageSize;
   const auto last_page = (base + size + kPageSize - 1) / kPageSize;
   for (auto page = first_page; page < last_page; ++page) {
@@ -59,6 +65,9 @@ void Memory::unmap(std::uint64_t base, std::size_t size) {
   ++page_epoch_;
   ++code_epoch_;
   invalidate_tlb();  // erase invalidates references; flush TLB
+  // jit_tlb may hold host_data pointers straight into PageEntry objects this unmap is about to
+  // erase -- those become dangling the instant pages_.erase() runs, not just logically stale.
+  clear_jit_tlb();
   const auto first_page = base / kPageSize;
   const auto last_page = (base + size + kPageSize - 1) / kPageSize;
   for (auto page = first_page; page < last_page; ++page) {
@@ -71,6 +80,10 @@ void Memory::reprotect(std::uint64_t base, std::size_t size, MemoryPermissionMas
   // Reprotect does not erase entries, so cached PageEntry* pointers stay
   // valid. Permissions are read through the pointer, so we don't have to
   // invalidate the TLB.
+  // jit_tlb caches permissions BY VALUE though (not read through host_data the way Memory's own
+  // tlb_ re-reads permissions through PageEntry* every time) -- a reprotect can flip the exact bit
+  // a cached slot's fast path would trust, so this one does need to clear it.
+  clear_jit_tlb();
   const auto first_page = base / kPageSize;
   const auto last_page = (base + size + kPageSize - 1) / kPageSize;
   for (auto page = first_page; page < last_page; ++page) {
@@ -356,6 +369,11 @@ void Memory::refresh_access_hook_state() noexcept {
                           !access_hooks_.empty() ||
                           !pending_added_access_hooks_.empty() ||
                           !pending_removed_access_hooks_.empty();
+  refresh_jit_fast_path_blocked();
+}
+
+void Memory::refresh_jit_fast_path_blocked() noexcept {
+  jit_fast_path_blocked = has_any_access_hooks_ || !mmio_regions_.empty() || (passthrough_read_ != nullptr);
 }
 
 Memory::HookId Memory::map_mmio(std::uint64_t base, std::size_t size, MmioReadCallback on_read, MmioWriteCallback on_write) {
@@ -368,6 +386,7 @@ Memory::HookId Memory::map_mmio(std::uint64_t base, std::size_t size, MmioReadCa
     mmio_min_base_ = std::min(mmio_min_base_, base);
     mmio_max_end_ = std::max(mmio_max_end_, base + size);
   }
+  refresh_jit_fast_path_blocked();
   return id;
 }
 
@@ -386,6 +405,7 @@ bool Memory::unmap_mmio(HookId id) {
           mmio_max_end_ = std::max(mmio_max_end_, region.base + region.size);
         }
       }
+      refresh_jit_fast_path_blocked();
       return true;
     }
   }
@@ -396,6 +416,7 @@ void Memory::clear_mmio_regions() {
   mmio_regions_.clear();
   mmio_min_base_ = ~0ull;
   mmio_max_end_ = 0;
+  refresh_jit_fast_path_blocked();
 }
 
 std::vector<Memory::PageSnapshot> Memory::snapshot_pages() const {
@@ -411,6 +432,7 @@ std::vector<Memory::PageSnapshot> Memory::snapshot_pages() const {
 void Memory::restore_pages(const std::vector<PageSnapshot>& pages) {
   ++page_epoch_;
   invalidate_tlb();
+  clear_jit_tlb();  // pages_.clear() below frees every PageEntry jit_tlb could be pointing at
   pages_.clear();
   for (const auto& snapshot : pages) {
     pages_.emplace(snapshot.page_index, PageEntry{snapshot.data, snapshot.permissions, ++code_epoch_});
