@@ -934,15 +934,7 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
     const bool masking_safe_now = allow_masking && (state.rflags & kFlagTF) == 0 &&
                                    state.dr[7] == 0 && block_liveness_eligible(memory);
     detail::set_dead_flags_mask(masking_safe_now ? cache_entry.dead_flags_mask : 0);
-    switch (code) {
-#define KUBERA_CODE(code) \
-    case iced_x86::Code::code: result = handlers::handle_code_##code(ctx); break;
-#include "seven/handled_codes.def"
-#undef KUBERA_CODE
-      default:
-        result = unsupported(ctx);
-        break;
-    }
+    result = dispatch_handler(ctx, code);
     result.code = reported_code;
     if (result.reason == StopReason::none) {
       if (collect_code_stats_ && static_cast<std::size_t>(code) < code_execution_counts_.size()) {
@@ -1366,6 +1358,17 @@ std::size_t Executor::supported_code_count() const noexcept {
 
 ExecutionResult Executor::unsupported(ExecutionContext& ctx) {
   return {StopReason::unsupported_instruction, 0, ExceptionInfo{StopReason::unsupported_instruction, ctx.state.rip, 0}, std::nullopt};
+}
+
+ExecutionResult Executor::dispatch_handler(ExecutionContext& ctx, iced_x86::Code code) {
+  switch (code) {
+#define KUBERA_CODE(code) \
+    case iced_x86::Code::code: return handlers::handle_code_##code(ctx);
+#include "seven/handled_codes.def"
+#undef KUBERA_CODE
+    default:
+      return unsupported(ctx);
+  }
 }
 
 std::vector<std::uint8_t> parse_hex_bytes(std::string_view text) {
