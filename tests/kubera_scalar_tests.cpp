@@ -262,6 +262,47 @@ TEST(KuberaScalar, FxrstorReadsWritablePages) {
 }
 
 
+TEST(KuberaScalar, BtsWithHugeBitIndexFaultsGeneralProtectionNotPageFault) {
+  // bts [rdi], r8 -- the register-sourced bit index extends the effective address by
+  // (index >> 6) * 8 per the SDM, so a huge index (as seven-fuzzer's random register generation
+  // produces routinely) pushes the real access into non-canonical territory. Real hardware raises
+  // #GP(0) for that, checked before any page walk -- confirmed via a standalone probe. Before this
+  // fix, seven_core had no canonical-address check anywhere, so this came back as a generic
+  // page_fault instead, a real divergence from hardware seven-fuzzer's BT-family findings caught.
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  memory.map(0x4000, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("4C 0F AB 07"));
+  state.gpr[7] = 0x4000;                       // rdi: canonical, mapped base
+  state.gpr[8] = 0xA94F08C0EA937D27ull;         // r8: bit index, huge/negative-looking
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::general_protection);
+}
+
+TEST(KuberaScalar, BtsWithSmallBitIndexStillWorksAfterCanonicalCheck) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  memory.map(0x4000, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("4C 0F AB 07"));
+  state.gpr[7] = 0x4000;
+  state.gpr[8] = 5;  // r8: small in-range bit index
+
+  const auto result = executor.step(state, memory);
+  ASSERT_EQ(result.reason, seven::StopReason::none);
+  std::uint8_t byte0 = 0;
+  ASSERT_TRUE(memory.read(0x4000, &byte0, 1));
+  EXPECT_EQ(byte0, 0x20);
+}
+
 TEST(KuberaScalar, RdsspReportsNoShadowStack) {
   run_single(seven::parse_hex_bytes("F3 48 0F 1E CA"),
              [](seven::CpuState& state, seven::Memory&) {
