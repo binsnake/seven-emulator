@@ -58,7 +58,7 @@ ExecutionResult handle_code_CMOVO_R16_RM16(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 2, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::o)) {
     return {};
@@ -71,7 +71,7 @@ ExecutionResult handle_code_CMOVNO_R16_RM16(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 2, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::no)) {
     return {};
@@ -84,7 +84,7 @@ ExecutionResult handle_code_CMOVB_R16_RM16(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 2, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::b)) {
     return {};
@@ -97,7 +97,7 @@ ExecutionResult handle_code_CMOVAE_R16_RM16(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 2, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::ae)) {
     return {};
@@ -110,7 +110,7 @@ ExecutionResult handle_code_CMOVE_R16_RM16(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 2, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::e)) {
     return {};
@@ -123,7 +123,7 @@ ExecutionResult handle_code_CMOVNE_R16_RM16(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 2, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::ne)) {
     return {};
@@ -136,7 +136,7 @@ ExecutionResult handle_code_CMOVBE_R16_RM16(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 2, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::be)) {
     return {};
@@ -149,7 +149,7 @@ ExecutionResult handle_code_CMOVA_R16_RM16(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 2, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::a)) {
     return {};
@@ -162,7 +162,7 @@ ExecutionResult handle_code_CMOVS_R16_RM16(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 2, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::s)) {
     return {};
@@ -175,7 +175,7 @@ ExecutionResult handle_code_CMOVNS_R16_RM16(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 2, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::ns)) {
     return {};
@@ -188,7 +188,7 @@ ExecutionResult handle_code_CMOVP_R16_RM16(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 2, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::p)) {
     return {};
@@ -201,7 +201,7 @@ ExecutionResult handle_code_CMOVNP_R16_RM16(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 2, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::np)) {
     return {};
@@ -214,7 +214,7 @@ ExecutionResult handle_code_CMOVL_R16_RM16(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 2, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::l)) {
     return {};
@@ -227,7 +227,7 @@ ExecutionResult handle_code_CMOVGE_R16_RM16(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 2, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::ge)) {
     return {};
@@ -240,7 +240,7 @@ ExecutionResult handle_code_CMOVLE_R16_RM16(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 2, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::le)) {
     return {};
@@ -253,7 +253,7 @@ ExecutionResult handle_code_CMOVG_R16_RM16(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 2, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::g)) {
     return {};
@@ -266,7 +266,7 @@ ExecutionResult handle_code_CMOVO_R32_RM32(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 4, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::o)) {
     // A 32-bit CMOV that is not taken still performs its 32-bit destination write,
@@ -283,7 +283,7 @@ ExecutionResult handle_code_CMOVNO_R32_RM32(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 4, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::no)) {
     // A 32-bit CMOV that is not taken still performs its 32-bit destination write,
@@ -300,7 +300,7 @@ ExecutionResult handle_code_CMOVB_R32_RM32(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 4, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::b)) {
     // A 32-bit CMOV that is not taken still performs its 32-bit destination write,
@@ -317,7 +317,7 @@ ExecutionResult handle_code_CMOVAE_R32_RM32(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 4, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::ae)) {
     // A 32-bit CMOV that is not taken still performs its 32-bit destination write,
@@ -334,7 +334,7 @@ ExecutionResult handle_code_CMOVE_R32_RM32(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 4, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::e)) {
     // A 32-bit CMOV that is not taken still performs its 32-bit destination write,
@@ -351,7 +351,7 @@ ExecutionResult handle_code_CMOVNE_R32_RM32(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 4, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::ne)) {
     // A 32-bit CMOV that is not taken still performs its 32-bit destination write,
@@ -368,7 +368,7 @@ ExecutionResult handle_code_CMOVBE_R32_RM32(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 4, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::be)) {
     // A 32-bit CMOV that is not taken still performs its 32-bit destination write,
@@ -385,7 +385,7 @@ ExecutionResult handle_code_CMOVA_R32_RM32(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 4, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::a)) {
     // A 32-bit CMOV that is not taken still performs its 32-bit destination write,
@@ -402,7 +402,7 @@ ExecutionResult handle_code_CMOVS_R32_RM32(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 4, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::s)) {
     // A 32-bit CMOV that is not taken still performs its 32-bit destination write,
@@ -419,7 +419,7 @@ ExecutionResult handle_code_CMOVNS_R32_RM32(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 4, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::ns)) {
     // A 32-bit CMOV that is not taken still performs its 32-bit destination write,
@@ -436,7 +436,7 @@ ExecutionResult handle_code_CMOVP_R32_RM32(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 4, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::p)) {
     // A 32-bit CMOV that is not taken still performs its 32-bit destination write,
@@ -453,7 +453,7 @@ ExecutionResult handle_code_CMOVNP_R32_RM32(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 4, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::np)) {
     // A 32-bit CMOV that is not taken still performs its 32-bit destination write,
@@ -470,7 +470,7 @@ ExecutionResult handle_code_CMOVL_R32_RM32(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 4, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::l)) {
     // A 32-bit CMOV that is not taken still performs its 32-bit destination write,
@@ -487,7 +487,7 @@ ExecutionResult handle_code_CMOVGE_R32_RM32(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 4, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::ge)) {
     // A 32-bit CMOV that is not taken still performs its 32-bit destination write,
@@ -504,7 +504,7 @@ ExecutionResult handle_code_CMOVLE_R32_RM32(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 4, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::le)) {
     // A 32-bit CMOV that is not taken still performs its 32-bit destination write,
@@ -521,7 +521,7 @@ ExecutionResult handle_code_CMOVG_R32_RM32(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 4, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::g)) {
     // A 32-bit CMOV that is not taken still performs its 32-bit destination write,
@@ -538,7 +538,7 @@ ExecutionResult handle_code_CMOVO_R64_RM64(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 8, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::o)) {
     return {};
@@ -551,7 +551,7 @@ ExecutionResult handle_code_CMOVNO_R64_RM64(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 8, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::no)) {
     return {};
@@ -564,7 +564,7 @@ ExecutionResult handle_code_CMOVB_R64_RM64(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 8, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::b)) {
     return {};
@@ -577,7 +577,7 @@ ExecutionResult handle_code_CMOVAE_R64_RM64(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 8, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::ae)) {
     return {};
@@ -590,7 +590,7 @@ ExecutionResult handle_code_CMOVE_R64_RM64(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 8, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::e)) {
     return {};
@@ -603,7 +603,7 @@ ExecutionResult handle_code_CMOVNE_R64_RM64(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 8, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::ne)) {
     return {};
@@ -616,7 +616,7 @@ ExecutionResult handle_code_CMOVBE_R64_RM64(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 8, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::be)) {
     return {};
@@ -629,7 +629,7 @@ ExecutionResult handle_code_CMOVA_R64_RM64(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 8, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::a)) {
     return {};
@@ -642,7 +642,7 @@ ExecutionResult handle_code_CMOVS_R64_RM64(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 8, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::s)) {
     return {};
@@ -655,7 +655,7 @@ ExecutionResult handle_code_CMOVNS_R64_RM64(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 8, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::ns)) {
     return {};
@@ -668,7 +668,7 @@ ExecutionResult handle_code_CMOVP_R64_RM64(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 8, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::p)) {
     return {};
@@ -681,7 +681,7 @@ ExecutionResult handle_code_CMOVNP_R64_RM64(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 8, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::np)) {
     return {};
@@ -694,7 +694,7 @@ ExecutionResult handle_code_CMOVL_R64_RM64(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 8, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::l)) {
     return {};
@@ -707,7 +707,7 @@ ExecutionResult handle_code_CMOVGE_R64_RM64(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 8, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::ge)) {
     return {};
@@ -720,7 +720,7 @@ ExecutionResult handle_code_CMOVLE_R64_RM64(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 8, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::le)) {
     return {};
@@ -733,7 +733,7 @@ ExecutionResult handle_code_CMOVG_R64_RM64(ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, 8, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!eval_cond(ctx.state, Cond::g)) {
     return {};
@@ -745,7 +745,7 @@ ExecutionResult handle_code_CMOVG_R64_RM64(ExecutionContext& ctx) {
 ExecutionResult handle_code_SETO_RM8(ExecutionContext& ctx) {
   const std::uint64_t value = eval_cond(ctx.state, Cond::o) ? 1u : 0u;
   if (!detail::write_operand(ctx, 0, value, 1)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -753,7 +753,7 @@ ExecutionResult handle_code_SETO_RM8(ExecutionContext& ctx) {
 ExecutionResult handle_code_SETNO_RM8(ExecutionContext& ctx) {
   const std::uint64_t value = eval_cond(ctx.state, Cond::no) ? 1u : 0u;
   if (!detail::write_operand(ctx, 0, value, 1)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -761,7 +761,7 @@ ExecutionResult handle_code_SETNO_RM8(ExecutionContext& ctx) {
 ExecutionResult handle_code_SETB_RM8(ExecutionContext& ctx) {
   const std::uint64_t value = eval_cond(ctx.state, Cond::b) ? 1u : 0u;
   if (!detail::write_operand(ctx, 0, value, 1)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -769,7 +769,7 @@ ExecutionResult handle_code_SETB_RM8(ExecutionContext& ctx) {
 ExecutionResult handle_code_SETAE_RM8(ExecutionContext& ctx) {
   const std::uint64_t value = eval_cond(ctx.state, Cond::ae) ? 1u : 0u;
   if (!detail::write_operand(ctx, 0, value, 1)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -777,7 +777,7 @@ ExecutionResult handle_code_SETAE_RM8(ExecutionContext& ctx) {
 ExecutionResult handle_code_SETE_RM8(ExecutionContext& ctx) {
   const std::uint64_t value = eval_cond(ctx.state, Cond::e) ? 1u : 0u;
   if (!detail::write_operand(ctx, 0, value, 1)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -785,7 +785,7 @@ ExecutionResult handle_code_SETE_RM8(ExecutionContext& ctx) {
 ExecutionResult handle_code_SETNE_RM8(ExecutionContext& ctx) {
   const std::uint64_t value = eval_cond(ctx.state, Cond::ne) ? 1u : 0u;
   if (!detail::write_operand(ctx, 0, value, 1)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -793,7 +793,7 @@ ExecutionResult handle_code_SETNE_RM8(ExecutionContext& ctx) {
 ExecutionResult handle_code_SETBE_RM8(ExecutionContext& ctx) {
   const std::uint64_t value = eval_cond(ctx.state, Cond::be) ? 1u : 0u;
   if (!detail::write_operand(ctx, 0, value, 1)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -801,7 +801,7 @@ ExecutionResult handle_code_SETBE_RM8(ExecutionContext& ctx) {
 ExecutionResult handle_code_SETA_RM8(ExecutionContext& ctx) {
   const std::uint64_t value = eval_cond(ctx.state, Cond::a) ? 1u : 0u;
   if (!detail::write_operand(ctx, 0, value, 1)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -809,7 +809,7 @@ ExecutionResult handle_code_SETA_RM8(ExecutionContext& ctx) {
 ExecutionResult handle_code_SETS_RM8(ExecutionContext& ctx) {
   const std::uint64_t value = eval_cond(ctx.state, Cond::s) ? 1u : 0u;
   if (!detail::write_operand(ctx, 0, value, 1)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -817,7 +817,7 @@ ExecutionResult handle_code_SETS_RM8(ExecutionContext& ctx) {
 ExecutionResult handle_code_SETNS_RM8(ExecutionContext& ctx) {
   const std::uint64_t value = eval_cond(ctx.state, Cond::ns) ? 1u : 0u;
   if (!detail::write_operand(ctx, 0, value, 1)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -825,7 +825,7 @@ ExecutionResult handle_code_SETNS_RM8(ExecutionContext& ctx) {
 ExecutionResult handle_code_SETP_RM8(ExecutionContext& ctx) {
   const std::uint64_t value = eval_cond(ctx.state, Cond::p) ? 1u : 0u;
   if (!detail::write_operand(ctx, 0, value, 1)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -833,7 +833,7 @@ ExecutionResult handle_code_SETP_RM8(ExecutionContext& ctx) {
 ExecutionResult handle_code_SETNP_RM8(ExecutionContext& ctx) {
   const std::uint64_t value = eval_cond(ctx.state, Cond::np) ? 1u : 0u;
   if (!detail::write_operand(ctx, 0, value, 1)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -841,7 +841,7 @@ ExecutionResult handle_code_SETNP_RM8(ExecutionContext& ctx) {
 ExecutionResult handle_code_SETL_RM8(ExecutionContext& ctx) {
   const std::uint64_t value = eval_cond(ctx.state, Cond::l) ? 1u : 0u;
   if (!detail::write_operand(ctx, 0, value, 1)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -849,7 +849,7 @@ ExecutionResult handle_code_SETL_RM8(ExecutionContext& ctx) {
 ExecutionResult handle_code_SETGE_RM8(ExecutionContext& ctx) {
   const std::uint64_t value = eval_cond(ctx.state, Cond::ge) ? 1u : 0u;
   if (!detail::write_operand(ctx, 0, value, 1)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -857,7 +857,7 @@ ExecutionResult handle_code_SETGE_RM8(ExecutionContext& ctx) {
 ExecutionResult handle_code_SETLE_RM8(ExecutionContext& ctx) {
   const std::uint64_t value = eval_cond(ctx.state, Cond::le) ? 1u : 0u;
   if (!detail::write_operand(ctx, 0, value, 1)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -865,7 +865,7 @@ ExecutionResult handle_code_SETLE_RM8(ExecutionContext& ctx) {
 ExecutionResult handle_code_SETG_RM8(ExecutionContext& ctx) {
   const std::uint64_t value = eval_cond(ctx.state, Cond::g) ? 1u : 0u;
   if (!detail::write_operand(ctx, 0, value, 1)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }

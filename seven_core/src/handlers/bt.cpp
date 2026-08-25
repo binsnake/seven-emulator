@@ -32,7 +32,7 @@ ExecutionResult read_bt_base_value(ExecutionContext& ctx, std::size_t width, std
   bool ok = false;
   value_out = detail::read_operand(ctx, 0, width, &ok);
   if (!ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   bit_out = bit_index & (bit_span - 1ull);
   return {};

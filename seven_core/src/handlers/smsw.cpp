@@ -11,7 +11,7 @@ static ExecutionResult smsw_impl(ExecutionContext& ctx, std::size_t reg_width) {
   const bool is_mem = ctx.instr.op_kind(0) == iced_x86::OpKind::MEMORY;
   const std::size_t width = is_mem ? 2 : reg_width;
   if (!detail::write_operand(ctx, 0, msw, width)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }

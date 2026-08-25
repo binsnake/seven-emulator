@@ -16,7 +16,7 @@ ExecutionResult imul_reg_rm_imm(ExecutionContext& ctx, std::size_t width, std::s
   bool src_ok = false;
   const auto src = detail::sign_extend(detail::read_operand(ctx, 1, width, &src_ok), width);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto imm = detail::sign_extend(detail::immediate_value(ctx.instr, 2), imm_width);
   const auto product = static_cast<WideT>(static_cast<OperandT>(src)) * static_cast<WideT>(static_cast<OperandT>(imm));
@@ -34,7 +34,7 @@ ExecutionResult handle_code_IMUL_R16_RM16(ExecutionContext& ctx) {
   const auto lhs = detail::sign_extend(detail::read_register(ctx.state, ctx.instr.op_register(0)), 2);
   const auto rhs = detail::sign_extend(detail::read_operand(ctx, 1, 2, &rhs_ok), 2);
   if (!rhs_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto product = static_cast<std::int32_t>(static_cast<std::int16_t>(lhs)) *
                        static_cast<std::int32_t>(static_cast<std::int16_t>(rhs));
@@ -57,7 +57,7 @@ ExecutionResult handle_code_IMUL_R32_RM32(ExecutionContext& ctx) {
   const auto lhs = detail::sign_extend(detail::read_register(ctx.state, ctx.instr.op_register(0)), 4);
   const auto rhs = detail::sign_extend(detail::read_operand(ctx, 1, 4, &rhs_ok), 4);
   if (!rhs_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto product = static_cast<std::int64_t>(static_cast<std::int32_t>(lhs)) *
                        static_cast<std::int64_t>(static_cast<std::int32_t>(rhs));
@@ -80,7 +80,7 @@ ExecutionResult handle_code_IMUL_R64_RM64(ExecutionContext& ctx) {
   const auto lhs = detail::sign_extend(detail::read_register(ctx.state, ctx.instr.op_register(0)), 8);
   const auto rhs = detail::sign_extend(detail::read_operand(ctx, 1, 8, &rhs_ok), 8);
   if (!rhs_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto product = static_cast<math::wide_integer::int128_t>(static_cast<std::int64_t>(lhs)) *
                        static_cast<math::wide_integer::int128_t>(static_cast<std::int64_t>(rhs));
@@ -102,7 +102,7 @@ ExecutionResult handle_code_IMUL_RM8(ExecutionContext& ctx) {
   bool rhs_ok = false;
   const auto rhs = detail::read_operand(ctx, 0, 1, &rhs_ok);
   if (!rhs_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto lhs = detail::read_register(ctx.state, iced_x86::Register::AL);
   const auto product = static_cast<std::int16_t>(static_cast<std::int8_t>(lhs)) *
@@ -117,7 +117,7 @@ ExecutionResult handle_code_IMUL_RM16(ExecutionContext& ctx) {
   bool rhs_ok = false;
   const auto rhs = detail::read_operand(ctx, 0, 2, &rhs_ok);
   if (!rhs_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto lhs = detail::read_register(ctx.state, iced_x86::Register::AX);
   const auto product = static_cast<std::int32_t>(static_cast<std::int16_t>(lhs)) *
@@ -133,7 +133,7 @@ ExecutionResult handle_code_IMUL_RM32(ExecutionContext& ctx) {
   bool rhs_ok = false;
   const auto rhs = detail::read_operand(ctx, 0, 4, &rhs_ok);
   if (!rhs_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto lhs = detail::read_register(ctx.state, iced_x86::Register::EAX);
   const auto product = static_cast<std::int64_t>(static_cast<std::int32_t>(lhs)) *
@@ -149,7 +149,7 @@ ExecutionResult handle_code_IMUL_RM64(ExecutionContext& ctx) {
   bool rhs_ok = false;
   const auto rhs = detail::read_operand(ctx, 0, 8, &rhs_ok);
   if (!rhs_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto lhs = detail::read_register(ctx.state, iced_x86::Register::RAX);
   const auto product = static_cast<math::wide_integer::int128_t>(static_cast<std::int64_t>(lhs)) *

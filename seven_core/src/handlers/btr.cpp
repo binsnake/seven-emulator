@@ -31,7 +31,7 @@ ExecutionResult btr_rmw(ExecutionContext& ctx, std::size_t width, std::uint64_t 
     bool lhs_ok = false;
     value = detail::read_operand(ctx, 0, width, &lhs_ok);
     if (!lhs_ok) {
-      return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+      return detail::memory_fault(ctx, detail::memory_address(ctx));
     }
     bit = bit_index & (bit_span - 1ull);
   }
@@ -45,7 +45,7 @@ ExecutionResult btr_rmw(ExecutionContext& ctx, std::size_t width, std::uint64_t 
       return wr;
     }
   } else if (!detail::write_operand(ctx, 0, value, width)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
 
   detail::set_flag(ctx.state.rflags, kFlagCF, old_bit);

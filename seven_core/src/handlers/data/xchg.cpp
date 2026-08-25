@@ -7,14 +7,14 @@ ExecutionResult xchg_rm_r(ExecutionContext& ctx, std::size_t width) {
   bool dst_ok = false;
   const auto lhs = detail::read_operand(ctx, 0, width, &dst_ok);
   if (!dst_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto rhs = detail::read_register(ctx.state, ctx.instr.op_register(1));
   if (!detail::write_operand(ctx, 0, rhs, width)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!detail::write_operand(ctx, 1, lhs, width)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -23,18 +23,18 @@ ExecutionResult xchg_r_r(ExecutionContext& ctx, std::size_t width) {
   bool lhs_ok = false;
   const auto lhs = detail::read_operand(ctx, 0, width, &lhs_ok);
   if (!lhs_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   bool rhs_ok = false;
   const auto rhs = detail::read_operand(ctx, 1, width, &rhs_ok);
   if (!rhs_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!detail::write_operand(ctx, 0, rhs, width)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!detail::write_operand(ctx, 1, lhs, width)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }

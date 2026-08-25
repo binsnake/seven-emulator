@@ -125,7 +125,7 @@ ExecutionResult handle_code_blsi(std::uint8_t size, ExecutionContext& ctx) {
   bool src_ok = false;
   auto src = detail::read_operand(ctx, 1, size, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto result = src & (~src + 1ull);
   detail::set_flag(ctx.state.rflags, kFlagSF, (result & (1ull << (bit_width(size) - 1ull))) != 0ull);
@@ -135,7 +135,7 @@ ExecutionResult handle_code_blsi(std::uint8_t size, ExecutionContext& ctx) {
   detail::set_flag(ctx.state.rflags, kFlagAF, false);
   detail::set_flag(ctx.state.rflags, kFlagPF, false);
   if (!detail::write_operand(ctx, 0, result, size)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -144,7 +144,7 @@ ExecutionResult handle_code_blsr(std::uint8_t size, ExecutionContext& ctx) {
   bool src_ok = false;
   auto src = detail::read_operand(ctx, 1, size, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto result = src & (src - 1ull);
   detail::set_flag(ctx.state.rflags, kFlagSF, (result & (1ull << (bit_width(size) - 1ull))) != 0ull);
@@ -154,7 +154,7 @@ ExecutionResult handle_code_blsr(std::uint8_t size, ExecutionContext& ctx) {
   detail::set_flag(ctx.state.rflags, kFlagAF, false);
   detail::set_flag(ctx.state.rflags, kFlagPF, false);
   if (!detail::write_operand(ctx, 0, result, size)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -163,7 +163,7 @@ ExecutionResult handle_code_blsmsk(std::uint8_t size, ExecutionContext& ctx) {
   bool src_ok = false;
   auto src = detail::read_operand(ctx, 1, size, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto result = src ^ (src - 1ull);
   detail::set_flag(ctx.state.rflags, kFlagSF, (result & (1ull << (bit_width(size) - 1ull))) != 0ull);
@@ -173,7 +173,7 @@ ExecutionResult handle_code_blsmsk(std::uint8_t size, ExecutionContext& ctx) {
   detail::set_flag(ctx.state.rflags, kFlagAF, false);
   detail::set_flag(ctx.state.rflags, kFlagPF, false);
   if (!detail::write_operand(ctx, 0, result, size)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -182,17 +182,17 @@ ExecutionResult handle_code_andn(std::uint8_t size, ExecutionContext& ctx) {
   bool src1_ok = false;
   const auto src1 = detail::read_operand(ctx, 1, size, &src1_ok);
   if (!src1_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   bool src2_ok = false;
   const auto src2 = detail::read_operand(ctx, 2, size, &src2_ok);
   if (!src2_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto result = (~src1) & src2;
   detail::set_logic_flags(ctx.state, result, size);
   if (!detail::write_operand(ctx, 0, result, size)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -201,12 +201,12 @@ ExecutionResult handle_code_bzhi(std::uint8_t size, ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, size, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   bool idx_ok = false;
   const auto raw_index = detail::read_operand(ctx, 2, size, &idx_ok);
   if (!idx_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto bits = bit_width(size);
   const auto index = raw_index & 0xFFull;
@@ -223,7 +223,7 @@ ExecutionResult handle_code_bzhi(std::uint8_t size, ExecutionContext& ctx) {
   detail::set_flag(ctx.state.rflags, kFlagAF, false);
   detail::set_flag(ctx.state.rflags, kFlagPF, false);
   if (!detail::write_operand(ctx, 0, result, size)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -232,12 +232,12 @@ ExecutionResult handle_code_bextr(std::uint8_t size, ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, size, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   bool control_ok = false;
   const auto control = detail::read_operand(ctx, 2, size, &control_ok);
   if (!control_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto result = bextr(src, control, size);
   detail::set_flag(ctx.state.rflags, kFlagZF, result == 0);
@@ -247,7 +247,7 @@ ExecutionResult handle_code_bextr(std::uint8_t size, ExecutionContext& ctx) {
   detail::set_flag(ctx.state.rflags, kFlagAF, false);
   detail::set_flag(ctx.state.rflags, kFlagPF, false);
   if (!detail::write_operand(ctx, 0, result, size)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -256,17 +256,17 @@ ExecutionResult handle_code_mulx(std::uint8_t size, ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src2 = detail::read_operand(ctx, 2, size, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto src1 = detail::read_register(ctx.state, size == 4 ? iced_x86::Register::EDX : iced_x86::Register::RDX);
   const auto lo = mulx_low(src1, src2, size);
   const auto hi = mulx_high(src1, src2, size);
   // libLISA writes the low destination before the high destination.
   if (!detail::write_operand(ctx, 1, lo, size)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!detail::write_operand(ctx, 0, hi, size)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -275,16 +275,16 @@ ExecutionResult handle_code_pdep(std::uint8_t size, ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, size, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   bool mask_ok = false;
   const auto mask = detail::read_operand(ctx, 2, size, &mask_ok);
   if (!mask_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto result = pdep(src, mask, size);
   if (!detail::write_operand(ctx, 0, result, size)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -293,16 +293,16 @@ ExecutionResult handle_code_pext(std::uint8_t size, ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, size, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   bool mask_ok = false;
   const auto mask = detail::read_operand(ctx, 2, size, &mask_ok);
   if (!mask_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto result = pext(src, mask, size);
   if (!detail::write_operand(ctx, 0, result, size)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -311,12 +311,12 @@ ExecutionResult handle_code_rorx(std::uint8_t size, ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, size, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto count = ctx.instr.immediate8();
   const auto result = rotate_right(src, count, size);
   if (!detail::write_operand(ctx, 0, result, size)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -325,16 +325,16 @@ ExecutionResult handle_code_sarx(std::uint8_t size, ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, size, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   bool count_ok = false;
   const auto count = detail::read_operand(ctx, 2, size, &count_ok);
   if (!count_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto result = arithmetic_shift_right(src, count, size);
   if (!detail::write_operand(ctx, 0, result, size)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -343,16 +343,16 @@ ExecutionResult handle_code_shlx(std::uint8_t size, ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, size, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   bool count_ok = false;
   const auto count = detail::read_operand(ctx, 2, size, &count_ok);
   if (!count_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto result = shift_left(src, count, size);
   if (!detail::write_operand(ctx, 0, result, size)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -361,16 +361,16 @@ ExecutionResult handle_code_shrx(std::uint8_t size, ExecutionContext& ctx) {
   bool src_ok = false;
   const auto src = detail::read_operand(ctx, 1, size, &src_ok);
   if (!src_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   bool count_ok = false;
   const auto count = detail::read_operand(ctx, 2, size, &count_ok);
   if (!count_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto result = shift_right(src, count, size);
   if (!detail::write_operand(ctx, 0, result, size)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }

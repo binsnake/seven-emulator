@@ -11,7 +11,7 @@ ExecutionResult handle_code_ENTERW(ExecutionContext& ctx) {
   auto sp = detail::read_register(ctx.state, iced_x86::Register::SP);
   sp = (sp - 2ull) & 0xFFFFull;
   if (!ctx.memory.write(sp, &old_bp, 2)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, sp, 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, sp);
   }
   detail::write_register(ctx.state, iced_x86::Register::SP, sp, 2);
   detail::write_register(ctx.state, iced_x86::Register::BP, sp, 2);
@@ -29,7 +29,7 @@ ExecutionResult handle_code_ENTERD(ExecutionContext& ctx) {
   auto sp = detail::read_register(ctx.state, iced_x86::Register::ESP);
   sp -= 4;
   if (!ctx.memory.write(sp, &old_bp, 4)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, sp, 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, sp);
   }
   detail::write_register(ctx.state, iced_x86::Register::EBP, sp, 4);
   detail::write_register(ctx.state, iced_x86::Register::ESP, sp, 4);
@@ -47,7 +47,7 @@ ExecutionResult handle_code_ENTERQ(ExecutionContext& ctx) {
   auto sp = detail::read_register(ctx.state, iced_x86::Register::RSP);
   sp -= 8;
   if (!ctx.memory.write(sp, &old_bp, 8)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, sp, 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, sp);
   }
   detail::write_register(ctx.state, iced_x86::Register::RBP, sp, 8);
   detail::write_register(ctx.state, iced_x86::Register::RSP, sp, 8);

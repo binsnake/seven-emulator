@@ -25,7 +25,7 @@ ExecutionResult movs_impl(ExecutionContext& ctx, const std::size_t width) {
       if (rep) {
         ctx.state.gpr[1] = count - i;
       }
-      return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, read_addr, 0}, ctx.instr.code()};
+      return detail::memory_fault(ctx, read_addr);
     }
     value = detail::truncate(value, width);
     if (!ctx.memory.write(write_addr, &value, width)) {
@@ -34,7 +34,7 @@ ExecutionResult movs_impl(ExecutionContext& ctx, const std::size_t width) {
       if (rep) {
         ctx.state.gpr[1] = count - i;
       }
-      return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, write_addr, 0}, ctx.instr.code()};
+      return detail::memory_fault(ctx, write_addr);
     }
 
     const auto hit_bits = detail::debug_data_breakpoint_hits(ctx.state, read_addr, width, true, false) |

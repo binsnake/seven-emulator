@@ -9,7 +9,7 @@ ExecutionResult handle_code_BOUND_R16_M1616(ExecutionContext& ctx) {
   std::uint16_t lower = 0;
   std::uint16_t upper = 0;
   if (!ctx.memory.read(address, &lower, 2) || !ctx.memory.read(address + 2, &upper, 2)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, address, 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, address);
   }
 
   const auto destination_sign = static_cast<std::int16_t>(destination);
@@ -28,7 +28,7 @@ ExecutionResult handle_code_BOUND_R32_M3232(ExecutionContext& ctx) {
   std::uint32_t lower = 0;
   std::uint32_t upper = 0;
   if (!ctx.memory.read(address, &lower, 4) || !ctx.memory.read(address + 4, &upper, 4)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, address, 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, address);
   }
 
   const auto destination_sign = static_cast<std::int32_t>(destination);

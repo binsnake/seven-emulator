@@ -41,7 +41,7 @@ ExecutionResult handle_code_STI(ExecutionContext& ctx) {
 ExecutionResult handle_code_PUSHFQ(ExecutionContext& ctx) {
   ctx.state.gpr[4] = mask_stack_pointer(ctx.state, ctx.state.gpr[4] - 8);
   if (!ctx.memory.write(ctx.state.gpr[4], &ctx.state.rflags, 8)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, ctx.state.gpr[4], 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, ctx.state.gpr[4]);
   }
   return {};
 }
@@ -49,7 +49,7 @@ ExecutionResult handle_code_PUSHFQ(ExecutionContext& ctx) {
 ExecutionResult handle_code_POPFQ(ExecutionContext& ctx) {
   std::uint64_t value = 0;
   if (!ctx.memory.read(ctx.state.gpr[4], &value, 8)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, ctx.state.gpr[4], 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, ctx.state.gpr[4]);
   }
   // seven emulates ring 3 only. At CPL 3 (IOPL 0) POPFQ CANNOT modify IF/IOPL/VIF/VIP/VM and it
   // clears RF -- it never disables interrupts. Measured on an i9-11900K: user-mode POPF always
@@ -153,7 +153,7 @@ ExecutionResult handle_code_ENDBR64(ExecutionContext&) {
 
 ExecutionResult handle_code_STMXCSR(ExecutionContext& ctx) {
   if (!detail::write_operand(ctx, 0, ctx.state.mxcsr, 4)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -162,7 +162,7 @@ ExecutionResult handle_code_LDMXCSR(ExecutionContext& ctx) {
   bool ok = false;
   const auto value = detail::read_operand(ctx, 0, 4, &ok);
   if (!ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if ((value >> 16) != 0) {
     return {StopReason::general_protection, 0, ExceptionInfo{StopReason::general_protection, detail::memory_address(ctx), 0}, ctx.instr.code()};
@@ -173,7 +173,7 @@ ExecutionResult handle_code_LDMXCSR(ExecutionContext& ctx) {
 
 ExecutionResult handle_code_STMXCSR_M32(ExecutionContext& ctx) {
   if (!detail::write_operand(ctx, 0, ctx.state.mxcsr, 4)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -182,7 +182,7 @@ ExecutionResult handle_code_LDMXCSR_M32(ExecutionContext& ctx) {
   bool ok = false;
   const auto value = detail::read_operand(ctx, 0, 4, &ok);
   if (!ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if ((value >> 16) != 0) {
     return {StopReason::general_protection, 0, ExceptionInfo{StopReason::general_protection, detail::memory_address(ctx), 0}, ctx.instr.code()};

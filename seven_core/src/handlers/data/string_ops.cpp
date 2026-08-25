@@ -31,14 +31,14 @@ ExecutionResult cmps_impl(ExecutionContext& ctx, std::size_t width) {
       ctx.state.gpr[6] = rsi;
       ctx.state.gpr[7] = rdi;
       if (rep) ctx.state.gpr[1] = remaining;
-      return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, lhs_addr, 0}, ctx.instr.code()};
+      return detail::memory_fault(ctx, lhs_addr);
     }
     std::uint64_t rhs = 0;
     if (!ctx.memory.read(rhs_addr, &rhs, width)) {
       ctx.state.gpr[6] = rsi;
       ctx.state.gpr[7] = rdi;
       if (rep) ctx.state.gpr[1] = remaining;
-      return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, rhs_addr, 0}, ctx.instr.code()};
+      return detail::memory_fault(ctx, rhs_addr);
     }
     lhs &= width_mask(width);
     rhs &= width_mask(width);
@@ -98,7 +98,7 @@ ExecutionResult scas_impl(ExecutionContext& ctx, std::size_t width) {
     if (!ctx.memory.read(rhs_addr, &rhs, width)) {
       ctx.state.gpr[7] = rdi;
       if (rep) ctx.state.gpr[1] = remaining;
-      return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, rhs_addr, 0}, ctx.instr.code()};
+      return detail::memory_fault(ctx, rhs_addr);
     }
     rhs &= width_mask(width);
     const auto result = detail::truncate(lhs - rhs, width);
@@ -150,7 +150,7 @@ ExecutionResult stos_impl(ExecutionContext& ctx, std::size_t width) {
     if (!ctx.memory.write(write_addr, &value, width)) {
       ctx.state.gpr[7] = rdi;
       if (rep) ctx.state.gpr[1] = remaining;
-      return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, write_addr, 0}, ctx.instr.code()};
+      return detail::memory_fault(ctx, write_addr);
     }
     const auto hit_bits = detail::debug_data_breakpoint_hits(ctx.state, write_addr, width, false, true);
     if (df) {
@@ -192,7 +192,7 @@ ExecutionResult lods_impl(ExecutionContext& ctx, std::size_t width) {
     if (!ctx.memory.read(read_addr, &value, width)) {
       ctx.state.gpr[6] = rsi;
       if (rep) ctx.state.gpr[1] = remaining;
-      return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, read_addr, 0}, ctx.instr.code()};
+      return detail::memory_fault(ctx, read_addr);
     }
     detail::write_register(ctx.state, iced_x86::Register::RAX, value, width);
     const auto hit_bits = detail::debug_data_breakpoint_hits(ctx.state, read_addr, width, true, false);

@@ -43,13 +43,13 @@ ExecutionResult handle_code_CMPXCHG_RM8_R8(ExecutionContext& ctx) {
   bool lhs_ok = false;
   const auto lhs = detail::read_operand(ctx, 0, 1, &lhs_ok);
   if (!lhs_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto rhs = detail::read_register(ctx.state, ctx.instr.op_register(1));
   const auto accumulator = detail::read_register(ctx.state, iced_x86::Register::AL);
   if (lhs == accumulator) {
     if (!detail::write_operand(ctx, 0, rhs, 1)) {
-      return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+      return detail::memory_fault(ctx, detail::memory_address(ctx));
     }
     set_cmpxchg_flags(ctx.state, accumulator, lhs, 1, true);
     return {};
@@ -63,13 +63,13 @@ ExecutionResult handle_code_CMPXCHG_RM16_R16(ExecutionContext& ctx) {
   bool lhs_ok = false;
   const auto lhs = detail::read_operand(ctx, 0, 2, &lhs_ok);
   if (!lhs_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto rhs = detail::read_register(ctx.state, ctx.instr.op_register(1));
   const auto accumulator = detail::read_register(ctx.state, iced_x86::Register::AX);
   if (lhs == accumulator) {
     if (!detail::write_operand(ctx, 0, rhs, 2)) {
-      return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+      return detail::memory_fault(ctx, detail::memory_address(ctx));
     }
     set_cmpxchg_flags(ctx.state, accumulator, lhs, 2, true);
     return {};
@@ -83,13 +83,13 @@ ExecutionResult handle_code_CMPXCHG_RM32_R32(ExecutionContext& ctx) {
   bool lhs_ok = false;
   const auto lhs = detail::read_operand(ctx, 0, 4, &lhs_ok);
   if (!lhs_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto rhs = detail::read_register(ctx.state, ctx.instr.op_register(1));
   const auto accumulator = detail::read_register(ctx.state, iced_x86::Register::EAX);
   if (lhs == accumulator) {
     if (!detail::write_operand(ctx, 0, rhs, 4)) {
-      return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+      return detail::memory_fault(ctx, detail::memory_address(ctx));
     }
     set_cmpxchg_flags(ctx.state, accumulator, lhs, 4, true);
     return {};
@@ -103,13 +103,13 @@ ExecutionResult handle_code_CMPXCHG_RM64_R64(ExecutionContext& ctx) {
   bool lhs_ok = false;
   const auto lhs = detail::read_operand(ctx, 0, 8, &lhs_ok);
   if (!lhs_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto rhs = detail::read_register(ctx.state, ctx.instr.op_register(1));
   const auto accumulator = detail::read_register(ctx.state, iced_x86::Register::RAX);
   if (lhs == accumulator) {
     if (!detail::write_operand(ctx, 0, rhs, 8)) {
-      return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+      return detail::memory_fault(ctx, detail::memory_address(ctx));
     }
     set_cmpxchg_flags(ctx.state, accumulator, lhs, 8, true);
     return {};
@@ -127,7 +127,7 @@ ExecutionResult handle_code_CMPXCHG8B_M64(ExecutionContext& ctx) {
   bool lhs_ok = false;
   const auto lhs = detail::read_operand(ctx, 0, 8, &lhs_ok);
   if (!lhs_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, address, 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, address);
   }
   const auto desired = (detail::read_register(ctx.state, iced_x86::Register::EDX) << 32) |
                       (detail::read_register(ctx.state, iced_x86::Register::EAX) & 0xFFFFFFFFull);
@@ -135,7 +135,7 @@ ExecutionResult handle_code_CMPXCHG8B_M64(ExecutionContext& ctx) {
     const auto source = (detail::read_register(ctx.state, iced_x86::Register::ECX) << 32) |
                         (detail::read_register(ctx.state, iced_x86::Register::EBX) & 0xFFFFFFFFull);
     if (!detail::write_operand(ctx, 0, source, 8)) {
-      return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, address, 0}, ctx.instr.code()};
+      return detail::memory_fault(ctx, address);
     }
     detail::set_flag(ctx.state.rflags, kFlagZF, true);
     return {};
@@ -153,7 +153,7 @@ ExecutionResult handle_code_CMPXCHG16B_M128(ExecutionContext& ctx) {
   }
   std::array<std::uint8_t, 16> lhs_bytes{};
   if (!ctx.memory.read(address, lhs_bytes.data(), 16)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, address, 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, address);
   }
 
   seven::SimdUint lhs = 0;
@@ -182,7 +182,7 @@ ExecutionResult handle_code_CMPXCHG16B_M128(ExecutionContext& ctx) {
       source_bytes[i] = static_cast<std::uint8_t>(source >> (8 * i));
     }
     if (!ctx.memory.write(address, source_bytes.data(), 16)) {
-      return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, address, 0}, ctx.instr.code()};
+      return detail::memory_fault(ctx, address);
     }
     detail::set_flag(ctx.state.rflags, kFlagZF, true);
     return {};

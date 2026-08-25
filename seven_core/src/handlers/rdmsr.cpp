@@ -26,13 +26,13 @@ ExecutionResult handle_code_RDMSRLIST(ExecutionContext& ctx) {
     std::uint64_t msr_index = 0;
     const auto msr_address = rsi + (bit * 8);
     if (!ctx.memory.read(msr_address, &msr_index, 8)) {
-      return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, msr_address, 0}, ctx.instr.code()};
+      return detail::memory_fault(ctx, msr_address);
     }
 
     const auto value = detail::read_msr(ctx.state, static_cast<std::uint32_t>(msr_index));
     const auto value_address = rdi + (bit * 8);
     if (!ctx.memory.write(value_address, &value, 8)) {
-      return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, value_address, 0}, ctx.instr.code()};
+      return detail::memory_fault(ctx, value_address);
     }
 
     rcx &= ~mask;

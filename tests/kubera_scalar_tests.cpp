@@ -303,6 +303,25 @@ TEST(KuberaScalar, BtsWithSmallBitIndexStillWorksAfterCanonicalCheck) {
   EXPECT_EQ(byte0, 0x20);
 }
 
+TEST(KuberaScalar, NonCanonicalAddressFaultsGeneralProtectionNotPageFault) {
+  // mov rax, [rbx] with rbx pointing at a non-canonical address. Every handler's memory-fault
+  // path now funnels through detail::memory_fault(), which checks canonicality before treating
+  // the access as an ordinary page_fault -- previously only the ~169 sites that already called
+  // memory_fault() got this for free, while ~400 other sites (including this MOV handler)
+  // constructed the page_fault ExecutionResult inline and skipped the check entirely.
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("48 8B 03"));
+  state.gpr[3] = 0x8000'1234'5678'9ABCull;  // rbx: non-canonical
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::general_protection);
+}
+
 TEST(KuberaScalar, RdsspReportsNoShadowStack) {
   run_single(seven::parse_hex_bytes("F3 48 0F 1E CA"),
              [](seven::CpuState& state, seven::Memory&) {
