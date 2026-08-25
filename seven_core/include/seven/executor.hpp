@@ -75,6 +75,10 @@ class Executor {
   // instruction through the real handler instead of reimplementing it. Just runs the handler --
   // caller sets detail::set_dead_flags_mask() beforehand and commits rip/rsp afterward itself.
   [[nodiscard]] static ExecutionResult dispatch_handler(ExecutionContext& ctx, iced_x86::Code code);
+  // True for SYSCALL/CPUID/RDTSC/RDTSCP/INT* -- codes step_impl() routes to a trap hook instead of
+  // dispatch_handler(). An external caller doing its own dispatch_handler() call needs this to
+  // know which codes it can't just hand off the same way.
+  [[nodiscard]] static bool is_trap_instruction(iced_x86::Code code) noexcept;
 
  private:
   using CodeIndex = std::size_t;

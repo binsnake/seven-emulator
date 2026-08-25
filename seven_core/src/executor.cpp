@@ -1360,6 +1360,10 @@ ExecutionResult Executor::unsupported(ExecutionContext& ctx) {
   return {StopReason::unsupported_instruction, 0, ExceptionInfo{StopReason::unsupported_instruction, ctx.state.rip, 0}, std::nullopt};
 }
 
+bool Executor::is_trap_instruction(iced_x86::Code code) noexcept {
+  return trap_kind_for_code(code).has_value();
+}
+
 // forceinline so step_impl's dispatch stays as fast as before this got pulled out of it
 __forceinline ExecutionResult Executor::dispatch_handler(ExecutionContext& ctx, iced_x86::Code code) {
   switch (code) {
