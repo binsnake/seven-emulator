@@ -510,7 +510,16 @@ const Memory::MmioRegion* Memory::find_mmio_region(std::uint64_t address, std::s
   if (mmio_regions_.empty()) {
     return nullptr;
   }
-  const auto end = address + size;
+  const auto end = address + static_cast<std::uint64_t>(size);
+  // A guest-chosen address near the top of the address space plus size can wrap end back down
+  // past zero. Left unchecked, that wrapped (small) end could pass the mmio_max_end_ pre-check
+  // and then the per-region range check below despite address itself being nowhere near any
+  // registered region -- a false match whose "address - region.base" offset (see read()/write())
+  // would be a huge, effectively guest-controlled index into whatever the region's callback
+  // trusts that offset to bound. Reject the wrap outright rather than let it reach that check.
+  if (end < address) {
+    return nullptr;
+  }
   if (address < mmio_min_base_ || end > mmio_max_end_) {
     return nullptr;
   }

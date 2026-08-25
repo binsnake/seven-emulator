@@ -177,6 +177,7 @@ add_executable(seven_tests
   tests/kubera_scalar_tests.cpp
   tests/kubera_simd_tests.cpp
   tests/kubera_liveness_tests.cpp
+  tests/kubera_memory_tests.cpp
 )
 target_link_libraries(seven_tests PRIVATE seven_core GTest::gtest_main)
 if(MSVC)
