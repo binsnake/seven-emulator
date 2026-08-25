@@ -31,6 +31,15 @@ std::uint64_t truncate(std::uint64_t value, std::size_t width);
 bool even_parity(std::uint8_t value);
 std::uint64_t sign_extend(std::uint64_t value, std::size_t width);
 ExecutionResult memory_fault(ExecutionContext& ctx, std::uint64_t address);
+// Legacy (non-VEX) SSE/SSE2/SSE3/SSE4 instructions with a full 128-bit (m128) memory operand
+// require it 16-byte aligned, raising #GP(0) if not -- unlike VEX-encoded forms of the same
+// operation, which never impose this. Returns the #GP ExecutionResult when operand_index names a
+// misaligned memory operand, or std::nullopt when there's nothing to fault on (operand is a
+// register, or the memory operand is already aligned) -- callers still do their own read/write
+// afterward, this only gates entry to it.
+[[nodiscard]] std::optional<ExecutionResult> require_aligned_memory_operand(ExecutionContext& ctx,
+                                                                             std::uint32_t operand_index,
+                                                                             std::uint64_t alignment_mask);
 ExecutionResult read_memory_checked(ExecutionContext& ctx, std::uint64_t address, void* value, std::size_t width);
 ExecutionResult write_memory_checked(ExecutionContext& ctx, std::uint64_t address, const void* value, std::size_t width);
 ExecutionResult read_operand_checked(ExecutionContext& ctx, std::uint32_t operand_index, std::size_t width, std::uint64_t& value);

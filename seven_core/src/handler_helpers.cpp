@@ -107,6 +107,17 @@ ExecutionResult memory_fault(ExecutionContext& ctx, std::uint64_t address) {
   return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, address, 0}, ctx.instr.code()};
 }
 
+std::optional<ExecutionResult> require_aligned_memory_operand(ExecutionContext& ctx, std::uint32_t operand_index,
+                                                                std::uint64_t alignment_mask) {
+  if (ctx.instr.op_kind(operand_index) != iced_x86::OpKind::MEMORY) return std::nullopt;
+  const auto address = memory_address(ctx);
+  if ((address & alignment_mask) != 0) {
+    return ExecutionResult{StopReason::general_protection, 0, ExceptionInfo{StopReason::general_protection, address, 0},
+                            ctx.instr.code()};
+  }
+  return std::nullopt;
+}
+
 ExecutionResult read_memory_checked(ExecutionContext& ctx, std::uint64_t address, void* value, std::size_t width) {
   if (!ctx.memory.read(address, value, width)) {
     return memory_fault(ctx, address);

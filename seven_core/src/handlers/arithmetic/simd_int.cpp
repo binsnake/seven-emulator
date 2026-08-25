@@ -270,6 +270,9 @@ ExecutionResult legacy_compare(ExecutionContext& ctx, Fn&& fn, bool zero_upper =
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
+  // Legacy (non-VEX) form: real hardware requires the m128 source aligned to 16 bytes, #GP(0)
+  // otherwise -- see require_aligned_memory_operand's own doc comment.
+  if (auto fault = detail::require_aligned_memory_operand(ctx, 1, 0xFULL)) return *fault;
   bool ok = false;
   const auto dst_reg = ctx.instr.op_register(0);
   const auto lhs_bits = read_vec(ctx.state, dst_reg);
@@ -313,6 +316,9 @@ ExecutionResult legacy_bitwise(ExecutionContext& ctx, Fn&& fn, bool zero_upper =
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
+  // Legacy (non-VEX) form: real hardware requires the m128 source aligned to 16 bytes, #GP(0)
+  // otherwise -- see require_aligned_memory_operand's own doc comment.
+  if (auto fault = detail::require_aligned_memory_operand(ctx, 1, 0xFULL)) return *fault;
   bool ok = false;
   const auto dst_reg = ctx.instr.op_register(0);
   const auto lhs = read_vec(ctx.state, dst_reg);
@@ -372,6 +378,9 @@ ExecutionResult legacy_shift_reg(ExecutionContext& ctx, Fn&& fn, bool zero_upper
   // form, not register-only -- read_operand() handles both, matching every
   // sibling *_reg function in this file. A prior register-only check here
   // rejected the valid memory form outright and faulted on a mapped address.
+  // Legacy (non-VEX) form: real hardware also requires that m128 count source aligned to 16
+  // bytes, #GP(0) otherwise -- see require_aligned_memory_operand's own doc comment.
+  if (auto fault = detail::require_aligned_memory_operand(ctx, 1, 0xFULL)) return *fault;
   bool ok = false;
   const auto dst_reg = ctx.instr.op_register(0);
   const auto count_bits = read_operand(ctx, 1, vector_width(dst_reg), &ok);

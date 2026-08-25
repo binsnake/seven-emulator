@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
 
 #include <iced_x86/code.hpp>
@@ -153,6 +154,106 @@ TEST(KuberaSimd, Sse3HaddpsProducesHorizontalSums) {
                EXPECT_FLOAT_EQ(std::bit_cast<float>(xmm_u32(state, 0, 2)), 7.0f);
                EXPECT_FLOAT_EQ(std::bit_cast<float>(xmm_u32(state, 0, 3)), 70.0f);
              });
+}
+
+TEST(KuberaSimd, LegacyPandFaultsOnMisalignedMemoryOperand) {
+  std::vector<std::uint8_t> bytes;
+  const auto mem = iced_x86::MemoryOperand::with_base_displ(iced_x86::Register::RAX, 0);
+  const auto instr = iced_x86::InstructionFactory::with2(iced_x86::Code::PAND_XMM_XMMM128, iced_x86::Register::XMM0, mem);
+  ASSERT_TRUE(encode_to_bytes(instr, bytes, "pand xmm0, [rax]"));
+
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.rflags = 0x202;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, bytes);
+  memory.map(0x8000, 0x1000);
+  std::vector<std::uint8_t> src(16, 0xFF);
+  ASSERT_TRUE(memory.write(0x8000, src.data(), src.size()));
+  set_reg(state, iced_x86::Register::RAX, 0x8004);  // 16-byte alignment requires the low nibble to be zero
+  set_xmm_u64(state, 0, 0x1111'1111'1111'1111ull, 0x2222'2222'2222'2222ull);
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::general_protection);
+}
+
+TEST(KuberaSimd, LegacyPandAllowsAlignedMemoryOperand) {
+  std::vector<std::uint8_t> bytes;
+  const auto mem = iced_x86::MemoryOperand::with_base_displ(iced_x86::Register::RAX, 0);
+  const auto instr = iced_x86::InstructionFactory::with2(iced_x86::Code::PAND_XMM_XMMM128, iced_x86::Register::XMM0, mem);
+  ASSERT_TRUE(encode_to_bytes(instr, bytes, "pand xmm0, [rax]"));
+
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.rflags = 0x202;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, bytes);
+  memory.map(0x8000, 0x1000);
+  std::vector<std::uint8_t> src(16);
+  std::fill(src.begin(), src.begin() + 8, std::uint8_t{0x0F});
+  std::fill(src.begin() + 8, src.end(), std::uint8_t{0xF0});
+  ASSERT_TRUE(memory.write(0x8000, src.data(), src.size()));
+  set_reg(state, iced_x86::Register::RAX, 0x8000);  // already 16-byte aligned
+  set_xmm_u64(state, 0, 0xFFFF'FFFF'FFFF'FFFFull, 0xFFFF'FFFF'FFFF'FFFFull);
+
+  const auto result = executor.step(state, memory);
+  ASSERT_EQ(result.reason, seven::StopReason::none);
+  EXPECT_EQ(xmm_u64(state, 0, 0), 0x0F0F'0F0F'0F0F'0F0Full);
+  EXPECT_EQ(xmm_u64(state, 0, 1), 0xF0F0'F0F0'F0F0'F0F0ull);
+}
+
+TEST(KuberaSimd, VexVpandAllowsMisalignedMemoryOperand) {
+  std::vector<std::uint8_t> bytes;
+  const auto mem = iced_x86::MemoryOperand::with_base_displ(iced_x86::Register::RAX, 0);
+  const auto instr = iced_x86::InstructionFactory::with3(
+      iced_x86::Code::VEX_VPAND_XMM_XMM_XMMM128, iced_x86::Register::XMM0, iced_x86::Register::XMM1, mem);
+  ASSERT_TRUE(encode_to_bytes(instr, bytes, "vpand xmm0, xmm1, [rax]"));
+
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.rflags = 0x202;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, bytes);
+  memory.map(0x8000, 0x1000);
+  std::vector<std::uint8_t> src(16, 0xFF);
+  ASSERT_TRUE(memory.write(0x8000, src.data(), src.size()));
+  set_reg(state, iced_x86::Register::RAX, 0x8004);  // VEX form never requires alignment
+  set_xmm_u64(state, 1, 0x1111'1111'1111'1111ull, 0x2222'2222'2222'2222ull);
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::none);
+}
+
+TEST(KuberaSimd, MovsldupAllowsMisalignedMemoryOperand) {
+  std::vector<std::uint8_t> bytes;
+  const auto mem = iced_x86::MemoryOperand::with_base_displ(iced_x86::Register::RAX, 0);
+  const auto instr = iced_x86::InstructionFactory::with2(iced_x86::Code::MOVSLDUP_XMM_XMMM128, iced_x86::Register::XMM0, mem);
+  ASSERT_TRUE(encode_to_bytes(instr, bytes, "movsldup xmm0, [rax]"));
+
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.rflags = 0x202;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, bytes);
+  memory.map(0x8000, 0x1000);
+  std::vector<std::uint8_t> src(16, 0xAB);
+  ASSERT_TRUE(memory.write(0x8000, src.data(), src.size()));
+  set_reg(state, iced_x86::Register::RAX, 0x8004);  // MOVSLDUP is documented unaligned-safe, unlike PSHUFD etc.
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::none);
 }
 
 TEST(KuberaSimd, Sse42Crc32MatchesCastagnoliReference) {

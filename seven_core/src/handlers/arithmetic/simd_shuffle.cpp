@@ -165,9 +165,16 @@ ExecutionResult vex_binary_lanewise(ExecutionContext& ctx, std::size_t lane_byte
 }
 
 template <typename T, std::size_t N, typename Fn>
-ExecutionResult legacy_unary_lanewise(ExecutionContext& ctx, std::size_t lane_bytes, Fn&& fn, bool zero_upper = false) {
+ExecutionResult legacy_unary_lanewise(ExecutionContext& ctx, std::size_t lane_bytes, Fn&& fn, bool zero_upper = false,
+                                       bool require_alignment = true) {
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
+  }
+  // Legacy (non-VEX) form: real hardware requires the m128 source aligned to 16 bytes, #GP(0)
+  // otherwise -- unless the specific instruction is documented unaligned-safe (e.g. MOVSLDUP,
+  // MOVSHDUP), in which case the caller passes require_alignment = false.
+  if (require_alignment) {
+    if (auto fault = detail::require_aligned_memory_operand(ctx, 1, 0xFULL)) return *fault;
   }
   bool ok = false;
   const auto dst_reg = ctx.instr.op_register(0);
@@ -313,15 +320,15 @@ ExecutionResult handle_code_PSHUFHW_XMM_XMMM128_IMM8(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_MOVSLDUP_XMM_XMMM128(ExecutionContext& ctx) {
-  return legacy_unary_lanewise<float, 4>(ctx, kXmmBytes, [](const auto& src) {
-    return std::array<float, 4>{src[0], src[0], src[2], src[2]};
-  });
+  // MOVSLDUP's memory operand is documented unaligned-safe, like MOVUPS -- no #GP on misalignment.
+  return legacy_unary_lanewise<float, 4>(
+      ctx, kXmmBytes, [](const auto& src) { return std::array<float, 4>{src[0], src[0], src[2], src[2]}; }, false, false);
 }
 
 ExecutionResult handle_code_MOVSHDUP_XMM_XMMM128(ExecutionContext& ctx) {
-  return legacy_unary_lanewise<float, 4>(ctx, kXmmBytes, [](const auto& src) {
-    return std::array<float, 4>{src[1], src[1], src[3], src[3]};
-  });
+  // MOVSHDUP's memory operand is documented unaligned-safe, like MOVUPS -- no #GP on misalignment.
+  return legacy_unary_lanewise<float, 4>(
+      ctx, kXmmBytes, [](const auto& src) { return std::array<float, 4>{src[1], src[1], src[3], src[3]}; }, false, false);
 }
 
 ExecutionResult handle_code_MOVDDUP_XMM_XMMM64(ExecutionContext& ctx) {
