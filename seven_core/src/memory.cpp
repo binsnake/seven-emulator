@@ -36,7 +36,6 @@ void Memory::clear_passthrough() {
 
 void Memory::map(std::uint64_t base, std::size_t size, MemoryPermissionMask permissions) {
   ++page_epoch_;
-  ++code_epoch_;
   // map() may insert new entries; std::unordered_map insertion can rehash and
   // invalidate iterators, but does not invalidate references / pointers to
   // existing elements. However, we still need to invalidate the TLB so that
@@ -49,6 +48,10 @@ void Memory::map(std::uint64_t base, std::size_t size, MemoryPermissionMask perm
     auto [it, inserted] = pages_.try_emplace(page);
     (void)inserted;
     it->second.permissions = permissions;
+    // Every (re)mapped page gets a fresh, never-before-used epoch, even one that lands back on a
+    // page_index an earlier unmap() vacated -- a stale cache entry compiled against the OLD
+    // occupant of this address can never alias the new one, since code_epoch_ only ever goes up.
+    it->second.code_epoch = ++code_epoch_;
   }
 }
 
@@ -65,7 +68,6 @@ void Memory::unmap(std::uint64_t base, std::size_t size) {
 
 void Memory::reprotect(std::uint64_t base, std::size_t size, MemoryPermissionMask permissions) {
   ++page_epoch_;
-  ++code_epoch_;
   // Reprotect does not erase entries, so cached PageEntry* pointers stay
   // valid. Permissions are read through the pointer, so we don't have to
   // invalidate the TLB.
@@ -75,6 +77,9 @@ void Memory::reprotect(std::uint64_t base, std::size_t size, MemoryPermissionMas
     auto it = pages_.find(page);
     if (it != pages_.end()) {
       it->second.permissions = permissions;
+      // A permission change can flip a page executable either direction; stamp it regardless so a
+      // block compiled while it was executable doesn't survive a later revoke.
+      it->second.code_epoch = ++code_epoch_;
     }
   }
 }
@@ -242,7 +247,7 @@ bool Memory::write(std::uint64_t address, const void* src, std::size_t size, Mem
       }
       std::memcpy(entry->data.data() + first_offset, src, size);
       if ((entry->permissions & static_cast<MemoryPermissionMask>(MemoryPermission::execute)) != 0) {
-        ++code_epoch_;
+        entry->code_epoch = ++code_epoch_;
       }
       return true;
     }
@@ -258,7 +263,6 @@ bool Memory::write(std::uint64_t address, const void* src, std::size_t size, Mem
   const auto* in = static_cast<const std::byte*>(src);
   std::size_t remaining = size;
   std::uint64_t current = address;
-  bool code_changed = false;
   while (remaining != 0) {
     const auto page_index = current / kPageSize;
     const auto page_offset = current % kPageSize;
@@ -266,15 +270,14 @@ bool Memory::write(std::uint64_t address, const void* src, std::size_t size, Mem
     if (entry == nullptr || !has_permission(entry->permissions, kind)) {
       return false;
     }
-    code_changed |= (entry->permissions & static_cast<MemoryPermissionMask>(MemoryPermission::execute)) != 0;
     const auto chunk = std::min<std::size_t>(remaining, kPageSize - page_offset);
     std::memcpy(entry->data.data() + page_offset, in, chunk);
+    if ((entry->permissions & static_cast<MemoryPermissionMask>(MemoryPermission::execute)) != 0) {
+      entry->code_epoch = ++code_epoch_;
+    }
     in += chunk;
     current += chunk;
     remaining -= chunk;
-  }
-  if (code_changed) {
-    ++code_epoch_;
   }
   return true;
 }
@@ -287,7 +290,6 @@ bool Memory::write_unchecked(std::uint64_t address, const void* src, std::size_t
   const auto* in = static_cast<const std::byte*>(src);
   std::size_t remaining = size;
   std::uint64_t current = address;
-  bool code_changed = false;
   while (remaining != 0) {
     const auto page_index = current / kPageSize;
     const auto page_offset = current % kPageSize;
@@ -295,15 +297,14 @@ bool Memory::write_unchecked(std::uint64_t address, const void* src, std::size_t
     if (entry == nullptr) {
       return false;
     }
-    code_changed |= (entry->permissions & static_cast<MemoryPermissionMask>(MemoryPermission::execute)) != 0;
     const auto chunk = std::min<std::size_t>(remaining, kPageSize - page_offset);
     std::memcpy(entry->data.data() + page_offset, in, chunk);
+    if ((entry->permissions & static_cast<MemoryPermissionMask>(MemoryPermission::execute)) != 0) {
+      entry->code_epoch = ++code_epoch_;
+    }
     in += chunk;
     current += chunk;
     remaining -= chunk;
-  }
-  if (code_changed) {
-    ++code_epoch_;
   }
   return true;
 }
@@ -409,11 +410,10 @@ std::vector<Memory::PageSnapshot> Memory::snapshot_pages() const {
 
 void Memory::restore_pages(const std::vector<PageSnapshot>& pages) {
   ++page_epoch_;
-  ++code_epoch_;
   invalidate_tlb();
   pages_.clear();
   for (const auto& snapshot : pages) {
-    pages_.emplace(snapshot.page_index, PageEntry{snapshot.data, snapshot.permissions});
+    pages_.emplace(snapshot.page_index, PageEntry{snapshot.data, snapshot.permissions, ++code_epoch_});
   }
 }
 
