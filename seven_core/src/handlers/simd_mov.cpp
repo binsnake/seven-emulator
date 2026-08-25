@@ -116,7 +116,16 @@ bool write_any(ExecutionContext& ctx, std::uint32_t operand_index, big_uint valu
   return false;
 }
 
-ExecutionResult full_move(ExecutionContext& ctx, std::uint32_t dst, std::uint32_t src, bool zero_upper) {
+// alignment_mask defaults to 0 (no check) since full_move backs ~80 instructions spanning legacy
+// unaligned-safe moves (MOVUPS/MOVDQU/...), VEX/EVEX forms (never alignment-checked regardless of
+// A vs U naming), and the handful of legacy moves that DO require it (MOVAPS/MOVAPD/MOVDQA) --
+// callers opt in explicitly with 0xFULL rather than this function guessing from the Code enum.
+ExecutionResult full_move(ExecutionContext& ctx, std::uint32_t dst, std::uint32_t src, bool zero_upper,
+                          std::uint64_t alignment_mask = 0) {
+  if (alignment_mask != 0) {
+    if (auto fault = detail::require_aligned_memory_operand(ctx, dst, alignment_mask)) return *fault;
+    if (auto fault = detail::require_aligned_memory_operand(ctx, src, alignment_mask)) return *fault;
+  }
   bool ok = false;
   const auto width = infer_width(ctx, dst, src);
   const auto value = read_any(ctx, src, width, &ok);
@@ -173,7 +182,13 @@ ExecutionResult gpr_to_xmm(ExecutionContext& ctx, std::uint32_t dst, std::uint32
   return {};
 }
 
-ExecutionResult xmm_to_gpr(ExecutionContext& ctx, std::uint32_t dst, std::uint32_t src, std::size_t width) {
+// See full_move's comment on alignment_mask's default -- same reasoning, this backs both
+// alignment-free GPR<->XMM moves and the MOVNT* non-temporal stores, which DO require it.
+ExecutionResult xmm_to_gpr(ExecutionContext& ctx, std::uint32_t dst, std::uint32_t src, std::size_t width,
+                           std::uint64_t alignment_mask = 0) {
+  if (alignment_mask != 0) {
+    if (auto fault = detail::require_aligned_memory_operand(ctx, dst, alignment_mask)) return *fault;
+  }
   bool ok = false;
   const auto value = read_any(ctx, src, width, &ok);
   if (!ok) return detail::memory_fault(ctx, detail::memory_address(ctx));
@@ -254,22 +269,25 @@ ExecutionResult vmovhlps(ExecutionContext& ctx) {
 #define KUBERA_GPR_TO_XMM(name, width) ExecutionResult handle_code_##name(ExecutionContext& ctx) { return gpr_to_xmm(ctx, 0, 1, width); }
 #define KUBERA_XMM_TO_GPR(name, width) ExecutionResult handle_code_##name(ExecutionContext& ctx) { return xmm_to_gpr(ctx, 0, 1, width); }
 
-KUBERA_FULL_MOVE(MOVAPS_XMM_XMMM128, false)
-KUBERA_FULL_MOVE(MOVAPD_XMM_XMMM128, false)
+// MOVAPS/MOVAPD/MOVDQA ("Aligned") explicitly #GP(0) on a misaligned m128 memory operand, unlike
+// their MOVUPS/MOVUPD/MOVDQU ("Unaligned") counterparts right below -- real hardware distinguishes
+// these by name, not just by convention, so they get an explicit alignment_mask, not the macro.
+ExecutionResult handle_code_MOVAPS_XMM_XMMM128(ExecutionContext& ctx) { return full_move(ctx, 0, 1, false, 0xFULL); }
+ExecutionResult handle_code_MOVAPD_XMM_XMMM128(ExecutionContext& ctx) { return full_move(ctx, 0, 1, false, 0xFULL); }
 KUBERA_FULL_MOVE(MOVUPS_XMM_XMMM128, false)
 KUBERA_FULL_MOVE(MOVUPD_XMM_XMMM128, false)
 ExecutionResult handle_code_MOVSS_XMM_XMMM32(ExecutionContext& ctx) { return low_move_legacy_scalar_load(ctx, 0, 1, 4); }
 ExecutionResult handle_code_MOVSD_XMM_XMMM64(ExecutionContext& ctx) { return low_move_legacy_scalar_load(ctx, 0, 1, 8); }
-KUBERA_FULL_MOVE(MOVAPS_XMMM128_XMM, false)
-KUBERA_FULL_MOVE(MOVAPD_XMMM128_XMM, false)
+ExecutionResult handle_code_MOVAPS_XMMM128_XMM(ExecutionContext& ctx) { return full_move(ctx, 0, 1, false, 0xFULL); }
+ExecutionResult handle_code_MOVAPD_XMMM128_XMM(ExecutionContext& ctx) { return full_move(ctx, 0, 1, false, 0xFULL); }
 KUBERA_FULL_MOVE(MOVUPS_XMMM128_XMM, false)
 KUBERA_FULL_MOVE(MOVUPD_XMMM128_XMM, false)
 KUBERA_LOW_MOVE(MOVSS_XMMM32_XMM, 4, false)
 KUBERA_LOW_MOVE(MOVSD_XMMM64_XMM, 8, false)
-KUBERA_FULL_MOVE(MOVDQA_XMM_XMMM128, false)
+ExecutionResult handle_code_MOVDQA_XMM_XMMM128(ExecutionContext& ctx) { return full_move(ctx, 0, 1, false, 0xFULL); }
 KUBERA_FULL_MOVE(MOVDQU_XMM_XMMM128, false)
 ExecutionResult handle_code_LDDQU_XMM_M128(ExecutionContext& ctx) { return full_move(ctx, 0, 1, false); }
-KUBERA_FULL_MOVE(MOVDQA_XMMM128_XMM, false)
+ExecutionResult handle_code_MOVDQA_XMMM128_XMM(ExecutionContext& ctx) { return full_move(ctx, 0, 1, false, 0xFULL); }
 KUBERA_FULL_MOVE(MOVDQU_XMMM128_XMM, false)
 KUBERA_LOW_MOVE(MOVLPS_XMM_M64, 8, false)
 KUBERA_LOW_MOVE(MOVLPD_XMM_M64, 8, false)
@@ -291,10 +309,13 @@ ExecutionResult handle_code_PEXTRW_R32M16_XMM_IMM8(ExecutionContext& ctx) { retu
 ExecutionResult handle_code_PEXTRW_R64M16_XMM_IMM8(ExecutionContext& ctx) { return pextrw_to_gpr_or_mem(ctx); }
 KUBERA_LOW_MOVE(MOVQ_XMM_XMMM64, 8, true)
 KUBERA_LOW_MOVE(MOVQ_XMMM64_XMM, 8, true)
-KUBERA_XMM_TO_GPR(MOVNTPS_M128_XMM, 16)
-KUBERA_XMM_TO_GPR(MOVNTPD_M128_XMM, 16)
-KUBERA_XMM_TO_GPR(MOVNTDQ_M128_XMM, 16)
-KUBERA_FULL_MOVE(MOVNTDQA_XMM_M128, false)
+// MOVNTPS/MOVNTPD/MOVNTDQ (non-temporal stores) and MOVNTDQA (non-temporal "aligned hint" load,
+// literally named for it) both require their m128 memory operand 16-byte aligned per the SDM,
+// independent of the general legacy-SSE alignment rule this whole fix is about.
+ExecutionResult handle_code_MOVNTPS_M128_XMM(ExecutionContext& ctx) { return xmm_to_gpr(ctx, 0, 1, 16, 0xFULL); }
+ExecutionResult handle_code_MOVNTPD_M128_XMM(ExecutionContext& ctx) { return xmm_to_gpr(ctx, 0, 1, 16, 0xFULL); }
+ExecutionResult handle_code_MOVNTDQ_M128_XMM(ExecutionContext& ctx) { return xmm_to_gpr(ctx, 0, 1, 16, 0xFULL); }
+ExecutionResult handle_code_MOVNTDQA_XMM_M128(ExecutionContext& ctx) { return full_move(ctx, 0, 1, false, 0xFULL); }
 
 KUBERA_FULL_MOVE(VEX_VMOVAPS_XMM_XMMM128, true)
 KUBERA_FULL_MOVE(VEX_VMOVAPS_YMM_YMMM256, true)

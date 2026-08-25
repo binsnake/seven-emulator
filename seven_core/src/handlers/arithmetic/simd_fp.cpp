@@ -384,9 +384,15 @@ ExecutionResult vex_scalar_unary(ExecutionContext& ctx, Fn&& fn, bool zero_upper
   return {};
 }
 
-ExecutionResult packed_logic(ExecutionContext& ctx, std::uint32_t lhs_index, std::uint32_t rhs_index, std::uint8_t op, bool zero_upper = false) {
+// alignment_mask defaults to 0 (no check) -- shared by the legacy ANDPS/ANDPD/ANDNPS/ANDNPD/ORPS/
+// ORPD/XORPS/XORPD forms (rhs_index=1, DO require it) and the VEX forms (rhs_index=2, never do).
+ExecutionResult packed_logic(ExecutionContext& ctx, std::uint32_t lhs_index, std::uint32_t rhs_index, std::uint8_t op, bool zero_upper = false,
+                             std::uint64_t alignment_mask = 0) {
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
+  }
+  if (alignment_mask != 0) {
+    if (auto fault = detail::require_aligned_memory_operand(ctx, rhs_index, alignment_mask)) return *fault;
   }
   bool ok = false;
   const auto dst_reg = ctx.instr.op_register(0);
@@ -797,14 +803,14 @@ KUBERA_SCALAR_BIN(MAXSD_XMM_XMMM64, double, [](double a, double b) { return std:
 KUBERA_SCALAR_UNARY(SQRTSS_XMM_XMMM32, float, [](float a) { return std::sqrt(a); })
 KUBERA_SCALAR_UNARY(SQRTSD_XMM_XMMM64, double, [](double a) { return std::sqrt(a); })
 
-ExecutionResult handle_code_ANDPS_XMM_XMMM128(ExecutionContext& ctx) { return packed_logic(ctx, 0, 1, 0); }
-ExecutionResult handle_code_ANDPD_XMM_XMMM128(ExecutionContext& ctx) { return packed_logic(ctx, 0, 1, 0); }
-ExecutionResult handle_code_ANDNPS_XMM_XMMM128(ExecutionContext& ctx) { return packed_logic(ctx, 0, 1, 3); }
-ExecutionResult handle_code_ANDNPD_XMM_XMMM128(ExecutionContext& ctx) { return packed_logic(ctx, 0, 1, 3); }
-ExecutionResult handle_code_ORPS_XMM_XMMM128(ExecutionContext& ctx) { return packed_logic(ctx, 0, 1, 1); }
-ExecutionResult handle_code_ORPD_XMM_XMMM128(ExecutionContext& ctx) { return packed_logic(ctx, 0, 1, 1); }
-ExecutionResult handle_code_XORPS_XMM_XMMM128(ExecutionContext& ctx) { return packed_logic(ctx, 0, 1, 2); }
-ExecutionResult handle_code_XORPD_XMM_XMMM128(ExecutionContext& ctx) { return packed_logic(ctx, 0, 1, 2); }
+ExecutionResult handle_code_ANDPS_XMM_XMMM128(ExecutionContext& ctx) { return packed_logic(ctx, 0, 1, 0, false, 0xFULL); }
+ExecutionResult handle_code_ANDPD_XMM_XMMM128(ExecutionContext& ctx) { return packed_logic(ctx, 0, 1, 0, false, 0xFULL); }
+ExecutionResult handle_code_ANDNPS_XMM_XMMM128(ExecutionContext& ctx) { return packed_logic(ctx, 0, 1, 3, false, 0xFULL); }
+ExecutionResult handle_code_ANDNPD_XMM_XMMM128(ExecutionContext& ctx) { return packed_logic(ctx, 0, 1, 3, false, 0xFULL); }
+ExecutionResult handle_code_ORPS_XMM_XMMM128(ExecutionContext& ctx) { return packed_logic(ctx, 0, 1, 1, false, 0xFULL); }
+ExecutionResult handle_code_ORPD_XMM_XMMM128(ExecutionContext& ctx) { return packed_logic(ctx, 0, 1, 1, false, 0xFULL); }
+ExecutionResult handle_code_XORPS_XMM_XMMM128(ExecutionContext& ctx) { return packed_logic(ctx, 0, 1, 2, false, 0xFULL); }
+ExecutionResult handle_code_XORPD_XMM_XMMM128(ExecutionContext& ctx) { return packed_logic(ctx, 0, 1, 2, false, 0xFULL); }
 
 ExecutionResult handle_code_COMISS_XMM_XMMM32(ExecutionContext& ctx) { return scalar_compare<float>(ctx, false); }
 ExecutionResult handle_code_UCOMISS_XMM_XMMM32(ExecutionContext& ctx) { return scalar_compare<float>(ctx, true); }

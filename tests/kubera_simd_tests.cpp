@@ -233,7 +233,7 @@ TEST(KuberaSimd, VexVpandAllowsMisalignedMemoryOperand) {
   EXPECT_EQ(result.reason, seven::StopReason::none);
 }
 
-TEST(KuberaSimd, MovsldupAllowsMisalignedMemoryOperand) {
+TEST(KuberaSimd, MovsldupFaultsOnMisalignedMemoryOperand) {
   std::vector<std::uint8_t> bytes;
   const auto mem = iced_x86::MemoryOperand::with_base_displ(iced_x86::Register::RAX, 0);
   const auto instr = iced_x86::InstructionFactory::with2(iced_x86::Code::MOVSLDUP_XMM_XMMM128, iced_x86::Register::XMM0, mem);
@@ -250,10 +250,104 @@ TEST(KuberaSimd, MovsldupAllowsMisalignedMemoryOperand) {
   memory.map(0x8000, 0x1000);
   std::vector<std::uint8_t> src(16, 0xAB);
   ASSERT_TRUE(memory.write(0x8000, src.data(), src.size()));
-  set_reg(state, iced_x86::Register::RAX, 0x8004);  // MOVSLDUP is documented unaligned-safe, unlike PSHUFD etc.
+  // MOVSLDUP's memory operand is m128 per the SDM, and DOES require 16-byte alignment despite
+  // the "duplicate" naming similarity to MOVDDUP (which is genuinely unaligned-safe, m64 operand)
+  // -- confirmed on real hardware via a standalone probe, not assumed.
+  set_reg(state, iced_x86::Register::RAX, 0x8004);
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::general_protection);
+}
+
+TEST(KuberaSimd, LegacyMovapsFaultsOnMisalignedMemoryOperand) {
+  std::vector<std::uint8_t> bytes;
+  const auto mem = iced_x86::MemoryOperand::with_base_displ(iced_x86::Register::RAX, 0);
+  const auto instr = iced_x86::InstructionFactory::with2(iced_x86::Code::MOVAPS_XMM_XMMM128, iced_x86::Register::XMM0, mem);
+  ASSERT_TRUE(encode_to_bytes(instr, bytes, "movaps xmm0, [rax]"));
+
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.rflags = 0x202;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, bytes);
+  memory.map(0x8000, 0x1000);
+  std::vector<std::uint8_t> src(16, 0xFF);
+  ASSERT_TRUE(memory.write(0x8000, src.data(), src.size()));
+  set_reg(state, iced_x86::Register::RAX, 0x8004);  // MOVAPS ("Aligned") requires 16-byte alignment
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::general_protection);
+}
+
+TEST(KuberaSimd, LegacyMovupsAllowsMisalignedMemoryOperand) {
+  std::vector<std::uint8_t> bytes;
+  const auto mem = iced_x86::MemoryOperand::with_base_displ(iced_x86::Register::RAX, 0);
+  const auto instr = iced_x86::InstructionFactory::with2(iced_x86::Code::MOVUPS_XMM_XMMM128, iced_x86::Register::XMM0, mem);
+  ASSERT_TRUE(encode_to_bytes(instr, bytes, "movups xmm0, [rax]"));
+
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.rflags = 0x202;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, bytes);
+  memory.map(0x8000, 0x1000);
+  std::vector<std::uint8_t> src(16, 0xFF);
+  ASSERT_TRUE(memory.write(0x8000, src.data(), src.size()));
+  set_reg(state, iced_x86::Register::RAX, 0x8004);  // MOVUPS ("Unaligned") never requires alignment
 
   const auto result = executor.step(state, memory);
   EXPECT_EQ(result.reason, seven::StopReason::none);
+}
+
+TEST(KuberaSimd, VexVmovapsAllowsMisalignedMemoryOperand) {
+  std::vector<std::uint8_t> bytes;
+  const auto mem = iced_x86::MemoryOperand::with_base_displ(iced_x86::Register::RAX, 0);
+  const auto instr = iced_x86::InstructionFactory::with2(iced_x86::Code::VEX_VMOVAPS_XMM_XMMM128, iced_x86::Register::XMM0, mem);
+  ASSERT_TRUE(encode_to_bytes(instr, bytes, "vmovaps xmm0, [rax]"));
+
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.rflags = 0x202;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, bytes);
+  memory.map(0x8000, 0x1000);
+  std::vector<std::uint8_t> src(16, 0xFF);
+  ASSERT_TRUE(memory.write(0x8000, src.data(), src.size()));
+  set_reg(state, iced_x86::Register::RAX, 0x8004);  // VEX form never requires alignment, "Aligned" name notwithstanding
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::none);
+}
+
+TEST(KuberaSimd, LegacyMovntpsFaultsOnMisalignedMemoryOperand) {
+  std::vector<std::uint8_t> bytes;
+  const auto mem = iced_x86::MemoryOperand::with_base_displ(iced_x86::Register::RAX, 0);
+  const auto instr = iced_x86::InstructionFactory::with2(iced_x86::Code::MOVNTPS_M128_XMM, mem, iced_x86::Register::XMM0);
+  ASSERT_TRUE(encode_to_bytes(instr, bytes, "movntps [rax], xmm0"));
+
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.rflags = 0x202;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, bytes);
+  memory.map(0x8000, 0x1000);
+  set_reg(state, iced_x86::Register::RAX, 0x8004);  // non-temporal stores require 16-byte alignment
+  set_xmm_u64(state, 0, 0x1111'1111'1111'1111ull, 0x2222'2222'2222'2222ull);
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::general_protection);
 }
 
 TEST(KuberaSimd, Sse42Crc32MatchesCastagnoliReference) {
