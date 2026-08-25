@@ -561,7 +561,17 @@ bool Memory::access_allowed(const MemoryAccessEvent& event) const {
       const auto range_base = hook.range->base;
       const auto range_end = range_base + hook.range->size;
       const auto access_end = event.address + event.size;
-      if (event.address >= range_end || access_end <= range_base) {
+      // event.address is guest-controlled (unlike range_base/size, which the host set up when
+      // registering the hook) -- a guest picking an address near ~0ull can make access_end wrap
+      // back down past zero. A plain non-wrapping interval test against that wrapped value can
+      // then wrongly decide "no overlap" for an access whose real (wrapping) span does touch
+      // [range_base, range_end), letting it skip a hook meant to see every access to that range
+      // -- for a write hook specifically, access_allowed() runs before the underlying page write,
+      // so a skipped hook here is a real bypass of whatever the hook enforces, not just a missed
+      // notification. Treat the wrap itself as "can't rule out overlap" and fall through to call
+      // the hook rather than risk a false negative.
+      const bool access_wraps = access_end < event.address;
+      if (!access_wraps && (event.address >= range_end || access_end <= range_base)) {
         continue;
       }
     }

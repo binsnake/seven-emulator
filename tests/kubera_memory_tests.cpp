@@ -57,7 +57,7 @@ TEST(KuberaMemory, NonWrappingAccessStillReachesMmioCallback) {
 
   bool callback_invoked = false;
   std::uint64_t seen_offset = ~0ull;
-  memory.map_mmio(
+  (void)memory.map_mmio(
       0x2000, 0x1000,
       [&](std::uint64_t offset, void* dst, std::size_t size) {
         callback_invoked = true;
@@ -72,4 +72,38 @@ TEST(KuberaMemory, NonWrappingAccessStillReachesMmioCallback) {
   EXPECT_TRUE(callback_invoked);
   EXPECT_EQ(seen_offset, 0x10u);
   EXPECT_EQ(buffer[0], 0x42u);
+}
+
+// Same overflow shape as find_mmio_region, in Memory::access_allowed()'s range-scoped hook
+// overlap check: it computed access_end = event.address + event.size with no wraparound guard.
+// A guest picking an address near ~0ull can wrap access_end back down past zero, which a plain
+// non-wrapping interval test then wrongly reads as "no overlap" against a hook's registered
+// range -- even though the access's real (wrapping) span may well touch it. For a write hook
+// specifically this matters more than a missed notification: access_allowed() runs BEFORE the
+// underlying page write in Memory::write(), so a hook skipped this way never gets the chance to
+// veto (its callback returning false is what blocks the write) -- a real bypass of whatever the
+// hook enforces, reachable purely by a guest choosing a wraparound address.
+TEST(KuberaMemory, WraparoundWriteStillInvokesRangeScopedAccessHook) {
+  seven::Memory memory{};
+
+  bool hook_invoked = false;
+  const auto id = memory.add_access_hook(
+      [&](const seven::MemoryAccessEvent&) {
+        hook_invoked = true;
+        return true;
+      },
+      seven::MemoryHookRange{.base = 0x1000, .size = 0x1000},
+      seven::bit(seven::MemoryAccessKind::data_write));
+  ASSERT_NE(id, 0u);
+
+  // Same wraparound shape as the MMIO test above: address+size wraps to 0x8, well inside the
+  // hooked range numerically, even though the pre-fix skip logic would have missed it because
+  // event.address itself is nowhere near range_end under a naive (non-wrapping) comparison.
+  constexpr std::uint64_t kWraparoundAddress = 0xFFFF'FFFF'FFFF'FFF8ull;
+  std::uint8_t buffer[16] = {};
+
+  // The underlying page write still fails -- nothing is mapped at the top of the address space --
+  // but the hook must be given the chance to see (and veto) this access before that ever runs.
+  (void)memory.write(kWraparoundAddress, buffer, sizeof(buffer));
+  EXPECT_TRUE(hook_invoked);
 }
