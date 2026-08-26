@@ -228,10 +228,18 @@ bool Memory::read(std::uint64_t address, void* dst, std::size_t size, MemoryAcce
   }
 
   if (const auto* mmio = find_mmio_region(address, size)) {
+    // Take a copy of the callback and base before anything else runs. mmio points into
+    // mmio_regions_, and nothing defers MMIO mutation the way add/remove_access_hook is deferred --
+    // so a hook dispatched below calling map_mmio (push_back, may reallocate), unmap_mmio (erase,
+    // shifts every later element down) or clear_mmio_regions leaves that pointer naming a different
+    // device or freed storage, and the std::function read back out of it is then called. Copying
+    // also keeps the callable alive if the device reconfigures its own region from inside the call.
+    auto on_read = mmio->on_read;
+    const auto region_base = mmio->base;
     if (!access_allowed(MemoryAccessEvent{kind, address, size, nullptr, 0})) {
       return false;
     }
-    return mmio->on_read != nullptr ? mmio->on_read(address - mmio->base, dst, size) : false;
+    return on_read != nullptr ? on_read(address - region_base, dst, size) : false;
   }
 
   const auto copy_from_pages = [&](std::byte* out) {
@@ -284,7 +292,12 @@ bool Memory::read_unchecked(std::uint64_t address, void* dst, std::size_t size) 
     return false;
   }
   if (const auto* mmio = find_mmio_region(address, size)) {
-    return mmio->on_read != nullptr ? mmio->on_read(address - mmio->base, dst, size) : false;
+    // Copied out of mmio_regions_ before the call for the reason read()'s hooked path
+    // spells out: a device callback is free to reconfigure its own region, which would
+    // otherwise destroy or relocate the std::function while its own frame is still live.
+    auto on_read = mmio->on_read;
+    const auto region_base = mmio->base;
+    return on_read != nullptr ? on_read(address - region_base, dst, size) : false;
   }
 
   auto* out = static_cast<std::byte*>(dst);
@@ -364,7 +377,12 @@ bool Memory::write(std::uint64_t address, const void* src, std::size_t size, Mem
     return false;
   }
   if (const auto* mmio = find_mmio_region(address, size)) {
-    return mmio->on_write != nullptr ? mmio->on_write(address - mmio->base, src, size) : false;
+    // Copied out of mmio_regions_ before the call for the reason read()'s hooked path
+    // spells out: a device callback is free to reconfigure its own region, which would
+    // otherwise destroy or relocate the std::function while its own frame is still live.
+    auto on_write = mmio->on_write;
+    const auto region_base = mmio->base;
+    return on_write != nullptr ? on_write(address - region_base, src, size) : false;
   }
 
   const auto* in = static_cast<const std::byte*>(src);
@@ -394,7 +412,12 @@ bool Memory::write_unchecked(std::uint64_t address, const void* src, std::size_t
     return false;
   }
   if (const auto* mmio = find_mmio_region(address, size)) {
-    return mmio->on_write != nullptr ? mmio->on_write(address - mmio->base, src, size) : false;
+    // Copied out of mmio_regions_ before the call for the reason read()'s hooked path
+    // spells out: a device callback is free to reconfigure its own region, which would
+    // otherwise destroy or relocate the std::function while its own frame is still live.
+    auto on_write = mmio->on_write;
+    const auto region_base = mmio->base;
+    return on_write != nullptr ? on_write(address - region_base, src, size) : false;
   }
 
   const auto* in = static_cast<const std::byte*>(src);

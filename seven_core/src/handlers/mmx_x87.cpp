@@ -18,10 +18,6 @@ big_uint mask(std::size_t width) {
 }
 
 
-std::size_t xmm_index(iced_x86::Register reg) {
-  return static_cast<std::size_t>(static_cast<std::uint32_t>(reg) - static_cast<std::uint32_t>(iced_x86::Register::XMM0));
-}
-
 std::size_t vector_index(iced_x86::Register reg) {
   const auto value = static_cast<std::uint32_t>(reg);
   const auto xmm0 = static_cast<std::uint32_t>(iced_x86::Register::XMM0);
@@ -101,8 +97,8 @@ ExecutionResult store_masked_bytes(ExecutionContext& ctx, std::uint32_t data_ind
   if (use_xmm) {
     const auto data_reg = ctx.instr.op_register(data_index);
     const auto mask_reg = ctx.instr.op_register(mask_index);
-    const auto data = ctx.state.vectors[xmm_index(data_reg)].value;
-    const auto mask_value = ctx.state.vectors[xmm_index(mask_reg)].value;
+    const auto data = ctx.state.vectors[vector_index(data_reg)].value;
+    const auto mask_value = ctx.state.vectors[vector_index(mask_reg)].value;
     for (std::size_t i = 0; i < width; ++i) {
       bytes[i] = static_cast<std::uint8_t>((data >> (8 * i)) & 0xFFu);
       mask[i] = static_cast<std::uint8_t>((mask_value >> (8 * i)) & 0xFFu);

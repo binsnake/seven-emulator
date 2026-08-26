@@ -1118,7 +1118,11 @@ void Executor::clear_hooks() {
 }
 
 InstructionHookAction Executor::run_instruction_hooks(InstructionHookContext& ctx, ExecutionResult& stop_result) {
-  if (!pending_hook_mutations_.empty()) {
+  // Only at depth 0. Re-entered from inside a callback, this would run queued mutations while an
+  // OUTER dispatch is still walking instruction_hooks_/code_hooks_ -- a queued emplace_back
+  // reallocates the vector that outer range-for is iterating. The outermost HookDispatchScope
+  // flushes the queue on its way out, which is the only safe point.
+  if (!dispatching_hooks_ && !pending_hook_mutations_.empty()) {
     apply_pending_hook_mutations();
   }
 

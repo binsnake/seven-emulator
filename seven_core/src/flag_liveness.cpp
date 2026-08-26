@@ -353,6 +353,13 @@ bool can_fault(const iced_x86::Instruction& instr) noexcept {
     case iced_x86::Code::ENTERW_IMM16_IMM8: case iced_x86::Code::ENTERD_IMM16_IMM8: case iced_x86::Code::ENTERQ_IMM16_IMM8:
     case iced_x86::Code::LEAVEW: case iced_x86::Code::LEAVED: case iced_x86::Code::LEAVEQ:
     case iced_x86::Code::XLAT_M8:
+    // PUSHF/POPF push and pop through rsp with op_count() == 0, so neither the operand loop nor the
+    // PUSH/POP list above ever saw them. Both genuinely fault: handle_code_PUSHFQ writes 8 bytes at
+    // rsp and handle_code_POPFQ reads 8, each returning memory_fault. Leaving them out also made
+    // POPFQ callout-eligible in the JIT, which is how a guest could set rflags.TF in the middle of a
+    // compiled block -- see the mask on the Jcc path's popfq for why that mattered.
+    case iced_x86::Code::PUSHFW: case iced_x86::Code::PUSHFD: case iced_x86::Code::PUSHFQ:
+    case iced_x86::Code::POPFW: case iced_x86::Code::POPFD: case iced_x86::Code::POPFQ:
       return true;
 
     // MOV to/from a control or debug register operates on two REGISTER-kind operands -- no
