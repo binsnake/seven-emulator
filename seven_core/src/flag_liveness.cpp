@@ -331,6 +331,16 @@ bool can_fault(const iced_x86::Instruction& instr) noexcept {
     case iced_x86::Code::LEAVEW: case iced_x86::Code::LEAVED: case iced_x86::Code::LEAVEQ:
     case iced_x86::Code::XLAT_M8:
       return true;
+
+    // MOV to/from a control or debug register operates on two REGISTER-kind operands -- no
+    // OpKind::MEMORY for the loop above to catch -- but both directions can fault: CPL>0 raises
+    // #GP, and (for CR) a reserved register encoding or (for DR) DR4/DR5 with CR4.DE set raises
+    // #UD. Same implicit-fault gap the CALL/RET/PUSH/POP cases above exist to close.
+    case iced_x86::Code::MOV_R32_CR: case iced_x86::Code::MOV_R64_CR:
+    case iced_x86::Code::MOV_CR_R32: case iced_x86::Code::MOV_CR_R64:
+    case iced_x86::Code::MOV_R32_DR: case iced_x86::Code::MOV_R64_DR:
+    case iced_x86::Code::MOV_DR_R32: case iced_x86::Code::MOV_DR_R64:
+      return true;
     default:
       return false;
   }

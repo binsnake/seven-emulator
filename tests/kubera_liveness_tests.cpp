@@ -108,6 +108,30 @@ TEST(KuberaLiveness, TrapFlagDisablesMaskingViaRun) {
   EXPECT_NE(state.rflags & seven::kFlagZF, 0u);
 }
 
+TEST(KuberaLiveness, MaskedWriteSurvivesMovCrUdFaultViaRun) {
+  // Same shape as MaskedWriteSurvivesMidBlockFaultViaRun, but the faulting second instruction is
+  // MOV r32, CR1 rather than a memory operand -- MOV to/from a control or debug register has two
+  // REGISTER-kind operands, so can_fault()'s operand-kind loop can't see it, and it needs its own
+  // explicit case (added alongside CALL/RET/PUSH/POP) or this add's flags would be wrongly masked
+  // as "covered" by an instruction that never actually completes. CR1 is architecturally reserved
+  // (real hardware only defines CR0/CR2/CR3/CR4/CR8), so this UDs before ever touching rax.
+  seven::CpuState state{};
+  seven::Memory memory{};
+  seven::Executor executor{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.gpr[4] = kStackTop;
+  write_bytes(memory, kBase, {0x48, 0x01, 0xD8, 0x0F, 0x20, 0xC8});  // add rax,rbx ; mov eax,cr1
+  state.gpr[0] = 0xFFFFFFFFFFFFFFFFull;  // rax
+  state.gpr[3] = 1ull;                   // rbx
+
+  const auto result = executor.run(state, memory, 100);
+  ASSERT_EQ(result.reason, seven::StopReason::invalid_opcode);
+  EXPECT_EQ(state.gpr[0], 0u);
+  EXPECT_NE(state.rflags & seven::kFlagCF, 0u);
+  EXPECT_NE(state.rflags & seven::kFlagZF, 0u);
+}
+
 TEST(KuberaLiveness, JitBypassEligibleReflectsHooksAndTrapState) {
   // jit_bypass_eligible() is a narrow public surface for an external native-codegen consumer (see
   // seven-jit's JitExecutor) to ask "can I run my own code for a span of instructions without

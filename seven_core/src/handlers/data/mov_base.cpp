@@ -47,6 +47,28 @@ constexpr std::uint64_t kCr4DeBit = 1ull << 3;
   return index;
 }
 
+// SDM Vol 3, 2.5: MOV to/from a control register requires the reg field to name CR0, CR2, CR3,
+// CR4, or (64-bit mode only) CR8 -- any other encoding (CR1, CR5-CR7, CR9-CR15) is #UD on real
+// hardware. `state.cr` is sized to cover CR0-CR15 so an unfiltered index never reads/writes out
+// of bounds, but leaving these reserved encodings live lets a guest treat nonexistent registers
+// (including CR9-CR15, which don't exist in silicon at all) as ordinary read/write storage.
+[[nodiscard]] std::optional<std::uint32_t> resolve_control_index(iced_x86::Register reg) {
+  if (reg < iced_x86::Register::CR0 || reg > iced_x86::Register::CR15) {
+    return std::nullopt;
+  }
+  const auto index = static_cast<std::uint32_t>(reg) - static_cast<std::uint32_t>(iced_x86::Register::CR0);
+  switch (index) {
+    case 0u:
+    case 2u:
+    case 3u:
+    case 4u:
+    case 8u:
+      return index;
+    default:
+      return std::nullopt;
+  }
+}
+
 }  // namespace
 
 ExecutionResult handle_code_MOV_RM8_R8(ExecutionContext& ctx) {
@@ -354,33 +376,29 @@ ExecutionResult handle_code_MOV_SREG_R64M16(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_MOV_R32_CR(ExecutionContext& ctx) {
-  const auto as_cr = [](iced_x86::Register reg) {
-    if (reg >= iced_x86::Register::DR0 && reg <= iced_x86::Register::DR15) {
-      return static_cast<iced_x86::Register>(
-          static_cast<std::uint32_t>(iced_x86::Register::CR0) +
-          (static_cast<std::uint32_t>(reg) - static_cast<std::uint32_t>(iced_x86::Register::DR0)));
-    }
-    return reg;
-  };
+  if (!cpl_is_zero(ctx.state)) {
+    return gp_fault(ctx);
+  }
+  const auto src_index = resolve_control_index(ctx.instr.op_register(1));
+  if (!src_index.has_value()) {
+    return ud_fault(ctx);
+  }
   const auto dst = ctx.instr.op_register(0);
-  const auto src = as_cr(ctx.instr.op_register(1));
-  const auto value = detail::read_register(ctx.state, src);
+  const auto value = ctx.state.cr[src_index.value()];
   detail::write_register(ctx.state, dst, value, 4);
   return {};
 }
 
 ExecutionResult handle_code_MOV_R64_CR(ExecutionContext& ctx) {
-  const auto as_cr = [](iced_x86::Register reg) {
-    if (reg >= iced_x86::Register::DR0 && reg <= iced_x86::Register::DR15) {
-      return static_cast<iced_x86::Register>(
-          static_cast<std::uint32_t>(iced_x86::Register::CR0) +
-          (static_cast<std::uint32_t>(reg) - static_cast<std::uint32_t>(iced_x86::Register::DR0)));
-    }
-    return reg;
-  };
+  if (!cpl_is_zero(ctx.state)) {
+    return gp_fault(ctx);
+  }
+  const auto src_index = resolve_control_index(ctx.instr.op_register(1));
+  if (!src_index.has_value()) {
+    return ud_fault(ctx);
+  }
   const auto dst = ctx.instr.op_register(0);
-  const auto src = as_cr(ctx.instr.op_register(1));
-  const auto value = detail::read_register(ctx.state, src);
+  const auto value = ctx.state.cr[src_index.value()];
   detail::write_register(ctx.state, dst, value, 8);
   return {};
 }
@@ -414,34 +432,30 @@ ExecutionResult handle_code_MOV_R64_DR(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_MOV_CR_R32(ExecutionContext& ctx) {
-  const auto as_cr = [](iced_x86::Register reg) {
-    if (reg >= iced_x86::Register::DR0 && reg <= iced_x86::Register::DR15) {
-      return static_cast<iced_x86::Register>(
-          static_cast<std::uint32_t>(iced_x86::Register::CR0) +
-          (static_cast<std::uint32_t>(reg) - static_cast<std::uint32_t>(iced_x86::Register::DR0)));
-    }
-    return reg;
-  };
-  const auto dst = as_cr(ctx.instr.op_register(0));
+  if (!cpl_is_zero(ctx.state)) {
+    return gp_fault(ctx);
+  }
+  const auto dst_index = resolve_control_index(ctx.instr.op_register(0));
+  if (!dst_index.has_value()) {
+    return ud_fault(ctx);
+  }
   const auto src = ctx.instr.op_register(1);
   const auto value = detail::truncate(detail::read_register(ctx.state, src), 4);
-  detail::write_register(ctx.state, dst, value, 4);
+  ctx.state.cr[dst_index.value()] = value;
   return {};
 }
 
 ExecutionResult handle_code_MOV_CR_R64(ExecutionContext& ctx) {
-  const auto as_cr = [](iced_x86::Register reg) {
-    if (reg >= iced_x86::Register::DR0 && reg <= iced_x86::Register::DR15) {
-      return static_cast<iced_x86::Register>(
-          static_cast<std::uint32_t>(iced_x86::Register::CR0) +
-          (static_cast<std::uint32_t>(reg) - static_cast<std::uint32_t>(iced_x86::Register::DR0)));
-    }
-    return reg;
-  };
-  const auto dst = as_cr(ctx.instr.op_register(0));
+  if (!cpl_is_zero(ctx.state)) {
+    return gp_fault(ctx);
+  }
+  const auto dst_index = resolve_control_index(ctx.instr.op_register(0));
+  if (!dst_index.has_value()) {
+    return ud_fault(ctx);
+  }
   const auto src = ctx.instr.op_register(1);
   const auto value = detail::read_register(ctx.state, src);
-  detail::write_register(ctx.state, dst, value, 8);
+  ctx.state.cr[dst_index.value()] = value;
   return {};
 }
 

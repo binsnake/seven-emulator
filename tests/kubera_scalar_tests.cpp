@@ -322,6 +322,56 @@ TEST(KuberaScalar, NonCanonicalAddressFaultsGeneralProtectionNotPageFault) {
   EXPECT_EQ(result.reason, seven::StopReason::general_protection);
 }
 
+TEST(KuberaScalar, MovCrRejectsReservedControlRegisterIndex) {
+  // Real hardware only defines CR0, CR2, CR3, CR4, and (64-bit mode) CR8 as valid MOV CR
+  // operands -- CR1, CR5-CR7, CR9-CR15 #UD. state.cr is sized to cover all 16 possible encodings
+  // so an unfiltered access would never go out of bounds, but it would let a guest treat a
+  // register that doesn't exist in silicon at all as ordinary read/write storage.
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("0F 20 C8"));  // mov eax, cr1
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::invalid_opcode);
+}
+
+TEST(KuberaScalar, MovCrRequiresCplZero) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.sreg[1] = 0x2B;  // CS selector with RPL 3 -- CPL 3
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("0F 20 C0"));  // mov eax, cr0 -- valid register, wrong CPL
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::general_protection);
+}
+
+TEST(KuberaScalar, MovCrRoundTripsArchitecturallyValidRegister) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("44 0F 22 C0 44 0F 20 C3"));  // mov cr8,eax ; mov ebx,cr8
+  state.gpr[0] = 0xFull;  // eax
+
+  const auto r1 = executor.step(state, memory);
+  ASSERT_EQ(r1.reason, seven::StopReason::none);
+  EXPECT_EQ(state.cr[8], 0xFull);
+
+  const auto r2 = executor.step(state, memory);
+  ASSERT_EQ(r2.reason, seven::StopReason::none);
+  EXPECT_EQ(state.gpr[3], 0xFull);  // ebx, zero-extended
+}
+
 TEST(KuberaScalar, RdsspReportsNoShadowStack) {
   run_single(seven::parse_hex_bytes("F3 48 0F 1E CA"),
              [](seven::CpuState& state, seven::Memory&) {
