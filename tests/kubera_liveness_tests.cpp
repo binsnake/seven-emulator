@@ -6,6 +6,7 @@
 #include <span>
 
 #include <iced_x86/decoder.hpp>
+#include <iced_x86/instruction_info.hpp>
 
 #include "seven/flag_liveness.hpp"
 #include "seven/handler_helpers.hpp"
@@ -274,5 +275,30 @@ TEST(KuberaLiveness, StringInstructionsAreRecognizedAsFaultCapable) {
     ASSERT_TRUE(decoded.has_value()) << c.name;
     EXPECT_TRUE(seven::can_fault(decoded.value()))
         << c.name << " reads or writes guest memory, so it must be treated as fault-capable";
+  }
+}
+
+// InstructionExtensions::encoding() used to return EncodingKind::LEGACY unconditionally, with a
+// comment admitting it was a placeholder. Executor::simd_profile_allows() gates the AVX and AVX-512
+// build profiles on it, so both of those checks were dead code: a build configured with
+// SEVEN_ENABLE_AVX512=0 still accepted EVEX instructions. The surviving vector-width check hides
+// this for ZMM/YMM operands, so the case that actually slipped through was an EVEX-encoded
+// instruction on XMM registers, which is also where the opmask semantics live.
+TEST(KuberaLiveness, InstructionEncodingIsClassifiedNotAssumedLegacy) {
+  struct Case { const char* name; const char* bytes; iced_x86::EncodingKind expected; };
+  const Case cases[] = {
+      {"add eax, ecx", "01 C8", iced_x86::EncodingKind::LEGACY},
+      {"movaps xmm0, xmm1", "0F 28 C1", iced_x86::EncodingKind::LEGACY},
+      {"vmovaps xmm0, xmm1", "C5 F8 28 C1", iced_x86::EncodingKind::VEX},
+      {"vmovaps ymm0, ymm1", "C5 FC 28 C1", iced_x86::EncodingKind::VEX},
+      // EVEX on XMM specifically -- the shape the width check cannot catch.
+      {"vpaddd xmm0, xmm1, xmm2", "62 F1 75 08 FE C2", iced_x86::EncodingKind::EVEX},
+  };
+  for (const auto& c : cases) {
+    const auto raw = seven::parse_hex_bytes(c.bytes);
+    iced_x86::Decoder decoder(64, std::span<const std::uint8_t>(raw.data(), raw.size()), 0x1000);
+    const auto decoded = decoder.decode();
+    ASSERT_TRUE(decoded.has_value()) << c.name;
+    EXPECT_EQ(iced_x86::InstructionExtensions::encoding(decoded.value()), c.expected) << c.name;
   }
 }
