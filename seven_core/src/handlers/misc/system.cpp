@@ -3,6 +3,33 @@
 
 namespace seven::handlers {
 
+namespace {
+
+// CLI/STI are only unconditionally allowed at CPL0 -- at CPL>0 real hardware requires CPL <= IOPL
+// (rflags bits 12-13) and #GP(0)s otherwise. seven emulates ring 3 only (see POPFQ below), where
+// IOPL is always 0, so this reduces to CPL0-only in practice, but the real CPL<=IOPL comparison is
+// what's architecturally correct rather than a hardcoded CPL0 check.
+[[nodiscard]] bool cli_sti_allowed(const CpuState& state) {
+  const auto cpl = state.sreg[1] & 0x3u;
+  const auto iopl = (state.rflags >> 12) & 0x3u;
+  return cpl <= iopl;
+}
+
+[[nodiscard]] ExecutionResult gp_fault(ExecutionContext& ctx) {
+  return {StopReason::general_protection, 0, ExceptionInfo{StopReason::general_protection, ctx.state.rip, 0}, ctx.instr.code()};
+}
+
+// WRFSBASE/WRGSBASE require the value written to FS.base/GS.base to already be a canonical
+// 48-bit linear address, #GP(0) otherwise -- same 4-level-paging rule handler_helpers.cpp's
+// memory_fault() enforces for ordinary memory operands, duplicated here since these two
+// instructions never go through that path (they touch state directly, not memory).
+[[nodiscard]] bool is_canonical_address(std::uint64_t address) noexcept {
+  constexpr int kShift = 16;  // 64 - 48
+  return (static_cast<std::int64_t>(address << kShift) >> kShift) == static_cast<std::int64_t>(address);
+}
+
+}  // namespace
+
 ExecutionResult handle_code_CLC(ExecutionContext& ctx) {
   detail::set_flag(ctx.state.rflags, kFlagCF, false);
   return {};
@@ -29,11 +56,17 @@ ExecutionResult handle_code_STD(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_CLI(ExecutionContext& ctx) {
+  if (!cli_sti_allowed(ctx.state)) {
+    return gp_fault(ctx);
+  }
   detail::set_flag(ctx.state.rflags, kFlagIF, false);
   return {};
 }
 
 ExecutionResult handle_code_STI(ExecutionContext& ctx) {
+  if (!cli_sti_allowed(ctx.state)) {
+    return gp_fault(ctx);
+  }
   detail::set_flag(ctx.state.rflags, kFlagIF, true);
   return {};
 }
@@ -201,12 +234,20 @@ ExecutionResult handle_code_RDGSBASE_R64(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_WRFSBASE_R64(ExecutionContext& ctx) {
-  ctx.state.fs_base = detail::read_register(ctx.state, ctx.instr.op_register(0));
+  const auto value = detail::read_register(ctx.state, ctx.instr.op_register(0));
+  if (!is_canonical_address(value)) {
+    return gp_fault(ctx);
+  }
+  ctx.state.fs_base = value;
   return {};
 }
 
 ExecutionResult handle_code_WRGSBASE_R64(ExecutionContext& ctx) {
-  ctx.state.gs_base = detail::read_register(ctx.state, ctx.instr.op_register(0));
+  const auto value = detail::read_register(ctx.state, ctx.instr.op_register(0));
+  if (!is_canonical_address(value)) {
+    return gp_fault(ctx);
+  }
+  ctx.state.gs_base = value;
   return {};
 }
 

@@ -155,6 +155,28 @@ TEST(KuberaLiveness, MaskedWriteSurvivesWrmsrGpFaultViaRun) {
   EXPECT_NE(state.rflags & seven::kFlagZF, 0u);
 }
 
+TEST(KuberaLiveness, MaskedWriteSurvivesCliGpFaultViaRun) {
+  // Same shape again: CLI reads no memory operand and writes no ALU status flag, but can now #GP
+  // at CPL>IOPL, so it needs the same explicit can_fault() case as the other CPL-gated
+  // instructions above.
+  seven::CpuState state{};
+  seven::Memory memory{};
+  seven::Executor executor{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.gpr[4] = kStackTop;
+  state.sreg[1] = 0x2B;  // CPL 3, IOPL 0 -- CPL > IOPL
+  write_bytes(memory, kBase, {0x48, 0x01, 0xD8, 0xFA});  // add rax,rbx ; cli
+  state.gpr[0] = 0xFFFFFFFFFFFFFFFFull;  // rax
+  state.gpr[3] = 1ull;                   // rbx
+
+  const auto result = executor.run(state, memory, 100);
+  ASSERT_EQ(result.reason, seven::StopReason::general_protection);
+  EXPECT_EQ(state.gpr[0], 0u);
+  EXPECT_NE(state.rflags & seven::kFlagCF, 0u);
+  EXPECT_NE(state.rflags & seven::kFlagZF, 0u);
+}
+
 TEST(KuberaLiveness, JitBypassEligibleReflectsHooksAndTrapState) {
   // jit_bypass_eligible() is a narrow public surface for an external native-codegen consumer (see
   // seven-jit's JitExecutor) to ask "can I run my own code for a span of instructions without

@@ -449,6 +449,87 @@ TEST(KuberaScalar, XsetbvRequiresCplZero) {
   EXPECT_EQ(result.reason, seven::StopReason::general_protection);
 }
 
+TEST(KuberaScalar, CliRequiresCplLessThanOrEqualIopl) {
+  // CLI/STI are only unconditionally allowed at CPL0 -- at CPL>IOPL real hardware #GPs. IOPL 0
+  // (the default, unset rflags bits 12-13) means any CPL>0 must fault.
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.sreg[1] = 0x2B;  // CPL 3, IOPL 0 -- CPL > IOPL
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("FA"));  // cli
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::general_protection);
+}
+
+TEST(KuberaScalar, StiRequiresCplLessThanOrEqualIopl) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.sreg[1] = 0x2B;  // CPL 3, IOPL 0 -- CPL > IOPL
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("FB"));  // sti
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::general_protection);
+}
+
+TEST(KuberaScalar, CliAllowedWhenCplWithinIopl) {
+  // CPL 3 with IOPL raised to 3 in rflags -- CPL <= IOPL, so CLI must still succeed. Proves the
+  // fix is the real CPL<=IOPL comparison, not a blunt CPL0-only gate.
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.sreg[1] = 0x2B;               // CPL 3
+  state.rflags = 0x202 | (3ull << 12);  // IOPL 3
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("FA"));  // cli
+
+  const auto result = executor.step(state, memory);
+  ASSERT_EQ(result.reason, seven::StopReason::none);
+  EXPECT_EQ(state.rflags & seven::kFlagIF, 0u);
+}
+
+TEST(KuberaScalar, WrfsbaseRejectsNonCanonicalAddress) {
+  // WRFSBASE/WRGSBASE never route through the ordinary memory-operand fault path (they write
+  // FS.base/GS.base directly, not memory), so they need their own canonical-address check --
+  // real hardware #GP(0)s on a non-canonical operand here just like it does for any other
+  // 4-level-paging address.
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("F3 48 0F AE D0"));  // wrfsbase rax (REX.W -- the R64 form is the only one registered)
+  state.gpr[0] = 0x8000'1234'5678'9ABCull;  // non-canonical
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::general_protection);
+}
+
+TEST(KuberaScalar, WrfsbaseAllowsCanonicalAddress) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("F3 48 0F AE D0"));  // wrfsbase rax (REX.W -- the R64 form is the only one registered)
+  state.gpr[0] = 0x0000'7FF6'1234'0000ull;  // canonical
+
+  const auto result = executor.step(state, memory);
+  ASSERT_EQ(result.reason, seven::StopReason::none);
+  EXPECT_EQ(state.fs_base, state.gpr[0]);
+}
+
 TEST(KuberaScalar, RdsspReportsNoShadowStack) {
   run_single(seven::parse_hex_bytes("F3 48 0F 1E CA"),
              [](seven::CpuState& state, seven::Memory&) {

@@ -349,6 +349,8 @@ bool can_fault(const iced_x86::Instruction& instr) noexcept {
     case iced_x86::Code::WRMSR: case iced_x86::Code::WRMSRNS: case iced_x86::Code::WRMSRLIST:
     case iced_x86::Code::RDMSR: case iced_x86::Code::RDMSRLIST:
     case iced_x86::Code::XSETBV:
+    case iced_x86::Code::CLI: case iced_x86::Code::STI:
+    case iced_x86::Code::WRFSBASE_R64: case iced_x86::Code::WRGSBASE_R64:
       return true;
     default:
       return false;
