@@ -555,3 +555,48 @@ TEST(KuberaMemory, AnExecutionHookMayAddAHookFromInsideItsOwnCallback) {
   ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
   EXPECT_EQ(added_calls, 1);
 }
+
+// step_impl decodes into a direct-mapped slot picked by (rip >> 1) & 8191 and then holds a
+// reference to that slot's instruction across every hook dispatch and the handler call itself. A
+// hook is allowed to re-enter the executor, and a nested step at any rip 0x4000 away lands on the
+// same slot and overwrites it. The outer frame then runs the handler it already picked from the
+// original opcode against whatever operands the nested instruction decoded to.
+
+TEST(KuberaMemory, AReentrantHookCannotSwapTheInstructionUnderTheOuterHandler) {
+  seven::CpuState state{};
+  seven::Memory memory{};
+  seven::Executor executor{};
+  state.mode = seven::ExecutionMode::long64;
+  memory.map(0x1000, 0x1000);
+  memory.map(0x5000, 0x1000);  // (0x1000 >> 1) & 8191 == (0x5000 >> 1) & 8191
+
+  const std::uint8_t outer[] = {0x48, 0x01, 0xD8};  // add rax, rbx
+  const std::uint8_t inner[] = {0x48, 0x01, 0xD1};  // add rcx, rdx
+  ASSERT_TRUE(memory.write(0x1000, outer, sizeof(outer)));
+  ASSERT_TRUE(memory.write(0x5000, inner, sizeof(inner)));
+
+  seven::CpuState nested{};
+  nested.mode = seven::ExecutionMode::long64;
+  nested.rip = 0x5000;
+
+  bool reentered = false;
+  const auto id = executor.add_execution_hook([&](std::uint64_t) {
+    if (reentered) {
+      return;
+    }
+    reentered = true;
+    (void)executor.step(nested, memory);
+  });
+  ASSERT_NE(id, 0u);
+
+  state.rip = 0x1000;
+  state.gpr[0] = 1;    // rax
+  state.gpr[3] = 2;    // rbx
+  state.gpr[1] = 100;  // rcx
+  state.gpr[2] = 200;  // rdx
+
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+  ASSERT_TRUE(reentered);
+  EXPECT_EQ(state.gpr[0], 3u) << "the outer add rax, rbx has to be the one that ran";
+  EXPECT_EQ(state.gpr[1], 100u) << "the nested instruction's operands must not leak into it";
+}

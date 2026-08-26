@@ -397,6 +397,15 @@ bool Executor::jit_bypass_eligible(const CpuState& state, const Memory& memory) 
 }
 
 ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_masking) {
+  StepDepthScope depth_scope{*this};
+  // A hook callback is free to call back into step()/run(), and the decode cache is direct-mapped
+  // on (rip >> 1), so a nested step at any rip 0x4000 away from the outer one lands on the exact
+  // same slot. The outer frame is still holding a reference into that slot -- ExecutionContext's
+  // `instr` -- across hook dispatch and the handler call, while the opcode it already picked its
+  // handler from is a copy. Overwriting the slot therefore runs the outer instruction's handler
+  // against the nested instruction's operands: an `add rax, rbx` executing as `add rcx, rdx`.
+  // Nested frames get their own private slot instead and never touch the shared array.
+  const bool nested = step_depth_ > 1;
   if (cache_memory_instance_ != memory.instance_id()) [[unlikely]] {
     // Both caches below are validated on (rip, code_epoch, mode) alone, and code_epoch is a
     // per-Memory counter that every Memory starts near zero. An Executor reused across two of them
@@ -465,9 +474,19 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
     };
 
     const auto code_epoch = memory.code_epoch();
-    const bool can_use_decode_cache = !memory.has_fetch_access_hooks() && !decode_cache_disabled_by_env_;
+    const bool can_use_decode_cache =
+        !nested && !memory.has_fetch_access_hooks() && !decode_cache_disabled_by_env_;
     const auto cache_index = static_cast<std::size_t>((state.rip >> 1) & (kDecodeCacheSize - 1));
-    auto& cache_entry = (*decode_cache_)[cache_index];
+    const auto scratch_slot = [this]() -> DecodedInstructionCacheEntry& {
+      const auto index = step_depth_ - 2;
+      while (nested_decode_scratch_.size() <= index) {
+        nested_decode_scratch_.push_back(std::make_unique<DecodedInstructionCacheEntry>());
+      }
+      auto& slot = *nested_decode_scratch_[index];
+      slot.valid = false;  // one slot per depth, reused across calls, so never serve a stale hit
+      return slot;
+    };
+    auto& cache_entry = nested ? scratch_slot() : (*decode_cache_)[cache_index];
     const bool cache_hit = can_use_decode_cache &&
                            cache_entry.valid &&
                            cache_entry.rip == state.rip &&
@@ -1215,6 +1234,12 @@ Executor::HookDispatchScope::~HookDispatchScope() {
     self.apply_pending_hook_mutations();
   }
 }
+
+Executor::StepDepthScope::StepDepthScope(Executor& executor) noexcept : self(executor) {
+  ++self.step_depth_;
+}
+
+Executor::StepDepthScope::~StepDepthScope() { --self.step_depth_; }
 
 void Executor::apply_pending_hook_mutations() {
   if (pending_hook_mutations_.empty()) {

@@ -115,6 +115,16 @@ class Executor {
     Executor& self;
     bool was_dispatching;
   };
+  // Counts step_impl frames currently on the stack, so a nested one knows to keep its hands off
+  // the shared decode cache -- see step_impl's `nested` for what goes wrong otherwise.
+  struct StepDepthScope {
+    explicit StepDepthScope(Executor& executor) noexcept;
+    ~StepDepthScope();
+    StepDepthScope(const StepDepthScope&) = delete;
+    StepDepthScope& operator=(const StepDepthScope&) = delete;
+
+    Executor& self;
+  };
 
   static ExecutionResult unsupported(ExecutionContext& ctx);
   // The shared dispatch core behind both step() and run()'s internal loop. `allow_masking` gates
@@ -189,6 +199,10 @@ class Executor {
   // Which Memory the decode and code-page caches were filled from -- see step_impl. 0 is never a
   // real instance id, so the first step always refills.
   std::uint64_t cache_memory_instance_ = 0;
+  // Depth of step_impl frames on the stack, and one private decode slot per nested depth. Held by
+  // unique_ptr so an outer frame's reference into its slot survives this vector growing.
+  std::size_t step_depth_ = 0;
+  std::vector<std::unique_ptr<DecodedInstructionCacheEntry>> nested_decode_scratch_;
   ContextSyncCallback context_read_cb_{};
   ContextSyncCallback context_write_cb_{};
   bool stop_requested_ = false;
