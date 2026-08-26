@@ -1014,6 +1014,138 @@ TEST(KuberaScalar, AFarReturnCannotLowerTheCurrentPrivilegeLevel) {
   EXPECT_EQ(state.sreg[1] & 0x3u, 3u) << "CPL must not have dropped";
 }
 
+namespace {
+
+// Writes one 80-bit extended value in the architectural in-memory layout: significand first,
+// little-endian, then the sign-and-exponent halfword.
+void write_extf80(seven::Memory& memory, std::uint64_t address, std::uint64_t significand,
+                  std::uint16_t sign_exp) {
+  ASSERT_TRUE(memory.write(address, &significand, sizeof(significand)));
+  ASSERT_TRUE(memory.write(address + 8, &sign_exp, sizeof(sign_exp)));
+}
+
+constexpr std::uint64_t kX87Data = 0x4000;
+
+}  // namespace
+
+// seven::ldexp used to add FSCALE's shift count to the biased exponent as an int, and the shift is
+// whatever the guest left in ST(1). It also fell back to std::ldexp on a double for the subnormal
+// and underflow cases, which are exactly the values a double cannot hold, so a result that should
+// have been a representable denormal came back as zero or infinity.
+TEST(KuberaScalar, FscaleReachesTheDenormalRangeInsteadOfFlushing) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.gpr[3] = kX87Data;
+  memory.map(kX87Data, 0x1000);
+  write_extf80(memory, kX87Data, 0x8000000000000000ull, 0xBFFF);       // -1.0
+  write_extf80(memory, kX87Data + 16, 0x8000000000000000ull, 0x0001);  // 2^-16382, smallest normal
+  // fld tbyte [rbx] ; fld tbyte [rbx+16] ; fscale
+  write_bytes(memory, kBase, seven::parse_hex_bytes("DB 2B DB 6B 10 D9 FD"));
+
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none) << "step " << i;
+  }
+
+  const auto result = state.x87_get(0);
+  EXPECT_EQ(result.val.signExp, 0x0000u) << "2^-16383 is a denormal, so the biased exponent is zero";
+  EXPECT_EQ(result.val.signif, 0x4000000000000000ull) << "and the significand keeps its one bit";
+}
+
+// This one is a tripwire rather than a repro: the old int addition wrapped to a large negative
+// value, which fell into the underflow branch, which returned infinity anyway -- so the answer was
+// right by luck while the arithmetic was undefined. It fails under a sanitizer, not at -O2.
+TEST(KuberaScalar, FscaleWithAHugeShiftDoesNotOverflowTheExponentArithmetic) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.gpr[3] = kX87Data;
+  memory.map(kX87Data, 0x1000);
+  const std::uint32_t shift = 0x7FFFFFFFu;  // INT_MAX, straight into the exponent addition
+  ASSERT_TRUE(memory.write(kX87Data + 16, &shift, sizeof(shift)));
+  // fild dword [rbx+16] ; fld1 ; fscale
+  write_bytes(memory, kBase, seven::parse_hex_bytes("DB 43 10 D9 E8 D9 FD"));
+
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none) << "step " << i;
+  }
+
+  EXPECT_TRUE(seven::isinf(state.x87_get(0)));
+  EXPECT_FALSE(seven::signbit(state.x87_get(0)));
+}
+
+TEST(KuberaScalar, FpremByAnInfiniteDivisorReturnsTheDividend) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.gpr[3] = kX87Data;
+  memory.map(kX87Data, 0x1000);
+  write_extf80(memory, kX87Data, 0x8000000000000000ull, 0x7FFF);       // +inf
+  write_extf80(memory, kX87Data + 16, 0x8000000000000000ull, 0x3FFF);  // 1.0
+  // fld tbyte [rbx] ; fld tbyte [rbx+16] ; fprem
+  write_bytes(memory, kBase, seven::parse_hex_bytes("DB 2B DB 6B 10 D9 F8"));
+
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none) << "step " << i;
+  }
+
+  const auto result = state.x87_get(0);
+  EXPECT_FALSE(seven::isnan(result)) << "trunc(a/inf) is zero and zero times infinity is NaN";
+  EXPECT_EQ(static_cast<double>(result), 1.0);
+}
+
+// FST/FSTP m32 rounds the 80-bit value to single precision once. Going through a double first
+// rounds twice, and a value sitting exactly on the double midpoint rounds to even there and then
+// lands a full ulp away from where one rounding puts it.
+TEST(KuberaScalar, FstpToSinglePrecisionRoundsOnce) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.gpr[3] = kX87Data;
+  state.gpr[1] = kX87Data + 32;
+  memory.map(kX87Data, 0x1000);
+  // 1 + 2^-24 + 2^-53
+  write_extf80(memory, kX87Data, 0x8000008000000400ull, 0x3FFF);
+  // fld tbyte [rbx] ; fstp dword [rcx]
+  write_bytes(memory, kBase, seven::parse_hex_bytes("DB 2B D9 19"));
+
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+
+  std::uint32_t stored = 0;
+  ASSERT_TRUE(memory.read(kX87Data + 32, &stored, sizeof(stored)));
+  EXPECT_EQ(stored, 0x3F800001u) << "rounding through double first collapses this to 1.0f";
+}
+
+TEST(KuberaScalar, Fyl2xOnALargeExponentDoesNotSaturateThroughDouble) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.gpr[3] = kX87Data;
+  memory.map(kX87Data, 0x1000);
+  write_extf80(memory, kX87Data, 0x8000000000000000ull, 0x3FFF);       // 1.0
+  write_extf80(memory, kX87Data + 16, 0x8000000000000000ull, 0x444B);  // 2^1100
+  // fld tbyte [rbx] ; fld tbyte [rbx+16] ; fyl2x
+  write_bytes(memory, kBase, seven::parse_hex_bytes("DB 2B DB 6B 10 D9 F1"));
+
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none) << "step " << i;
+  }
+
+  EXPECT_EQ(static_cast<double>(state.x87_get(0)), 1100.0)
+      << "2^1100 does not fit in a double, so narrowing before taking the log gave infinity";
+}
+
 // The RDTSC counter used to be a function-local static, so every guest in the process shared it.
 // Two Executors that are meant to be isolated could watch each other's progress through it, and on
 // separate threads they raced on the increment. RDTSCP read a hardcoded 0 at the same time, so a

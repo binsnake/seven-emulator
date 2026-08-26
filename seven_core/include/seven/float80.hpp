@@ -56,7 +56,10 @@ public:
     bool operator>=(Float80 o) const noexcept { return extF80_le(o.val, val); }
 
     explicit operator double()      const noexcept { return std::bit_cast<double>(extF80_to_f64(val)); }
-    explicit operator float()       const noexcept { return static_cast<float>(static_cast<double>(*this)); }
+    // Straight to f32. Going via double rounds twice, and a value that sits exactly on the f64
+    // midpoint can round to even there and then land a full ulp away from what one rounding gives,
+    // which FST/FSTP m32 would show.
+    explicit operator float()       const noexcept { return std::bit_cast<float>(extF80_to_f32(val)); }
     explicit operator std::int64_t()  const noexcept { return extF80_to_i64(val,  softfloat_round_minMag, false); }
     explicit operator std::uint64_t() const noexcept { return extF80_to_ui64(val, softfloat_round_minMag, false); }
     explicit operator int()         const noexcept { return static_cast<int>(static_cast<std::int64_t>(*this)); }
@@ -109,45 +112,95 @@ inline Float80 fmod(Float80 a, Float80 b) noexcept {
         extFloat80_t nan; nan.signExp = 0x7FFFu; nan.signif = 0xC000000000000000ULL;
         return Float80(nan);
     }
-    const Float80 q = trunc(a / b);
-    return a - q * b;
+    // IEEE and x87 both give the finite value back unchanged. This used to fall through to the
+    // quotient path below, where trunc(a/inf) is zero and zero times infinity is NaN.
+    if (isinf(b)) return a;
+    // Built on the exact IEEE remainder rather than a - trunc(a/b)*b: once |a/b| needs more than 64
+    // significand bits the quotient's low bits are rounding noise and the subtraction returns
+    // something arbitrary. FPREM1 next door already used extF80_rem, so the two also disagreed with
+    // each other. The two differ only in how the quotient is rounded -- nearest for the IEEE
+    // remainder, toward zero for fmod -- so they are at most one b apart, and fmod is the one whose
+    // sign follows the dividend.
+    const Float80 r = Float80(extF80_rem(a.val, b.val));
+    if (r == Float80(0) || signbit(r) == signbit(a)) return r;
+    return signbit(a) ? (r - abs(b)) : (r + abs(b));
 }
 
 // ── exponent manipulation (exact, no precision loss) ─────────────────────────
 
+// Entirely in the exponent/significand domain, with a 64-bit accumulator. The previous version
+// added `int n` to the biased exponent as an int, which overflows for a large n (FSCALE hands this
+// whatever the guest put in ST(1), up to INT_MAX), and fell back to std::ldexp on a double for the
+// subnormal and underflow cases -- but those are precisely the values that do not fit in a double,
+// so a result that should have been a representable denormal came back as infinity or zero.
 inline Float80 ldexp(Float80 x, int n) noexcept {
     if (isnan(x) || isinf(x) || x == Float80(0)) return x;
-    const uint16_t biased = x.val.signExp & 0x7FFFu;
-    if (biased == 0) {
-        // denormal: round-trip through double is acceptable
-        return Float80(std::ldexp(static_cast<double>(x), n));
+
+    const std::uint16_t sign = x.val.signExp & 0x8000u;
+    std::uint64_t signif = x.val.signif;
+    if (signif == 0) {
+        extFloat80_t r; r.signExp = sign; r.signif = 0;
+        return Float80(r);
     }
-    const int newexp = static_cast<int>(biased) + n;
-    if (newexp >= 0x7FFF) {
+
+    // A biased exponent of 0 means the same scale as 1 with no implicit integer bit, so the two
+    // shapes agree once the significand is normalized. Doing that here means the rest of the
+    // function only has one case to think about, denormals and pseudo-denormals included.
+    std::int64_t exp = static_cast<std::int64_t>(x.val.signExp & 0x7FFFu);
+    if (exp == 0) exp = 1;
+    while ((signif & 0x8000000000000000ULL) == 0) {
+        signif <<= 1;
+        --exp;
+    }
+
+    exp += static_cast<std::int64_t>(n);
+
+    if (exp >= 0x7FFF) {
         extFloat80_t r;
-        r.signExp = static_cast<uint16_t>((x.val.signExp & 0x8000u) | 0x7FFFu);
+        r.signExp = static_cast<std::uint16_t>(sign | 0x7FFFu);
         r.signif  = 0x8000000000000000ULL;
         return Float80(r);
     }
-    if (newexp <= 0) {
-        return Float80(std::ldexp(static_cast<double>(x), n));
+    if (exp <= 0) {
+        // Below the smallest normal: shift the significand down into the denormal range instead of
+        // flushing. Bits shifted out are dropped rather than rounded, which matches the rest of this
+        // file ignoring the guest's rounding-control bits.
+        const std::int64_t shift = 1 - exp;
+        extFloat80_t r;
+        r.signExp = sign;
+        r.signif  = (shift >= 64) ? 0ULL : (signif >> shift);
+        return Float80(r);
     }
-    extFloat80_t r = x.val;
-    r.signExp = static_cast<uint16_t>((x.val.signExp & 0x8000u) | static_cast<uint16_t>(newexp));
+    extFloat80_t r;
+    r.signExp = static_cast<std::uint16_t>(sign | static_cast<std::uint16_t>(exp));
+    r.signif  = signif;
     return Float80(r);
 }
 
 inline Float80 frexp(Float80 x, int* exp) noexcept {
     if (isnan(x) || isinf(x) || x == Float80(0)) { *exp = 0; return x; }
-    const uint16_t biased = x.val.signExp & 0x7FFFu;
-    if (biased == 0) {
-        double m = std::frexp(static_cast<double>(x), exp);
-        return Float80(m);
+
+    const std::uint16_t sign = x.val.signExp & 0x8000u;
+    std::uint64_t signif = x.val.signif;
+    if (signif == 0) {
+        *exp = 0;
+        extFloat80_t r; r.signExp = sign; r.signif = 0;
+        return Float80(r);
     }
-    // Normal: exponent = biased - 16382, mantissa exponent → 16382 → value in [0.5,1)
-    *exp = static_cast<int>(biased) - 16382;
-    extFloat80_t r = x.val;
-    r.signExp = static_cast<uint16_t>((x.val.signExp & 0x8000u) | 16382u);
+
+    // Same normalization as ldexp, and for the same reason: the old denormal branch went through a
+    // double, which cannot hold a denormal extF80 at all and returned zero with an exponent of zero.
+    std::int64_t e = static_cast<std::int64_t>(x.val.signExp & 0x7FFFu);
+    if (e == 0) e = 1;
+    while ((signif & 0x8000000000000000ULL) == 0) {
+        signif <<= 1;
+        --e;
+    }
+
+    *exp = static_cast<int>(e - 16382);
+    extFloat80_t r;
+    r.signExp = static_cast<std::uint16_t>(sign | 16382u);
+    r.signif  = signif;
     return Float80(r);
 }
 
@@ -173,7 +226,18 @@ inline Float80 pow(Float80 base, Float80 exp_) noexcept {
     return Float80(std::pow(static_cast<double>(base), static_cast<double>(exp_)));
 }
 
-inline Float80 log2(Float80 x) noexcept { return Float80(std::log2(static_cast<double>(x))); }
+// Split off the exponent before narrowing, unlike its neighbours above. The mantissa is always in
+// [0.5, 1) so the double round-trip only costs precision, whereas feeding the whole value through
+// turned anything outside double's exponent range into an infinity: FYL2X on 2^1100 answered
+// infinity rather than 1100.
+inline Float80 log2(Float80 x) noexcept {
+    if (isnan(x) || isinf(x) || signbit(x) || x == Float80(0)) {
+        return Float80(std::log2(static_cast<double>(x)));
+    }
+    int e = 0;
+    const Float80 mantissa = frexp(x, &e);
+    return Float80(static_cast<std::int64_t>(e)) + Float80(std::log2(static_cast<double>(mantissa)));
+}
 
 }  // namespace seven
 
