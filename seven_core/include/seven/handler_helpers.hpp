@@ -24,7 +24,10 @@ void set_flag(std::uint64_t& rflags, std::uint64_t bit, bool value);
 void set_dead_flags_mask(std::uint64_t mask) noexcept;
 [[nodiscard]] std::uint64_t dead_flags_mask() noexcept;
 std::uint64_t read_msr(CpuState& state, std::uint32_t index);
-void write_msr(CpuState& state, std::uint32_t index, std::uint64_t value);
+// False when the write would have to create a new entry and the guest has already created more
+// than any real machine implements -- the caller raises #GP, as hardware does for an MSR it has no
+// storage for.
+[[nodiscard]] bool write_msr(CpuState& state, std::uint32_t index, std::uint64_t value);
 std::uint64_t read_xcr(CpuState& state, std::uint32_t index);
 void write_xcr(CpuState& state, std::uint32_t index, std::uint64_t value);
 std::uint64_t truncate(std::uint64_t value, std::size_t width);

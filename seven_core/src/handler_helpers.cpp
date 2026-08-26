@@ -56,8 +56,24 @@ std::uint64_t read_msr(CpuState& state, std::uint32_t index) {
   return read_msr_unchecked(state, index);
 }
 
-void write_msr(CpuState& state, std::uint32_t index, std::uint64_t value) {
-  state.msr[index] = value;
+bool write_msr(CpuState& state, std::uint32_t index, std::uint64_t value) {
+  const auto it = state.msr.find(index);
+  if (it != state.msr.end()) {
+    it->second = value;
+    return true;
+  }
+  // Accepting any index at all turns this map into 4 billion slots of host-heap storage that a
+  // CPL0 guest can fill by walking ECX through a wrmsr loop -- on the order of 200 GB before the
+  // counter even wraps, with nothing else in the emulator able to interrupt or bound it. Real
+  // hardware implements a few hundred MSRs and #GPs on everything else, so a ceiling well above
+  // any plausible guest keeps the permissive behaviour where it matters and gives back the fault
+  // an unimplemented MSR would have raised. Writes to an index already present never fail.
+  constexpr std::size_t kMaxTrackedMsrs = 4096;
+  if (state.msr.size() >= kMaxTrackedMsrs) {
+    return false;
+  }
+  state.msr.emplace(index, value);
+  return true;
 }
 
 std::uint64_t read_xcr(CpuState& state, std::uint32_t index) {

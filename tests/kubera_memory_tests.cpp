@@ -347,3 +347,41 @@ TEST(KuberaMemory, InstructionThatGenuinelyStraddlesAnUnmappedPageStillFaults) {
   ASSERT_TRUE(result.exception.has_value());
   EXPECT_EQ(result.exception->address, 0x2000u) << "the fault belongs to the page it ran into";
 }
+
+// CpuState::msr is an unordered_map keyed on the 32-bit MSR index, and WRMSR used to insert
+// unconditionally. A CPL0 guest walking ECX through a wrmsr loop therefore made the host allocate
+// one node per index -- around 200 GB before the counter wraps, with no cooperative-cancellation
+// path able to interrupt it. Real hardware implements a few hundred MSRs and faults on the rest.
+
+TEST(KuberaMemory, WrmsrCannotGrowTheMsrMapWithoutBound) {
+  seven::CpuState state{};
+  seven::Memory memory{};
+  seven::Executor executor{};
+  state.mode = seven::ExecutionMode::long64;
+  memory.map(0x1000, 0x1000);
+  const std::uint8_t wrmsr[] = {0x0F, 0x30};
+  ASSERT_TRUE(memory.write(0x1000, wrmsr, sizeof(wrmsr)));
+
+  const auto initial = state.msr.size();
+  bool faulted = false;
+  for (std::uint32_t index = 0; index < 100000u && !faulted; ++index) {
+    state.rip = 0x1000;
+    state.gpr[1] = index;  // ECX
+    state.gpr[0] = index;  // EAX
+    state.gpr[2] = 0;      // EDX
+    const auto result = executor.step(state, memory);
+    faulted = result.reason == seven::StopReason::general_protection;
+  }
+
+  EXPECT_TRUE(faulted) << "a new index past the ceiling has to fault, not allocate";
+  EXPECT_LT(state.msr.size(), initial + 100000u);
+
+  // An index that is already present must keep working after the ceiling is reached.
+  state.rip = 0x1000;
+  state.gpr[1] = 0xC0000080u;  // EFER, mapped from the start
+  state.gpr[0] = 0x0D01;
+  state.gpr[2] = 0;
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::none);
+  EXPECT_EQ(state.msr.at(0xC0000080u), 0x0D01u);
+}

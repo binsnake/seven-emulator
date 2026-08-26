@@ -24,7 +24,9 @@ ExecutionResult handle_code_WRMSR(ExecutionContext& ctx) {
   const auto ecx = static_cast<std::uint32_t>(detail::read_register(ctx.state, iced_x86::Register::ECX));
   const std::uint64_t eax = detail::read_register(ctx.state, iced_x86::Register::EAX);
   const std::uint64_t edx = detail::read_register(ctx.state, iced_x86::Register::EDX);
-  detail::write_msr(ctx.state, ecx, (edx << 32) | (eax & 0xFFFFFFFFull));
+  if (!detail::write_msr(ctx.state, ecx, (edx << 32) | (eax & 0xFFFFFFFFull))) {
+    return gp_fault(ctx);
+  }
   return {};
 }
 
@@ -39,7 +41,9 @@ ExecutionResult handle_code_WRMSRNS(ExecutionContext& ctx) {
   }
   const std::uint64_t eax = detail::read_register(ctx.state, iced_x86::Register::EAX);
   const std::uint64_t edx = detail::read_register(ctx.state, iced_x86::Register::EDX);
-  detail::write_msr(ctx.state, msr_index, (edx << 32) | (eax & 0xFFFFFFFFull));
+  if (!detail::write_msr(ctx.state, msr_index, (edx << 32) | (eax & 0xFFFFFFFFull))) {
+    return gp_fault(ctx);
+  }
   return {};
 }
 
@@ -70,7 +74,9 @@ ExecutionResult handle_code_WRMSRLIST(ExecutionContext& ctx) {
     if (!ctx.memory.read(value_address, &value, 8)) {
       return detail::memory_fault(ctx, value_address);
     }
-    detail::write_msr(ctx.state, static_cast<std::uint32_t>(msr_index), value);
+    if (!detail::write_msr(ctx.state, static_cast<std::uint32_t>(msr_index), value)) {
+      return gp_fault(ctx);
+    }
 
     rcx &= ~mask;
     detail::write_register(ctx.state, iced_x86::Register::RCX, rcx);
