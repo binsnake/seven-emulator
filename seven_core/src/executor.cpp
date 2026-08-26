@@ -393,7 +393,14 @@ bool Executor::jit_bypass_eligible(const CpuState& state, const Memory& memory) 
   // external codegen bypass both need, for an overlapping reason. Trap flag and DR7 additionally
   // gate this the same way they gate masking_safe_now below: single-stepping (real or debug-driven)
   // has to keep landing on every instruction boundary regardless of hooks.
-  return (state.rflags & kFlagTF) == 0 && state.dr[7] == 0 && block_liveness_eligible(memory);
+  // The context-sync callbacks are per-instruction machinery too: step_impl pulls state in before
+  // the handler and pushes it back out after, which is how examples/live_context_windows.hpp
+  // mirrors a real suspended thread's registers. A bypassing consumer calls neither, so a compiled
+  // span ran against a CpuState nobody had refreshed and discarded every register write it made --
+  // the whole bridge quietly did nothing for as long as the span lasted. Same reasoning as the hook
+  // check above; they were simply missed because they are not stored as hooks.
+  return (state.rflags & kFlagTF) == 0 && state.dr[7] == 0 && !context_read_cb_ && !context_write_cb_ &&
+         block_liveness_eligible(memory);
 }
 
 ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_masking) {

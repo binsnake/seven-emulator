@@ -642,3 +642,28 @@ TEST(KuberaMemory, SelfModifyingCodeThroughAPassthroughInvalidatesTheDecodeCache
   ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
   EXPECT_EQ(state.gpr[0], 10u) << "the rewritten sub rax, rcx has to be what ran";
 }
+
+// jit_bypass_eligible answers "is it safe for a codegen layer to run a span without going through
+// step() at all". It listed hooks, the trap flag and DR7, but not the context-sync callbacks --
+// which are per-instruction machinery in exactly the same sense, just not stored as hooks. A
+// bypassing consumer skipped them entirely, so a live-context bridge silently stopped mirroring.
+
+TEST(KuberaMemory, ContextSyncCallbacksBlockTheCodegenBypass) {
+  seven::CpuState state{};
+  seven::Memory memory{};
+  seven::Executor executor{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = 0x1000;
+  memory.map(0x1000, 0x1000);
+
+  ASSERT_TRUE(executor.jit_bypass_eligible(state, memory)) << "baseline: nothing registered";
+
+  executor.set_context_read_callback([](seven::CpuState&) { return true; });
+  EXPECT_FALSE(executor.jit_bypass_eligible(state, memory)) << "a read callback has to run per instruction";
+
+  executor.set_context_read_callback(nullptr);
+  ASSERT_TRUE(executor.jit_bypass_eligible(state, memory));
+
+  executor.set_context_write_callback([](seven::CpuState&) { return true; });
+  EXPECT_FALSE(executor.jit_bypass_eligible(state, memory)) << "so does a write callback";
+}
