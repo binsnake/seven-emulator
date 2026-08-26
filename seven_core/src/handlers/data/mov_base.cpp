@@ -309,70 +309,67 @@ ExecutionResult handle_code_MOV_RM64_IMM32(ExecutionContext& ctx) {
   return {};
 }
 
-ExecutionResult handle_code_MOV_RM16_SREG(ExecutionContext& ctx) {
+namespace {
+
+// R32M16 and R64M16 name the width of the register form only. The memory form of all three of
+// these codes is m16, so a memory operand is always two bytes wide no matter which code iced
+// picked from the operand size.
+[[nodiscard]] std::size_t sreg_operand_width(const iced_x86::Instruction& instr, std::uint32_t index,
+                                             std::size_t register_width) {
+  return instr.op_kind(index) == iced_x86::OpKind::MEMORY ? 2 : register_width;
+}
+
+ExecutionResult store_sreg(ExecutionContext& ctx, std::size_t register_width) {
   const auto value = detail::read_register(ctx.state, ctx.instr.op_register(1));
-  if (!detail::write_operand(ctx, 0, value, 2)) {
+  if (!detail::write_operand(ctx, 0, value, sreg_operand_width(ctx.instr, 0, register_width))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
+}
+
+ExecutionResult load_sreg(ExecutionContext& ctx, std::size_t register_width) {
+  const auto width = sreg_operand_width(ctx.instr, 1, register_width);
+  bool src_ok = false;
+  const auto value = detail::read_operand(ctx, 1, width, &src_ok);
+  if (!src_ok) {
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
+  }
+  const auto dst_reg = ctx.instr.op_register(0);
+  detail::write_register(ctx.state, dst_reg, value, 2);
+  if (dst_reg == iced_x86::Register::SS) {
+    ctx.state.debug_suppression = 1;
+    if ((ctx.state.rflags & kFlagTF) != 0) ctx.state.pending_single_step = true;
+    if (ctx.instr.op_kind(1) == iced_x86::OpKind::MEMORY) {
+      ctx.debug_hit_bits |= detail::debug_data_breakpoint_hits(ctx.state, detail::memory_address(ctx), width, true, false);
+    }
+  }
+  return {};
+}
+
+}  // namespace
+
+ExecutionResult handle_code_MOV_RM16_SREG(ExecutionContext& ctx) {
+  return store_sreg(ctx, 2);
 }
 
 ExecutionResult handle_code_MOV_R32M16_SREG(ExecutionContext& ctx) {
-  const auto value = detail::read_register(ctx.state, ctx.instr.op_register(1));
-  detail::write_register(ctx.state, ctx.instr.op_register(0), value, 4);
-  return {};
+  return store_sreg(ctx, 4);
 }
 
 ExecutionResult handle_code_MOV_R64M16_SREG(ExecutionContext& ctx) {
-  const auto value = detail::read_register(ctx.state, ctx.instr.op_register(1));
-  detail::write_register(ctx.state, ctx.instr.op_register(0), value, 8);
-  return {};
+  return store_sreg(ctx, 8);
 }
 
 ExecutionResult handle_code_MOV_SREG_RM16(ExecutionContext& ctx) {
-  bool src_ok = false;
-  const auto value = detail::read_operand(ctx, 1, 2, &src_ok);
-  if (!src_ok) {
-    return detail::memory_fault(ctx, detail::memory_address(ctx));
-  }
-  const auto dst_reg = ctx.instr.op_register(0);
-  detail::write_register(ctx.state, dst_reg, value, 2);
-  if (dst_reg == iced_x86::Register::SS) {
-    ctx.state.debug_suppression = 1;
-    if ((ctx.state.rflags & kFlagTF) != 0) ctx.state.pending_single_step = true;
-    if (ctx.instr.op_kind(1) == iced_x86::OpKind::MEMORY) {
-      ctx.debug_hit_bits |= detail::debug_data_breakpoint_hits(ctx.state, detail::memory_address(ctx), 2, true, false);
-    }
-  }
-  return {};
+  return load_sreg(ctx, 2);
 }
 
 ExecutionResult handle_code_MOV_SREG_R32M16(ExecutionContext& ctx) {
-  bool src_ok = false;
-  const auto value = detail::read_operand(ctx, 1, 4, &src_ok);
-  if (!src_ok) {
-    return detail::memory_fault(ctx, detail::memory_address(ctx));
-  }
-  const auto dst_reg = ctx.instr.op_register(0);
-  detail::write_register(ctx.state, dst_reg, value, 2);
-  if (dst_reg == iced_x86::Register::SS) {
-    ctx.state.debug_suppression = 1;
-    if ((ctx.state.rflags & kFlagTF) != 0) ctx.state.pending_single_step = true;
-    if (ctx.instr.op_kind(1) == iced_x86::OpKind::MEMORY) {
-      ctx.debug_hit_bits |= detail::debug_data_breakpoint_hits(ctx.state, detail::memory_address(ctx), 4, true, false);
-    }
-  }
-  return {};
+  return load_sreg(ctx, 4);
 }
 
 ExecutionResult handle_code_MOV_SREG_R64M16(ExecutionContext& ctx) {
-  bool src_ok = false;
-  const auto value = detail::read_operand(ctx, 1, 8, &src_ok);
-  if (!src_ok) {
-    return detail::memory_fault(ctx, detail::memory_address(ctx));
-  }
-  detail::write_register(ctx.state, ctx.instr.op_register(0), value, 2);
-  return {};
+  return load_sreg(ctx, 8);
 }
 
 ExecutionResult handle_code_MOV_R32_CR(ExecutionContext& ctx) {

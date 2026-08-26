@@ -602,3 +602,85 @@ TEST(KuberaScalar, RdsspReportsNoShadowStack) {
 
 
 }  // namespace
+
+TEST(KuberaScalar, MovSegmentRegisterToAndFromMemoryUsesTheM16Form) {
+  constexpr std::uint64_t kData = 0x4000;
+
+  // 8C 03 -- mov word ptr [rbx], es. Default operand size in 64-bit mode makes this
+  // MOV_R32M16_SREG, whose handler used to write the register named by op 0 regardless of whether
+  // op 0 was a register at all. For a memory operand iced leaves op_register(0) as NONE, which
+  // write_register maps to gpr[0], so this stored nothing and destroyed rax instead.
+  run_single(seven::parse_hex_bytes("8C 03"),
+             [](seven::CpuState& state, seven::Memory& memory) {
+               memory.map(kData, 0x1000);
+               state.gpr[0] = 0xCAFEF00DDEADBEEFull;
+               state.gpr[3] = kData;
+               state.sreg[0] = 0x2B;
+             },
+             [](const seven::ExecutionResult& result, const seven::CpuState& state, const seven::Memory& memory) {
+               EXPECT_EQ(result.reason, seven::StopReason::none);
+               EXPECT_EQ(state.gpr[0], 0xCAFEF00DDEADBEEFull) << "rax is not an operand of this instruction";
+               std::uint16_t stored = 0;
+               ASSERT_TRUE(memory.read(kData, &stored, sizeof(stored)));
+               EXPECT_EQ(stored, 0x2Bu);
+             });
+
+  // 48 8C 03 -- REX.W mov word ptr [rbx], es. Still an m16 store.
+  run_single(seven::parse_hex_bytes("48 8C 03"),
+             [](seven::CpuState& state, seven::Memory& memory) {
+               memory.map(kData, 0x1000);
+               state.gpr[0] = 0x1111222233334444ull;
+               state.gpr[3] = kData;
+               state.sreg[0] = 0x33;
+             },
+             [](const seven::ExecutionResult& result, const seven::CpuState& state, const seven::Memory& memory) {
+               EXPECT_EQ(result.reason, seven::StopReason::none);
+               EXPECT_EQ(state.gpr[0], 0x1111222233334444ull);
+               std::uint16_t stored = 0;
+               ASSERT_TRUE(memory.read(kData, &stored, sizeof(stored)));
+               EXPECT_EQ(stored, 0x33u);
+             });
+
+  // 8C C8 -- mov eax, cs. The register form still zero-extends the selector to the full width.
+  run_single(seven::parse_hex_bytes("8C C8"),
+             [](seven::CpuState& state, seven::Memory&) {
+               state.gpr[0] = 0xFFFFFFFFFFFFFFFFull;
+               state.sreg[1] = 0x33;
+             },
+             [](const seven::ExecutionResult& result, const seven::CpuState& state, const seven::Memory&) {
+               EXPECT_EQ(result.reason, seven::StopReason::none);
+               EXPECT_EQ(state.gpr[0], 0x33u);
+             });
+}
+
+TEST(KuberaScalar, MovSegmentRegisterFromMemoryReadsOnlyTwoBytes) {
+  // 8E 03 -- mov es, word ptr [rbx]. The handler read 4 bytes (8 with REX.W) from an m16 operand,
+  // so an operand sitting in the last two bytes of a mapped page straddled into the next page and
+  // raised a #PF that hardware never raises.
+  constexpr std::uint64_t kData = 0x4000;
+  constexpr std::uint64_t kLastWord = kData + 0x1000 - 2;
+
+  run_single(seven::parse_hex_bytes("8E 03"),
+             [](seven::CpuState& state, seven::Memory& memory) {
+               memory.map(kData, 0x1000);
+               const std::uint16_t selector = 0x2B;
+               ASSERT_TRUE(memory.write(kLastWord, &selector, sizeof(selector)));
+               state.gpr[3] = kLastWord;
+             },
+             [](const seven::ExecutionResult& result, const seven::CpuState& state, const seven::Memory&) {
+               EXPECT_EQ(result.reason, seven::StopReason::none) << "an m16 load must not touch the next page";
+               EXPECT_EQ(state.sreg[0], 0x2Bu);
+             });
+
+  run_single(seven::parse_hex_bytes("48 8E 03"),
+             [](seven::CpuState& state, seven::Memory& memory) {
+               memory.map(kData, 0x1000);
+               const std::uint16_t selector = 0x33;
+               ASSERT_TRUE(memory.write(kLastWord, &selector, sizeof(selector)));
+               state.gpr[3] = kLastWord;
+             },
+             [](const seven::ExecutionResult& result, const seven::CpuState& state, const seven::Memory&) {
+               EXPECT_EQ(result.reason, seven::StopReason::none);
+               EXPECT_EQ(state.sreg[0], 0x33u);
+             });
+}
