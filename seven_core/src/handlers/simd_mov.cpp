@@ -1,3 +1,5 @@
+#include <algorithm>
+
 #include <array>
 
 #include "seven/handler_helpers.hpp"
@@ -50,6 +52,10 @@ big_uint mask(std::size_t width) {
 
 big_uint read_mem(ExecutionContext& ctx, std::uint64_t address, std::size_t width, bool* ok) {
   std::array<std::uint8_t, kZmmWidth> bytes{};
+  // A ZMM register is the widest thing this can stage, so a larger width is a caller bug --
+  // but both the copy and the loop below are sized by it, so bound it here rather than let
+  // one run off the end of this frame.
+  width = std::min(width, bytes.size());
   if (!ctx.memory.read(address, bytes.data(), width)) {
     if (ok) *ok = false;
     return 0;
@@ -62,6 +68,10 @@ big_uint read_mem(ExecutionContext& ctx, std::uint64_t address, std::size_t widt
 
 bool write_mem(ExecutionContext& ctx, std::uint64_t address, big_uint value, std::size_t width) {
   std::array<std::uint8_t, kZmmWidth> bytes{};
+  // A ZMM register is the widest thing this can stage, so a larger width is a caller bug --
+  // but both the copy and the loop below are sized by it, so bound it here rather than let
+  // one run off the end of this frame.
+  width = std::min(width, bytes.size());
   for (std::size_t i = 0; i < width; ++i) bytes[i] = static_cast<std::uint8_t>((value >> (8 * i)) & 0xFFu);
   return ctx.memory.write(address, bytes.data(), width);
 }

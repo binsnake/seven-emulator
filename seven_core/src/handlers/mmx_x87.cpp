@@ -191,6 +191,9 @@ std::uint16_t get_le16(const std::uint8_t* src) {
 
 ExecutionResult store_x87_env(ExecutionContext& ctx, std::uint64_t base, std::size_t env_size) {
   std::array<std::uint8_t, 28> image{};
+  // 14 or 28 by construction, but fsave derives it by subtracting the register file from the image
+  // size, and that subtraction would wrap to an enormous size_t if the image were ever smaller.
+  env_size = std::min(env_size, image.size());
   const auto layout = x87_env_layout(env_size);
   put_le16(image.data() + layout.fcw, ctx.state.get_x87_control_word());
   put_le16(image.data() + layout.fsw, ctx.state.get_x87_status_word());
@@ -202,6 +205,7 @@ ExecutionResult store_x87_env(ExecutionContext& ctx, std::uint64_t base, std::si
 
 ExecutionResult load_x87_env(ExecutionContext& ctx, std::uint64_t base, std::size_t env_size) {
   std::array<std::uint8_t, 28> image{};
+  env_size = std::min(env_size, image.size());
   if (!ctx.memory.read(base, image.data(), env_size)) return detail::memory_fault(ctx, base);
   const auto layout = x87_env_layout(env_size);
   // No reserved-bit check on the control word. FLDENV loads whatever is there rather than faulting
