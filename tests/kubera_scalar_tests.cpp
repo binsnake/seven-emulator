@@ -1014,6 +1014,51 @@ TEST(KuberaScalar, AFarReturnCannotLowerTheCurrentPrivilegeLevel) {
   EXPECT_EQ(state.sreg[1] & 0x3u, 3u) << "CPL must not have dropped";
 }
 
+// The RDTSC counter used to be a function-local static, so every guest in the process shared it.
+// Two Executors that are meant to be isolated could watch each other's progress through it, and on
+// separate threads they raced on the increment. RDTSCP read a hardcoded 0 at the same time, so a
+// guest using both saw the clock jump backwards.
+TEST(KuberaScalar, TheTimestampCounterIsPerGuestNotPerProcess) {
+  const auto run_one = [](seven::CpuState& state, seven::Memory& memory, seven::Executor& executor) {
+    state.mode = seven::ExecutionMode::long64;
+    state.rip = kBase;
+    write_bytes(memory, kBase, seven::parse_hex_bytes("0F 31"));  // rdtsc
+    return executor.step(state, memory);
+  };
+
+  seven::Executor executor_a{};
+  seven::CpuState state_a{};
+  seven::Memory memory_a{};
+  seven::Executor executor_b{};
+  seven::CpuState state_b{};
+  seven::Memory memory_b{};
+
+  ASSERT_EQ(run_one(state_a, memory_a, executor_a).reason, seven::StopReason::none);
+  ASSERT_EQ(run_one(state_a, memory_a, executor_a).reason, seven::StopReason::none);
+  state_a.rip = kBase;
+  ASSERT_EQ(run_one(state_a, memory_a, executor_a).reason, seven::StopReason::none);
+  ASSERT_EQ(run_one(state_b, memory_b, executor_b).reason, seven::StopReason::none);
+
+  EXPECT_EQ(state_b.gpr[0] & 0xFFFFFFFFull, 1u)
+      << "the second guest's first rdtsc must not see the first guest's count";
+  EXPECT_EQ(state_a.tsc, 3u);
+  EXPECT_EQ(state_b.tsc, 1u);
+
+  // rdtscp reads the same counter, and rdmsr on IA32_TIME_STAMP_COUNTER agrees with both.
+  seven::CpuState state_c{};
+  seven::Memory memory_c{};
+  seven::Executor executor_c{};
+  state_c.mode = seven::ExecutionMode::long64;
+  state_c.rip = kBase;
+  write_bytes(memory_c, kBase, seven::parse_hex_bytes("0F 31 0F 01 F9 B9 10 00 00 00 0F 32"));
+  ASSERT_EQ(executor_c.step(state_c, memory_c).reason, seven::StopReason::none);  // rdtsc
+  ASSERT_EQ(executor_c.step(state_c, memory_c).reason, seven::StopReason::none);  // rdtscp
+  EXPECT_EQ(state_c.gpr[0] & 0xFFFFFFFFull, 2u) << "rdtscp must not report a constant zero";
+  ASSERT_EQ(executor_c.step(state_c, memory_c).reason, seven::StopReason::none);  // mov ecx, 0x10
+  ASSERT_EQ(executor_c.step(state_c, memory_c).reason, seven::StopReason::none);  // rdmsr
+  EXPECT_EQ(state_c.gpr[0] & 0xFFFFFFFFull, 2u) << "rdmsr 0x10 must report the same counter";
+}
+
 // MOV to a segment register writes sreg[] by index, and index 1 is CS, the only place this
 // emulator records the current privilege level. There is no MOV CS encoding on hardware and iced
 // declines to decode one, so this pins both halves: the decoder rejects it, and if it ever stopped

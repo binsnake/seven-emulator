@@ -129,6 +129,11 @@ struct CpuState {
   std::array<std::uint8_t, 8> x87_tags{0x3, 0x3, 0x3, 0x3, 0x3, 0x3, 0x3, 0x3};
   std::array<std::uint64_t, 8> opmask{};
   std::array<VectorRegister, 32> vectors{};
+  // Per-guest, deliberately. This used to be a function-local static inside the RDTSC handler,
+  // which meant every Executor in the process shared one counter: two guests that are supposed to
+  // be isolated could watch each other's progress through it, and two Executors on separate
+  // threads raced on the increment.
+  std::uint64_t tsc = 0;
   std::uint8_t debug_suppression = 0;
   bool pending_single_step = false;
   std::uint64_t pending_debug_hit_bits = 0;

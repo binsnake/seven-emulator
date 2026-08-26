@@ -145,10 +145,9 @@ ExecutionResult handle_code_INTO(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_RDTSC(ExecutionContext& ctx) {
-  static std::uint64_t tsc = 0;
-  ++tsc;
-  detail::write_register(ctx.state, iced_x86::Register::EAX, static_cast<std::uint32_t>(tsc & 0xFFFFFFFFull), 4);
-  detail::write_register(ctx.state, iced_x86::Register::EDX, static_cast<std::uint32_t>(tsc >> 32), 4);
+  ++ctx.state.tsc;
+  detail::write_register(ctx.state, iced_x86::Register::EAX, static_cast<std::uint32_t>(ctx.state.tsc & 0xFFFFFFFFull), 4);
+  detail::write_register(ctx.state, iced_x86::Register::EDX, static_cast<std::uint32_t>(ctx.state.tsc >> 32), 4);
   return {};
 }
 

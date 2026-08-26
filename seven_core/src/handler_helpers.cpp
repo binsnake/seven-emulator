@@ -12,6 +12,7 @@ namespace detail {
 
 namespace {
 
+constexpr std::uint32_t kMsrTsc = 0x10u;
 constexpr std::uint32_t kMsrStar = 0xC0000081u;
 constexpr std::uint32_t kMsrLStar = 0xC0000082u;
 constexpr std::uint32_t kMsrCStar = 0xC0000083u;
@@ -31,6 +32,9 @@ constexpr std::uint32_t kMsrSysenterEip = 0x176u;
 }
 
 std::uint64_t read_msr_unchecked(CpuState& state, std::uint32_t index) {
+  if (index == kMsrTsc) {
+    return state.tsc;
+  }
   const auto it = state.msr.find(index);
   if (it != state.msr.end()) {
     return it->second;
@@ -57,6 +61,10 @@ std::uint64_t read_msr(CpuState& state, std::uint32_t index) {
 }
 
 bool write_msr(CpuState& state, std::uint32_t index, std::uint64_t value) {
+  if (index == kMsrTsc) {
+    state.tsc = value;
+    return true;
+  }
   const auto it = state.msr.find(index);
   if (it != state.msr.end()) {
     it->second = value;
