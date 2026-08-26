@@ -3,7 +3,12 @@
 #include <algorithm>
 #include <cmath>
 
+#include <span>
+
 #include <iced_x86/code.hpp>
+#include <iced_x86/decoder.hpp>
+#include <iced_x86/encoding_kind.hpp>
+#include <iced_x86/instruction_info.hpp>
 #include <iced_x86/instruction_create.hpp>
 #include <iced_x86/register.hpp>
 
@@ -566,4 +571,25 @@ TEST(KuberaSimd, ScalarMinsdAlsoTakesSrc2WhenEitherOperandIsNan) {
              [](const seven::ExecutionResult&, const seven::CpuState& state, const seven::Memory&) {
                EXPECT_EQ(xmm_u64(state, 0, 0), 0x7FF8000000000000ull);
              });
+}
+
+// Executor::simd_profile_allows gates the AVX and AVX-512 build profiles on
+// InstructionExtensions::encoding(). That used to return LEGACY for everything, which silently
+// turned both gates into dead code: a build configured with AVX-512 off still ran EVEX
+// instructions. It reads the generated ENC_FLAGS3 table now, and this pins that it keeps doing so,
+// because nothing else in the suite would notice it regressing to a constant.
+
+TEST(KuberaSimd, EncodingKindIsReadFromTheTableNotAssumedLegacy) {
+  const auto encoding_of = [](const char* hex) {
+    const auto bytes = seven::parse_hex_bytes(hex);
+    iced_x86::Decoder decoder(64, std::span<const std::uint8_t>(bytes.data(), bytes.size()), 0x1000,
+                              iced_x86::DecoderOptions::NO_INVALID_CHECK);
+    const auto decoded = decoder.decode();
+    EXPECT_TRUE(decoded.has_value()) << hex;
+    return iced_x86::InstructionExtensions::encoding(decoded.value());
+  };
+
+  EXPECT_EQ(encoding_of("0F 58 C1"), iced_x86::EncodingKind::LEGACY) << "addps xmm0, xmm1";
+  EXPECT_EQ(encoding_of("C5 FC 58 C1"), iced_x86::EncodingKind::VEX) << "vaddps ymm0, ymm0, ymm1";
+  EXPECT_EQ(encoding_of("62 F1 7C 48 58 C1"), iced_x86::EncodingKind::EVEX) << "vaddps zmm0, zmm0, zmm1";
 }
