@@ -107,3 +107,27 @@ TEST(KuberaMemory, WraparoundWriteStillInvokesRangeScopedAccessHook) {
   (void)memory.write(kWraparoundAddress, buffer, sizeof(buffer));
   EXPECT_TRUE(hook_invoked);
 }
+
+// map()/unmap()/reprotect() all derived their exclusive end page as
+// `(base + size + kPageSize - 1) / kPageSize`. For any range reaching the very top of the address
+// space that addition wraps, the end page comes out as 0, and the `page < last_page` loop body
+// never executes at all -- so the call silently did nothing. unmap() leaving the page mapped is a
+// leak, but reprotect() is the sharper one: a host revoking write access on that page is told
+// nothing failed while the guest keeps writing through it.
+TEST(KuberaMemory, TopOfAddressSpacePageIsActuallyMappedUnmappedAndReprotected) {
+  constexpr std::uint64_t kTopPage = 0xFFFF'FFFF'FFFF'F000ull;
+  constexpr auto kWrite = static_cast<seven::MemoryPermissionMask>(seven::MemoryPermission::write);
+  constexpr auto kRead = static_cast<seven::MemoryPermissionMask>(seven::MemoryPermission::read);
+  seven::Memory memory{};
+
+  memory.map(kTopPage, 0x1000, seven::kMemoryPermissionAll);
+  ASSERT_TRUE(memory.is_mapped(kTopPage, 0x1000));
+  ASSERT_TRUE(memory.has_permissions(kTopPage, 0x1000, kWrite));
+
+  // The revoke must actually land: read-only afterwards, not still writable.
+  memory.reprotect(kTopPage, 0x1000, kRead);
+  EXPECT_FALSE(memory.has_permissions(kTopPage, 0x1000, kWrite));
+
+  memory.unmap(kTopPage, 0x1000);
+  EXPECT_FALSE(memory.is_mapped(kTopPage, 0x1000));
+}

@@ -6,6 +6,25 @@
 
 namespace seven {
 
+namespace {
+
+// Exclusive end page for [base, base+size), saturating instead of wrapping. Written as
+// `(base + size + kPageSize - 1) / kPageSize` this collapses to 0 whenever the range touches the
+// very top of the address space, which silently turned unmap() and reprotect() into no-ops there --
+// a revoke the caller believes happened but didn't. Both additions can overflow independently, so
+// neither is performed: a wrapped end means "through the last page", and the ceiling is taken with
+// a remainder test rather than a bias term.
+std::uint64_t page_range_end(std::uint64_t base, std::size_t size) noexcept {
+  constexpr std::uint64_t kEndOfAddressSpace = (~std::uint64_t{0} / Memory::kPageSize) + 1;
+  const auto end = base + size;
+  if (end < base) {
+    return kEndOfAddressSpace;
+  }
+  return (end / Memory::kPageSize) + ((end % Memory::kPageSize) != 0 ? 1 : 0);
+}
+
+}  // namespace
+
 Memory::PageEntry* Memory::lookup_page(std::uint64_t page_index) const noexcept {
   auto& slot = tlb_[page_index & (kTlbSize - 1)];
   if (slot.entry != nullptr && slot.page_index == page_index && slot.epoch == tlb_epoch_) {
@@ -49,7 +68,7 @@ void Memory::map(std::uint64_t base, std::size_t size, MemoryPermissionMask perm
   // overwritten) -- clear rather than risk a stale cached permission bit surviving this call.
   clear_jit_tlb();
   const auto first_page = base / kPageSize;
-  const auto last_page = (base + size + kPageSize - 1) / kPageSize;
+  const auto last_page = page_range_end(base, size);
   for (auto page = first_page; page < last_page; ++page) {
     auto [it, inserted] = pages_.try_emplace(page);
     (void)inserted;
@@ -69,7 +88,7 @@ void Memory::unmap(std::uint64_t base, std::size_t size) {
   // erase -- those become dangling the instant pages_.erase() runs, not just logically stale.
   clear_jit_tlb();
   const auto first_page = base / kPageSize;
-  const auto last_page = (base + size + kPageSize - 1) / kPageSize;
+  const auto last_page = page_range_end(base, size);
   for (auto page = first_page; page < last_page; ++page) {
     pages_.erase(page);
   }
@@ -85,7 +104,7 @@ void Memory::reprotect(std::uint64_t base, std::size_t size, MemoryPermissionMas
   // a cached slot's fast path would trust, so this one does need to clear it.
   clear_jit_tlb();
   const auto first_page = base / kPageSize;
-  const auto last_page = (base + size + kPageSize - 1) / kPageSize;
+  const auto last_page = page_range_end(base, size);
   for (auto page = first_page; page < last_page; ++page) {
     auto it = pages_.find(page);
     if (it != pages_.end()) {
