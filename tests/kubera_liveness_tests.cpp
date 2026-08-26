@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -301,4 +302,56 @@ TEST(KuberaLiveness, InstructionEncodingIsClassifiedNotAssumedLegacy) {
     ASSERT_TRUE(decoded.has_value()) << c.name;
     EXPECT_EQ(iced_x86::InstructionExtensions::encoding(decoded.value()), c.expected) << c.name;
   }
+}
+
+// The dead-flags mask lives in one thread_local that step_impl assigns just before it dispatches a
+// handler. A handler's memory access can land on an MMIO device, and that host callback is free to
+// call run() again; the nested frame overwrote the mask and never put it back, so every flag write
+// the outer handler still had to do was filtered through the wrong block's liveness result.
+TEST(KuberaLiveness, ANestedRunFromAnMmioCallbackDoesNotClobberTheOuterMask) {
+  constexpr std::uint64_t kMmioBase = 0x8000;
+  constexpr std::uint64_t kNestedCode = 0x2000;
+
+  seven::Executor executor{};
+  seven::Memory memory{};
+  seven::CpuState state{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+
+  memory.map(kBase, 0x1000);
+  memory.map(kNestedCode, 0x1000);
+  // mov rbx, 0x8000 ; add rax, [rbx] ; cmp rax, rax ; hlt
+  // The cmp overwrites every ALU flag the add just wrote without reading one, so the add is
+  // exactly the shape the liveness pass hands a non-empty mask to.
+  write_bytes(memory, kBase, seven::parse_hex_bytes("48 BB 00 80 00 00 00 00 00 00 48 03 03 48 39 C0 F4"));
+  write_bytes(memory, kNestedCode, seven::parse_hex_bytes("48 31 C0 F4"));  // xor rax, rax ; hlt
+
+  bool ran_nested = false;
+  std::uint64_t mask_at_entry = 0;
+  std::uint64_t mask_after_nested = 0;
+
+  const auto id = memory.map_mmio(
+      kMmioBase, 0x1000,
+      [&](std::uint64_t, void* dst, std::size_t size) {
+        std::memset(dst, 0, size);
+        if (!ran_nested) {
+          ran_nested = true;
+          mask_at_entry = seven::detail::dead_flags_mask();
+          seven::CpuState nested_state{};
+          nested_state.mode = seven::ExecutionMode::long64;
+          nested_state.rip = kNestedCode;
+          (void)executor.run(nested_state, memory, 200);
+          mask_after_nested = seven::detail::dead_flags_mask();
+        }
+        return true;
+      },
+      [](std::uint64_t, const void*, std::size_t) { return true; });
+  ASSERT_NE(id, 0u);
+
+  (void)executor.run(state, memory, 200);
+
+  ASSERT_TRUE(ran_nested);
+  ASSERT_NE(mask_at_entry, 0u) << "nothing is being proved unless the outer add really carried a mask";
+  EXPECT_EQ(mask_after_nested, mask_at_entry)
+      << "the nested run left its own mask installed for the rest of the outer handler";
 }

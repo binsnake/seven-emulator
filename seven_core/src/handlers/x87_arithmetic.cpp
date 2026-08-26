@@ -108,8 +108,10 @@ ExecutionResult handle_code_FIDIV_M16INT(ExecutionContext& ctx) { return x87_bin
 ExecutionResult handle_code_FIDIV_M32INT(ExecutionContext& ctx) { return x87_binary_mem_int_st0_with_status(ctx, 4, [](X87Scalar a, X87Scalar b) { return x87_div_pair(a, b, false); }); }
 ExecutionResult handle_code_FIDIVR_M16INT(ExecutionContext& ctx) { return x87_binary_mem_int_st0_with_status(ctx, 2, [](X87Scalar a, X87Scalar b) { return x87_div_pair(a, b, true); }); }
 ExecutionResult handle_code_FIDIVR_M32INT(ExecutionContext& ctx) { return x87_binary_mem_int_st0_with_status(ctx, 4, [](X87Scalar a, X87Scalar b) { return x87_div_pair(a, b, true); }); }
-ExecutionResult handle_code_FPREM(ExecutionContext& ctx) { return x87_binary_st_regs(ctx, 0, 1, [](X87Scalar a, X87Scalar b) { return seven::fmod(a, b); }); }
-ExecutionResult handle_code_FPREM1(ExecutionContext& ctx) { return x87_binary_st_regs(ctx, 0, 1, [](X87Scalar a, X87Scalar b) { return seven::remainder(a, b); }); }
+// FPREM/FPREM1 encode no operands at all -- ST(0) and ST(1) are implicit. Going through the
+// operand-reading form asked for two registers that were never there and faulted.
+ExecutionResult handle_code_FPREM(ExecutionContext& ctx) { return x87_binary_st_indices(ctx, 0, 1, [](X87Scalar a, X87Scalar b) { return seven::fmod(a, b); }); }
+ExecutionResult handle_code_FPREM1(ExecutionContext& ctx) { return x87_binary_st_indices(ctx, 0, 1, [](X87Scalar a, X87Scalar b) { return seven::remainder(a, b); }); }
 
 }  // namespace seven::handlers
 

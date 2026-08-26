@@ -24,8 +24,9 @@ ExecutionResult handle_code_FCOM_M32FP(ExecutionContext& ctx) { return x87_compa
 ExecutionResult handle_code_FCOMP_M32FP(ExecutionContext& ctx) { return x87_compare_mem(ctx, 4, true, false); }
 ExecutionResult handle_code_FCOM_ST0_STI(ExecutionContext& ctx) { return x87_compare_st0_sti(ctx, 1, false, false); }
 ExecutionResult handle_code_FCOMP_ST0_STI(ExecutionContext& ctx) { return x87_compare_st0_sti(ctx, 1, false, true); }
-ExecutionResult handle_code_FCOMPP(ExecutionContext& ctx) { return x87_compare_regs(ctx, 0, 1, true, true, false); }
-ExecutionResult handle_code_FUCOMPP(ExecutionContext& ctx) { return x87_compare_regs(ctx, 0, 1, true, true, false, true); }
+// Both compare ST(0) against ST(1) with neither named in the encoding, same as FPREM.
+ExecutionResult handle_code_FCOMPP(ExecutionContext& ctx) { return x87_compare_indices(ctx, 0, 1, true, true, false); }
+ExecutionResult handle_code_FUCOMPP(ExecutionContext& ctx) { return x87_compare_indices(ctx, 0, 1, true, true, false, true); }
 ExecutionResult handle_code_FCOMI_ST0_STI(ExecutionContext& ctx) { return x87_compare_st0_sti(ctx, 1, true, false); }
 ExecutionResult handle_code_FUCOMI_ST0_STI(ExecutionContext& ctx) { return x87_compare_st0_sti(ctx, 1, true, false, true); }
 ExecutionResult handle_code_FCOMIP_ST0_STI(ExecutionContext& ctx) { return x87_compare_st0_sti(ctx, 1, true, true); }

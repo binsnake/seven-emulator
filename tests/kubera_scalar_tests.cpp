@@ -1064,3 +1064,89 @@ TEST(KuberaScalar, IretDoesNotLetRingThreeRewriteItsOwnIopl) {
   ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
   EXPECT_EQ((state.rflags >> 12) & 0x3u, 0u) << "IOPL is writable only from CPL 0";
 }
+
+// iced's decoder value-initializes Instruction, and OpKind::REGISTER and Register::NONE are both 0,
+// so reading an operand slot the decoder never wrote comes back as (REGISTER, NONE) -- which passes
+// an `op_kind(i) != REGISTER` guard. Several x87 handlers read operand 1 (or operands 0 and 1) on
+// instructions that carry fewer than that, and x87_st_index(NONE) then underflows to a huge value
+// that x87_phys_index masks down to ST(7). The mask is what keeps it memory-safe; it is also what
+// hid it.
+
+TEST(KuberaScalar, FpremDoesNotFaultOnAnInstructionWithNoOperands) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  // fld1 ; fldpi ; fprem  -- FPREM has op_count 0, so both operand reads return Register::NONE.
+  write_bytes(memory, kBase, seven::parse_hex_bytes("D9 E8 D9 EB D9 F8"));
+
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);  // fld1
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);  // fldpi
+
+  const auto result = executor.step(state, memory);  // fprem
+  EXPECT_EQ(result.reason, seven::StopReason::none)
+      << "fprem has no memory operand and must not raise a page fault";
+  EXPECT_NEAR(static_cast<double>(state.x87_get(0)), 0.14159265358979312, 1e-12)
+      << "fmod(pi, 1.0)";
+}
+
+TEST(KuberaScalar, FstpStiWritesTheRegisterItNames) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  // fldz ; fld1 ; fstp st(1)  -- stores ST(0) into ST(1), then pops, leaving 1.0 on top.
+  write_bytes(memory, kBase, seven::parse_hex_bytes("D9 EE D9 E8 DD D9"));
+
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);  // fldz
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);  // fld1
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);  // fstp st(1)
+
+  ASSERT_FALSE(state.x87_is_empty(0));
+  EXPECT_EQ(static_cast<double>(state.x87_get(0)), 1.0)
+      << "the value has to land in ST(1) and survive the pop, not go to ST(7)";
+}
+
+TEST(KuberaScalar, FstStiWritesTheRegisterItNames) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  // fldz ; fld1 ; fst st(1)  -- copies ST(0) into ST(1) with no pop, so both hold 1.0.
+  write_bytes(memory, kBase, seven::parse_hex_bytes("D9 EE D9 E8 DD D1"));
+
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);  // fldz
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);  // fld1
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);  // fst st(1)
+
+  ASSERT_FALSE(state.x87_is_empty(1));
+  EXPECT_EQ(static_cast<double>(state.x87_get(0)), 1.0);
+  EXPECT_EQ(static_cast<double>(state.x87_get(1)), 1.0)
+      << "the source is implicitly ST(0); the only named operand is the destination";
+}
+
+TEST(KuberaScalar, FcomppComparesTheTopTwoStackSlots) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  // fld1 ; fldz ; fcompp  -- compares ST(0)=0 against ST(1)=1, so C0 (carry-equivalent) is set.
+  write_bytes(memory, kBase, seven::parse_hex_bytes("D9 E8 D9 EE DE D9"));
+
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);  // fld1
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);  // fldz
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);  // fcompp
+
+  // C3 is bit 14, C0 is bit 8. 0 < 1 means C3 clear, C0 set. Comparing a slot with itself would
+  // report equal: C3 set, C0 clear.
+  EXPECT_EQ(state.x87_status_word & (1u << 14), 0u) << "C3: the operands are not equal";
+  EXPECT_NE(state.x87_status_word & (1u << 8), 0u) << "C0: ST(0) is less than ST(1)";
+}

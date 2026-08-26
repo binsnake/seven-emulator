@@ -705,7 +705,8 @@ ExecutionResult handle_code_FST_M64FP(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_FST_STI(ExecutionContext& ctx) {
-  return x87_reg_move(ctx, 0, 1, false);
+  // FST ST(i) names only the destination; the source is always ST(0).
+  return x87_store_st0_to_sti(ctx, false);
 }
 
 ExecutionResult handle_code_FNSTSW_M2BYTE(ExecutionContext& ctx) {

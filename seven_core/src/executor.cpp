@@ -430,10 +430,14 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
     notify_stop_hooks(state, memory, stopped, state.rip);
     return stopped;
   }
-  if (context_read_cb_) context_read_cb_(state);
+  // Both go through a local copy for the same reason the MMIO dispatch does: these are
+  // host-supplied callables owned by this Executor, and set_context_*_callback assigns the member
+  // outright. One that reinstalls itself from inside its own body would destroy the functor whose
+  // operator() is still on the stack.
+  if (auto read_cb = context_read_cb_) read_cb(state);
   struct WriteSync {
     Executor& self; CpuState& state;
-    ~WriteSync() { if (self.context_write_cb_) self.context_write_cb_(state); }
+    ~WriteSync() { if (auto write_cb = self.context_write_cb_) write_cb(state); }
   } write_sync{*this, state};
   state.rip = mask_instruction_pointer(state, state.rip);
   state.gpr[4] = mask_stack_pointer(state, state.gpr[4]);
@@ -896,6 +900,15 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
     // Flag Liveness Execution Model Problem.md.
     const bool masking_safe_now = allow_masking && (state.rflags & kFlagTF) == 0 &&
                                    state.dr[7] == 0 && block_liveness_eligible(memory);
+    // Saved and put back rather than plain assigned. A handler's memory access can land on an
+    // MMIO device or a passthrough, and that host callback is free to re-enter run(); the nested
+    // frame installs a mask for its own block and would otherwise leave it in place. Everything
+    // this handler writes after the callback returns would then be filtered by the wrong block's
+    // mask, which can drop a flag write that is genuinely live here.
+    const struct DeadFlagsMaskScope {
+      std::uint64_t saved;
+      ~DeadFlagsMaskScope() { detail::set_dead_flags_mask(saved); }
+    } dead_flags_scope{detail::dead_flags_mask()};
     detail::set_dead_flags_mask(masking_safe_now ? cache_entry.dead_flags_mask : 0);
     result = dispatch_handler(ctx, code);
     result.code = reported_code;

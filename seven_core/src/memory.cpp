@@ -208,7 +208,10 @@ bool Memory::read(std::uint64_t address, void* dst, std::size_t size, MemoryAcce
   if (access_wraps(address, size)) {
     return false;
   }
-  if (passthrough_read_) return passthrough_read_(address, dst, size);
+  // Copied out before the call, matching the MMIO dispatch below: a passthrough is the embedder's
+  // whole memory backend, and one that reopens its handle by calling set_passthrough from inside a
+  // read would otherwise free the functor it is still running out of.
+  if (auto fn = passthrough_read_) return fn(address, dst, size);
   // Fast path: most reads in real workloads are entirely within a single page
   // and target a non-MMIO address with no access hooks installed. Inline that
   // case to skip every dynamic check besides the TLB lookup itself.
@@ -321,7 +324,7 @@ bool Memory::read_unchecked(std::uint64_t address, void* dst, std::size_t size) 
 }
 
 bool Memory::read_code_page(std::uint64_t page_base, void* dst) const {
-  if (passthrough_read_) return passthrough_read_(page_base, dst, kPageSize);
+  if (auto fn = passthrough_read_) return fn(page_base, dst, kPageSize);
   if ((page_base % kPageSize) != 0) {
     return false;
   }
@@ -343,7 +346,8 @@ bool Memory::write(std::uint64_t address, const void* src, std::size_t size, Mem
     if (access_wraps(address, size)) {
       return false;
     }
-    if (!passthrough_write_(address, src, size)) {
+    auto fn = passthrough_write_;
+    if (!fn(address, src, size)) {
       return false;
     }
     // A passthrough can't tell us whether what it just wrote was executable, so every write has to
