@@ -796,3 +796,77 @@ TEST(KuberaScalar, FstpTbyteWritesTheArchitecturalEightyBitEncoding) {
   const std::vector<std::uint8_t> expected = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xFF, 0x3F};
   EXPECT_EQ(stored, expected);
 }
+
+TEST(KuberaScalar, LoopWithoutAnAddressSizePrefixCountsDownTheFullRcx) {
+  // E2 FE -- loop $-0. In 64-bit mode the default address size is 64, so this decrements RCX and
+  // branches while RCX is still nonzero. The counter register is chosen by the ADDRESS size, not
+  // the operand size, and iced's Jb2 decode handler was reading operand_size -- which is 32 here
+  // for want of a REX.W that LOOP can never have. That made the plain form decode as the ECX
+  // variant, so a 33-bit count collapsed to zero after one iteration instead of counting down.
+  run_single(seven::parse_hex_bytes("E2 FE"),
+             [](seven::CpuState& state, seven::Memory&) { state.gpr[1] = 0x0000'0001'0000'0001ull; },
+             [](const seven::ExecutionResult&, const seven::CpuState& state, const seven::Memory&) {
+               EXPECT_EQ(state.gpr[1], 0x0000'0001'0000'0000ull) << "loop decrements the full RCX";
+               EXPECT_EQ(state.rip, kBase) << "RCX is still nonzero, so the branch is taken";
+             });
+}
+
+TEST(KuberaScalar, LoopWithAnAddressSizePrefixCountsDownEcx) {
+  // 67 E2 FD -- the 0x67 form really does use ECX, and zero-extends it into RCX.
+  run_single(seven::parse_hex_bytes("67 E2 FD"),
+             [](seven::CpuState& state, seven::Memory&) { state.gpr[1] = 0x0000'0001'0000'0001ull; },
+             [](const seven::ExecutionResult&, const seven::CpuState& state, const seven::Memory&) {
+               EXPECT_EQ(state.gpr[1], 0ull) << "ECX drops to zero and zero-extends";
+               EXPECT_EQ(state.rip, kBase + 3) << "ECX hit zero, so the branch is not taken";
+             });
+}
+
+TEST(KuberaScalar, JrcxzTestsTheFullRcxNotJustEcx) {
+  // E3 FE -- jrcxz $-0. RCX's low half is zero but RCX itself is not, so this must NOT branch.
+  // Decoded as the JECXZ form it would branch, which is a visible control-flow divergence.
+  run_single(seven::parse_hex_bytes("E3 FE"),
+             [](seven::CpuState& state, seven::Memory&) { state.gpr[1] = 0x0000'0001'0000'0000ull; },
+             [](const seven::ExecutionResult&, const seven::CpuState& state, const seven::Memory&) {
+               EXPECT_EQ(state.gpr[1], 0x0000'0001'0000'0000ull) << "jrcxz never writes the counter";
+               EXPECT_EQ(state.rip, kBase + 2) << "RCX is nonzero, so the branch is not taken";
+             });
+}
+
+TEST(KuberaScalar, NearIndirectJumpThroughMemoryReadsAFullEightByteTarget) {
+  constexpr std::uint64_t kData = 0x4000;
+  constexpr std::uint64_t kTarget = 0x0000'0007'1234'5000ull;
+
+  // FF 27 -- jmp qword ptr [rdi]. FF /2 and FF /4 have a forced 64-bit operand size in long mode,
+  // but iced's Evj decode handler picked the code straight off operand_size, which is 32 without a
+  // REX.W these forms can never carry. That reported an RM32 form with a 4-byte memory size, so a
+  // target above 4GB came back truncated to its low half.
+  run_single(seven::parse_hex_bytes("FF 27"),
+             [kData, kTarget](seven::CpuState& state, seven::Memory& memory) {
+               memory.map(kData, 0x1000);
+               state.gpr[7] = kData;
+               ASSERT_TRUE(memory.write(kData, &kTarget, sizeof(kTarget)));
+             },
+             [kTarget](const seven::ExecutionResult&, const seven::CpuState& state, const seven::Memory&) {
+               EXPECT_EQ(state.rip, kTarget) << "the whole 64-bit target, not just its low half";
+             });
+}
+
+TEST(KuberaScalar, NearIndirectCallThroughARegisterUsesTheFullSixtyFourBits) {
+  constexpr std::uint64_t kStack = 0x8000;
+  constexpr std::uint64_t kTarget = 0x0000'0007'1234'5000ull;
+
+  // FF D1 -- call rcx. Same forced-64 rule as the jump above; decoded as an RM32 form the operand
+  // register came back as ECX, so the call landed at the low 32 bits of the target.
+  run_single(seven::parse_hex_bytes("FF D1"),
+             [kStack, kTarget](seven::CpuState& state, seven::Memory& memory) {
+               memory.map(kStack, 0x1000);
+               state.gpr[1] = kTarget;
+               state.gpr[4] = kStack + 0x800;
+             },
+             [kTarget](const seven::ExecutionResult&, const seven::CpuState& state, const seven::Memory& memory) {
+               EXPECT_EQ(state.rip, kTarget) << "the whole 64-bit target, not just its low half";
+               std::uint64_t pushed = 0;
+               ASSERT_TRUE(memory.read(state.gpr[4], &pushed, sizeof(pushed)));
+               EXPECT_EQ(pushed, kBase + 2) << "return address is the next instruction";
+             });
+}
