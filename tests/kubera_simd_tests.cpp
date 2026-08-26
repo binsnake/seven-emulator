@@ -432,3 +432,31 @@ TEST(KuberaSimd, Sse42Crc32MatchesCastagnoliReference) {
 }
 
 }  // namespace
+
+TEST(KuberaSimd, EvexBroadcastRepeatsTheElementNotTheWholeOperand) {
+  constexpr std::uint64_t kData = 0x4000;
+
+  // 62 F1 75 58 FE 07 -- vpaddd zmm0, zmm1, dword ptr [rdi]{1to16}. The broadcast element is the
+  // packed operand's ELEMENT size, which lives in the raw MemorySize's element_size. The handler
+  // took memory_size() (already collapsed to the full 64-byte operand width) and ran that byte
+  // count back through get_size, reindexing the table to PACKED128_UINT8 and getting 16. So it
+  // read 16 bytes of guest memory instead of 4 and repeated that block 4 times instead of
+  // broadcasting one dword across all 16 lanes.
+  run_single(seven::parse_hex_bytes("62 F1 75 58 FE 07"),
+             [kData](seven::CpuState& state, seven::Memory& memory) {
+               memory.map(kData, 0x1000);
+               state.gpr[7] = kData;
+               state.vectors[1].value = 0;
+               // Only the first dword may be read. The next twelve bytes differ so an over-read
+               // shows up in the result rather than blending in.
+               static constexpr std::uint32_t kWords[4] = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+               ASSERT_TRUE(memory.write(kData, kWords, sizeof(kWords)));
+             },
+             [](const seven::ExecutionResult& result, const seven::CpuState& state, const seven::Memory&) {
+               EXPECT_EQ(result.reason, seven::StopReason::none);
+               for (std::size_t lane = 0; lane < 8; ++lane) {
+                 EXPECT_EQ(xmm_u64(state, 0, lane), 0x1111'1111'1111'1111ull)
+                     << "every dword lane is the broadcast element, lane pair " << lane;
+               }
+             });
+}

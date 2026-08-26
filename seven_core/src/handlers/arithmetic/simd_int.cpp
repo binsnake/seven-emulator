@@ -71,6 +71,9 @@ void write_vec(CpuState& state, iced_x86::Register reg, big_uint value, bool zer
 
 big_uint read_mem(ExecutionContext& ctx, std::uint64_t address, std::size_t width, bool* ok) {
   std::array<std::uint8_t, kZmmBytes> bytes{};
+  // A ZMM register is the widest thing this can hold, so anything past that is a caller bug -- but
+  // the read below is sized by it, so keep it from running off the end of the buffer regardless.
+  width = std::min(width, bytes.size());
   if (!ctx.memory.read(address, bytes.data(), width)) {
     if (ok) *ok = false;
     return 0;
@@ -96,7 +99,18 @@ big_uint read_operand(ExecutionContext& ctx, std::uint32_t operand_index, std::s
   }
   if (kind == iced_x86::OpKind::MEMORY) {
     if (ctx.instr.is_broadcast()) {
-      const auto element_width = iced_x86::memory_size_ext::get_size(static_cast<iced_x86::MemorySize>(ctx.instr.memory_size()));
+      // The broadcast element is the packed operand's ELEMENT size, which lives in the raw
+      // MemorySize's element_size. memory_size() has already collapsed that to the full operand
+      // width (64 for a zmm form), and running that byte count back through get_size looks the
+      // table up a second time on an index that means nothing: 64 reindexed to PACKED128_UINT8 and
+      // came back as 16, so a {1to16} dword broadcast read 16 bytes of guest memory instead of 4
+      // and then laid down 4 lanes instead of 16. The xmm forms reindexed to 4 and were right by
+      // accident. A zero would be worse still -- the lane loop advances by this.
+      const auto element_width = iced_x86::memory_size_ext::get_element_size(ctx.instr.memory_size_enum());
+      if (element_width == 0 || element_width > width) {
+        if (ok) *ok = false;
+        return 0;
+      }
       const auto element = read_mem(ctx, detail::memory_address(ctx), element_width, ok);
       if (ok && !*ok) return 0;
       big_uint out = 0;
