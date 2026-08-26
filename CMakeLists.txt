@@ -48,10 +48,11 @@ if(NOT GTest_FOUND)
   FetchContent_MakeAvailable(googletest)
 endif()
 
+# Pinned for the same reason as asmjit: this is the floating-point core and master moves.
 FetchContent_Declare(
   softfloat
   GIT_REPOSITORY https://github.com/ucb-bar/berkeley-softfloat-3.git
-  GIT_TAG        master
+  GIT_TAG        a0c6494cdc11865811dec815d5c0049fba9d82a8
 )
 FetchContent_GetProperties(softfloat)
 if(NOT softfloat_POPULATED)
