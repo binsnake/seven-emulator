@@ -138,13 +138,19 @@ class Executor {
   static constexpr std::size_t kCodePageCacheSize = 64;
   struct CachedCodePageEntry {
     std::uint64_t page_base = 0;
-    std::uint64_t code_epoch = 0;
+    // Memory::page_code_epoch() for this page, not the process-wide Memory::code_epoch(). The
+    // global counter moves on a write to ANY executable page, so keying on it meant one guest store
+    // anywhere threw away all 64 cached pages and all 8192 decodes below along with them.
+    std::uint64_t page_epoch = 0;
     bool valid = false;
     std::array<std::uint8_t, Memory::kPageSize> bytes{};
   };
   struct DecodedInstructionCacheEntry {
     std::uint64_t rip = 0;
-    std::uint64_t code_epoch = 0;
+    // Page epochs for the first and last byte of this instruction -- the two can differ only when
+    // it straddles a page boundary, and both have to still match for the decode to be reusable.
+    std::uint64_t page_epoch = 0;
+    std::uint64_t last_page_epoch = 0;
     ExecutionMode mode = ExecutionMode::long64;
     bool valid = false;
     bool simd_allowed = true;

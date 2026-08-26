@@ -407,8 +407,8 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
   // Nested frames get their own private slot instead and never touch the shared array.
   const bool nested = step_depth_ > 1;
   if (cache_memory_instance_ != memory.instance_id()) [[unlikely]] {
-    // Both caches below are validated on (rip, code_epoch, mode) alone, and code_epoch is a
-    // per-Memory counter that every Memory starts near zero. An Executor reused across two of them
+    // Both caches below are validated on (rip, page epoch, mode) alone, and those epochs come from
+    // a per-Memory counter that every Memory starts near zero. An Executor reused across two of them
     // -- separate guests, or one guest rebuilt in a loop -- would find a cached decode from the
     // first that matched the second's epoch and execute the first's bytes at that address.
     for (auto& entry : *decode_cache_) entry.valid = false;
@@ -473,7 +473,15 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
       return false;
     };
 
-    const auto code_epoch = memory.code_epoch();
+    const auto rip_page_epoch = memory.page_code_epoch(state.rip / Memory::kPageSize);
+    // Epoch of the page holding an instruction's final byte. Only differs from rip's own page for
+    // one that straddles a boundary; `spans` is false when the span runs off the end of the address
+    // space, which is never cacheable.
+    const auto last_byte_epoch = [&](std::uint32_t length, bool& spans) -> std::uint64_t {
+      const auto last_byte = state.rip + (length - 1);
+      spans = last_byte >= state.rip;
+      return spans ? memory.page_code_epoch(last_byte / Memory::kPageSize) : 0;
+    };
     const bool can_use_decode_cache =
         !nested && !memory.has_fetch_access_hooks() && !decode_cache_disabled_by_env_;
     const auto cache_index = static_cast<std::size_t>((state.rip >> 1) & (kDecodeCacheSize - 1));
@@ -487,11 +495,14 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
       return slot;
     };
     auto& cache_entry = nested ? scratch_slot() : (*decode_cache_)[cache_index];
+    bool hit_spans_address_space = false;
     const bool cache_hit = can_use_decode_cache &&
                            cache_entry.valid &&
                            cache_entry.rip == state.rip &&
-                           cache_entry.code_epoch == code_epoch &&
-                           cache_entry.mode == state.mode;
+                           cache_entry.page_epoch == rip_page_epoch &&
+                           cache_entry.mode == state.mode &&
+                           cache_entry.last_page_epoch ==
+                               last_byte_epoch(cache_entry.instruction_length, hit_spans_address_space);
 
     if (!cache_hit) [[unlikely]] {
       std::array<std::uint8_t, iced_x86::IcedConstants::_MAX_INSTRUCTION_LENGTH> bytes{};
@@ -502,17 +513,19 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
         const auto page_base = state.rip & ~static_cast<std::uint64_t>(Memory::kPageSize - 1);
         const auto page_offset = static_cast<std::size_t>(state.rip - page_base);
         if (page_offset + bytes.size() <= Memory::kPageSize) {
-          auto& page_cache = (*code_page_cache_)[static_cast<std::size_t>((page_base >> 12) & (kCodePageCacheSize - 1))];
-          if (!page_cache.valid || page_cache.page_base != page_base || page_cache.code_epoch != code_epoch) {
+          const auto page_index = page_base / Memory::kPageSize;
+          const auto page_epoch = memory.page_code_epoch(page_index);
+          auto& page_cache = (*code_page_cache_)[static_cast<std::size_t>(page_index & (kCodePageCacheSize - 1))];
+          if (!page_cache.valid || page_cache.page_base != page_base || page_cache.page_epoch != page_epoch) {
             if (memory.read_code_page(page_base, page_cache.bytes.data())) {
               page_cache.page_base = page_base;
-              page_cache.code_epoch = code_epoch;
+              page_cache.page_epoch = page_epoch;
               page_cache.valid = true;
             } else {
               page_cache.valid = false;
             }
           }
-          if (page_cache.valid && page_cache.page_base == page_base && page_cache.code_epoch == code_epoch) {
+          if (page_cache.valid && page_cache.page_base == page_base && page_cache.page_epoch == page_epoch) {
             decode_bytes = page_cache.bytes.data() + page_offset;
             decode_size = Memory::kPageSize - page_offset;
             fetched = true;
@@ -595,7 +608,7 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
       }
 
       cache_entry.rip = state.rip;
-      cache_entry.code_epoch = code_epoch;
+      cache_entry.page_epoch = rip_page_epoch;
       cache_entry.mode = state.mode;
       cache_entry.instr = decoded.value();
       cache_entry.simd_allowed = simd_profile_allows(cache_entry.instr);
@@ -603,7 +616,9 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
       const auto trap = trap_kind_for_code(cache_entry.instr.code());
       cache_entry.trap_kind = trap.has_value() ? static_cast<std::uint8_t>(*trap) : 0xFFu;
       cache_entry.instruction_length = std::max<std::uint32_t>(1u, cache_entry.instr.length());
-      cache_entry.valid = can_use_decode_cache;
+      bool fits_in_address_space = false;
+      cache_entry.last_page_epoch = last_byte_epoch(cache_entry.instruction_length, fits_in_address_space);
+      cache_entry.valid = can_use_decode_cache && fits_in_address_space;
       cache_entry.dead_flags_mask = 0;
 
       // Opportunistically lift the rest of this basic block (straight-line run up to the first
@@ -641,9 +656,19 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
           if (collides) {
             break;
           }
+          // The lift only runs off the page cache, and that path is gated on the whole 15-byte
+          // fetch window fitting inside one page, so every instruction it decodes lives on rip's
+          // page and shares its epoch. Bail rather than stamp the wrong one if that ever changes.
+          const auto next_last_byte = next_rip + (next_decoded.value().length() - 1);
+          if (next_rip / Memory::kPageSize != state.rip / Memory::kPageSize ||
+              next_last_byte < next_rip ||
+              next_last_byte / Memory::kPageSize != state.rip / Memory::kPageSize) {
+            break;
+          }
           auto& next_entry = (*decode_cache_)[next_index];
           next_entry.rip = next_rip;
-          next_entry.code_epoch = code_epoch;
+          next_entry.page_epoch = rip_page_epoch;
+          next_entry.last_page_epoch = rip_page_epoch;
           next_entry.mode = state.mode;
           next_entry.instr = next_decoded.value();
           next_entry.simd_allowed = simd_profile_allows(next_entry.instr);
