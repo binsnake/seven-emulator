@@ -4,6 +4,13 @@ namespace seven::handlers {
 
 namespace {
 
+// See movs.cpp's identical constant for the full rationale: a rep-prefixed string instruction's
+// whole count otherwise runs inside one uninterruptible C++ loop, with no way for a caller's
+// cooperative stop request to interject mid-instruction. Capping iterations per call and yielding
+// back (rip left at this same instruction) reproduces real hardware's between-iterations
+// interrupt-checkability without any guest-visible effect.
+constexpr std::uint64_t kMaxRepIterationsPerCall = 4096;
+
 [[nodiscard]] std::uint64_t width_mask(std::size_t width) {
   if (width >= 8) {
     return ~0ull;
@@ -22,6 +29,7 @@ ExecutionResult cmps_impl(ExecutionContext& ctx, std::size_t width) {
   const bool df = (ctx.state.rflags & kFlagDF) != 0;
   std::uint64_t rsi = ctx.state.gpr[6];
   std::uint64_t rdi = ctx.state.gpr[7];
+  std::uint64_t iterations_done = 0;
 
   while (remaining > 0) {
     const auto lhs_addr = rsi;
@@ -69,6 +77,15 @@ ExecutionResult cmps_impl(ExecutionContext& ctx, std::size_t width) {
       return {};
     }
 
+    ++iterations_done;
+    if (continue_loop && iterations_done >= kMaxRepIterationsPerCall) {
+      ctx.state.gpr[6] = rsi;
+      ctx.state.gpr[7] = rdi;
+      ctx.state.gpr[1] = remaining;
+      ctx.control_flow_taken = true;
+      return {};
+    }
+
     if (!rep || !continue_loop) {
       break;
     }
@@ -91,6 +108,7 @@ ExecutionResult scas_impl(ExecutionContext& ctx, std::size_t width) {
   const bool df = (ctx.state.rflags & kFlagDF) != 0;
   std::uint64_t rdi = ctx.state.gpr[7];
   const auto lhs = detail::read_register(ctx.state, iced_x86::Register::RAX) & width_mask(width);
+  std::uint64_t iterations_done = 0;
 
   while (remaining > 0) {
     const auto rhs_addr = rdi;
@@ -124,6 +142,14 @@ ExecutionResult scas_impl(ExecutionContext& ctx, std::size_t width) {
       return {};
     }
 
+    ++iterations_done;
+    if (continue_loop && iterations_done >= kMaxRepIterationsPerCall) {
+      ctx.state.gpr[7] = rdi;
+      ctx.state.gpr[1] = remaining;
+      ctx.control_flow_taken = true;
+      return {};
+    }
+
     if (!rep || !continue_loop) {
       break;
     }
@@ -144,6 +170,7 @@ ExecutionResult stos_impl(ExecutionContext& ctx, std::size_t width) {
   const bool df = (ctx.state.rflags & kFlagDF) != 0;
   std::uint64_t rdi = ctx.state.gpr[7];
   const auto value = detail::read_register(ctx.state, iced_x86::Register::RAX) & width_mask(width);
+  std::uint64_t iterations_done = 0;
 
   while (remaining > 0) {
     const auto write_addr = rdi;
@@ -166,6 +193,14 @@ ExecutionResult stos_impl(ExecutionContext& ctx, std::size_t width) {
       return {};
     }
 
+    ++iterations_done;
+    if (rep && remaining > 0 && iterations_done >= kMaxRepIterationsPerCall) {
+      ctx.state.gpr[7] = rdi;
+      ctx.state.gpr[1] = remaining;
+      ctx.control_flow_taken = true;
+      return {};
+    }
+
     if (!rep) {
       break;
     }
@@ -185,6 +220,7 @@ ExecutionResult lods_impl(ExecutionContext& ctx, std::size_t width) {
 
   const bool df = (ctx.state.rflags & kFlagDF) != 0;
   std::uint64_t rsi = ctx.state.gpr[6];
+  std::uint64_t iterations_done = 0;
 
   while (remaining > 0) {
     const auto read_addr = rsi;
@@ -206,6 +242,14 @@ ExecutionResult lods_impl(ExecutionContext& ctx, std::size_t width) {
     if (detail::note_debug_break(ctx, hit_bits, rep && remaining > 0)) {
       ctx.state.gpr[6] = rsi;
       if (rep) ctx.state.gpr[1] = remaining;
+      return {};
+    }
+
+    ++iterations_done;
+    if (rep && remaining > 0 && iterations_done >= kMaxRepIterationsPerCall) {
+      ctx.state.gpr[6] = rsi;
+      ctx.state.gpr[1] = remaining;
+      ctx.control_flow_taken = true;
       return {};
     }
 

@@ -240,6 +240,54 @@ TEST(KuberaDebug, RepMovsbExecuteBreakpointRestarts) {
   EXPECT_EQ(out2, 0x43);
 }
 
+TEST(KuberaDebug, RepMovsbYieldsAfterIterationCapAndResumesCorrectly) {
+  // A guest-controlled RCX far above the per-call iteration cap must not run the whole
+  // rep movsb inside one uninterruptible step() call -- see kMaxRepIterationsPerCall's
+  // rationale comment in movs.cpp. This proves the yield-and-resume mechanism itself,
+  // with no debug registers involved at all.
+  constexpr std::uint64_t kSrc = 0x20000;
+  constexpr std::uint64_t kDst = 0x30000;
+  constexpr std::uint64_t kIterationCap = 4096;
+  constexpr std::uint64_t kCount = kIterationCap * 2 + 100;  // needs exactly 3 step() calls
+  seven::CpuState state{};
+  seven::Memory memory{};
+  seven::Executor executor{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.gpr[4] = kStackTop;
+  memory.map(kSrc, 0x10000);
+  memory.map(kDst, 0x10000);
+  write_bytes(memory, kBase, {0xF3, 0xA4});  // rep movsb
+
+  std::vector<std::uint8_t> src_bytes(kCount);
+  for (std::uint64_t i = 0; i < kCount; ++i) {
+    src_bytes[i] = static_cast<std::uint8_t>(i);
+  }
+  (void)memory.write(kSrc, src_bytes.data(), src_bytes.size());
+
+  state.gpr[6] = kSrc;
+  state.gpr[7] = kDst;
+  state.gpr[1] = kCount;
+
+  int step_count = 0;
+  while (state.rip == kBase) {
+    const auto result = executor.step(state, memory);
+    ASSERT_EQ(result.reason, seven::StopReason::none);
+    ++step_count;
+    ASSERT_LT(step_count, 10) << "should not need more than a handful of step() calls";
+  }
+
+  EXPECT_EQ(step_count, 3) << "a count of cap*2 + remainder must take exactly 3 step() calls";
+  EXPECT_EQ(state.rip, kBase + 2);
+  EXPECT_EQ(state.gpr[1], 0u);
+  EXPECT_EQ(state.gpr[6], kSrc + kCount);
+  EXPECT_EQ(state.gpr[7], kDst + kCount);
+
+  std::vector<std::uint8_t> dst_bytes(kCount);
+  ASSERT_TRUE(memory.read(kDst, dst_bytes.data(), dst_bytes.size()));
+  EXPECT_EQ(dst_bytes, src_bytes);
+}
+
 TEST(KuberaDebug, PopSsSuppressesExecuteBreakpointAndDelaysTf) {
   seven::CpuState state{};
   seven::Memory memory{};

@@ -4,6 +4,22 @@ namespace seven::handlers {
 
 namespace {
 
+// A rep-prefixed string instruction's whole count executes inside one C++ loop, in one call to
+// this handler, with no other opportunity for the caller (Executor::run(), a watchdog thread's
+// Executor::request_stop(), a JitExecutor budget check) to interject -- ExecutionContext carries
+// no reference back to the Executor at all, so a handler genuinely cannot poll for a cooperative
+// stop request mid-loop. A guest setting RCX to a huge value before a single `rep movsb`-family
+// instruction, with enough mapped memory to sustain it, can make step_impl's underlying call hang
+// for as long as that span takes to walk -- with zero chance for any cooperative-cancellation
+// mechanism elsewhere in this project (the exact contract JitExecutor::run() and seven-fuzzer's
+// watchdog thread already depend on) to fire. Real hardware avoids this by checking for pending
+// interrupts BETWEEN each iteration of a rep-prefixed instruction specifically so a long-running
+// one stays preemptible -- capping iterations per call and yielding back to the caller (leaving
+// rip pointing at this same instruction, so it re-enters and continues exactly where it left off)
+// reproduces that same interruptibility without any guest-visible effect: RCX/RSI/RDI already
+// reflect real partial progress, and nothing about the guest's own execution state changes.
+constexpr std::uint64_t kMaxRepIterationsPerCall = 4096;
+
 ExecutionResult movs_impl(ExecutionContext& ctx, const std::size_t width) {
   const bool rep = ctx.instr.has_rep_prefix() || ctx.instr.has_repne_prefix();
   std::uint64_t count = rep ? ctx.state.gpr[1] : 1u;  // RCX
@@ -55,6 +71,18 @@ ExecutionResult movs_impl(ExecutionContext& ctx, const std::size_t width) {
       if (rep) {
         ctx.state.gpr[1] = remaining;
       }
+      return {};
+    }
+
+    // See kMaxRepIterationsPerCall's comment above: yield back to the caller after a bounded
+    // number of iterations rather than let a huge RCX run this whole loop uninterruptibly. rip
+    // stays at this same instruction (control_flow_taken=true, state.rip left untouched) so the
+    // next step() call simply continues the same rep from exactly where it left off.
+    if (rep && remaining > 0 && (i + 1) >= kMaxRepIterationsPerCall) {
+      ctx.state.gpr[6] = rsi;
+      ctx.state.gpr[7] = rdi;
+      ctx.state.gpr[1] = remaining;
+      ctx.control_flow_taken = true;
       return {};
     }
   }
