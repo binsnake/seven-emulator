@@ -20,6 +20,13 @@ namespace {
 // reflect real partial progress, and nothing about the guest's own execution state changes.
 constexpr std::uint64_t kMaxRepIterationsPerCall = 4096;
 
+// A single-stepping guest sees a #DB after every iteration of a rep, not one after the whole loop.
+// Dropping the cap to one while TF is set reuses the same yield as the budget above, and the
+// executor already delivers TF at the end of whatever step() did.
+[[nodiscard]] std::uint64_t rep_iterations_per_call(const ExecutionContext& ctx) noexcept {
+  return (ctx.state.rflags & kFlagTF) != 0 ? 1u : kMaxRepIterationsPerCall;
+}
+
 ExecutionResult movs_impl(ExecutionContext& ctx, const std::size_t width) {
   const bool rep = ctx.instr.has_rep_prefix() || ctx.instr.has_repne_prefix();
   std::uint64_t count = rep ? ctx.state.gpr[1] : 1u;  // RCX
@@ -78,10 +85,11 @@ ExecutionResult movs_impl(ExecutionContext& ctx, const std::size_t width) {
     // number of iterations rather than let a huge RCX run this whole loop uninterruptibly. rip
     // stays at this same instruction (control_flow_taken=true, state.rip left untouched) so the
     // next step() call simply continues the same rep from exactly where it left off.
-    if (rep && remaining > 0 && (i + 1) >= kMaxRepIterationsPerCall) {
+    if (rep && remaining > 0 && (i + 1) >= rep_iterations_per_call(ctx)) {
       ctx.state.gpr[6] = rsi;
       ctx.state.gpr[7] = rdi;
       ctx.state.gpr[1] = remaining;
+      ctx.push_rf_for_debug = true;
       ctx.control_flow_taken = true;
       return {};
     }

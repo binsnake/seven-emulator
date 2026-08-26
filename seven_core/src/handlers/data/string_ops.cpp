@@ -11,6 +11,13 @@ namespace {
 // interrupt-checkability without any guest-visible effect.
 constexpr std::uint64_t kMaxRepIterationsPerCall = 4096;
 
+// A single-stepping guest sees a #DB after every iteration of a rep, not one after the whole loop.
+// Dropping the cap to one while TF is set reuses the same yield as the budget above, and the
+// executor already delivers TF at the end of whatever step() did.
+[[nodiscard]] std::uint64_t rep_iterations_per_call(const ExecutionContext& ctx) noexcept {
+  return (ctx.state.rflags & kFlagTF) != 0 ? 1u : kMaxRepIterationsPerCall;
+}
+
 [[nodiscard]] std::uint64_t width_mask(std::size_t width) {
   if (width >= 8) {
     return ~0ull;
@@ -78,10 +85,11 @@ ExecutionResult cmps_impl(ExecutionContext& ctx, std::size_t width) {
     }
 
     ++iterations_done;
-    if (continue_loop && iterations_done >= kMaxRepIterationsPerCall) {
+    if (continue_loop && iterations_done >= rep_iterations_per_call(ctx)) {
       ctx.state.gpr[6] = rsi;
       ctx.state.gpr[7] = rdi;
       ctx.state.gpr[1] = remaining;
+      ctx.push_rf_for_debug = true;
       ctx.control_flow_taken = true;
       return {};
     }
@@ -143,9 +151,10 @@ ExecutionResult scas_impl(ExecutionContext& ctx, std::size_t width) {
     }
 
     ++iterations_done;
-    if (continue_loop && iterations_done >= kMaxRepIterationsPerCall) {
+    if (continue_loop && iterations_done >= rep_iterations_per_call(ctx)) {
       ctx.state.gpr[7] = rdi;
       ctx.state.gpr[1] = remaining;
+      ctx.push_rf_for_debug = true;
       ctx.control_flow_taken = true;
       return {};
     }
@@ -194,9 +203,10 @@ ExecutionResult stos_impl(ExecutionContext& ctx, std::size_t width) {
     }
 
     ++iterations_done;
-    if (rep && remaining > 0 && iterations_done >= kMaxRepIterationsPerCall) {
+    if (rep && remaining > 0 && iterations_done >= rep_iterations_per_call(ctx)) {
       ctx.state.gpr[7] = rdi;
       ctx.state.gpr[1] = remaining;
+      ctx.push_rf_for_debug = true;
       ctx.control_flow_taken = true;
       return {};
     }
@@ -246,9 +256,10 @@ ExecutionResult lods_impl(ExecutionContext& ctx, std::size_t width) {
     }
 
     ++iterations_done;
-    if (rep && remaining > 0 && iterations_done >= kMaxRepIterationsPerCall) {
+    if (rep && remaining > 0 && iterations_done >= rep_iterations_per_call(ctx)) {
       ctx.state.gpr[6] = rsi;
       ctx.state.gpr[1] = remaining;
+      ctx.push_rf_for_debug = true;
       ctx.control_flow_taken = true;
       return {};
     }

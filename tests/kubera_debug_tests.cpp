@@ -288,6 +288,52 @@ TEST(KuberaDebug, RepMovsbYieldsAfterIterationCapAndResumesCorrectly) {
   EXPECT_EQ(dst_bytes, src_bytes);
 }
 
+TEST(KuberaDebug, SingleSteppingARepTrapsAfterEachIterationNotAfterTheWholeLoop) {
+  // A rep is interruptible between iterations, so a guest with TF set gets one #DB per iteration
+  // and can watch RCX/RSI/RDI count down. Running the whole loop inside a single step() and
+  // trapping once at the end is directly observable, and seven-fuzzer's string family saw it
+  // against hardware on its very first run.
+  constexpr std::uint64_t kSrc = 0x20000;
+  constexpr std::uint64_t kDst = 0x30000;
+  constexpr std::uint64_t kCount = 3;
+  seven::CpuState state{};
+  seven::Memory memory{};
+  seven::Executor executor{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.gpr[4] = kStackTop;
+  state.sreg[1] = 0x33;
+  state.idtr.base = kIdtBase;
+  state.idtr.limit = 0x1000 - 1;
+  state.rflags = 0x202 | seven::kFlagTF;
+  memory.map(kIdtBase, 0x1000);
+  memory.map(kDbHandler, 0x1000);
+  memory.map(kSrc, 0x1000);
+  memory.map(kDst, 0x1000);
+  memory.map(0x4000, 0x2000);  // the #DB frame's stack
+  write_bytes(memory, kBase, {0xF3, 0xA4});  // rep movsb
+  const std::uint8_t iretq[] = {0x48, 0xCF};
+  (void)memory.write(kDbHandler, iretq, sizeof(iretq));
+  write_idt_gate64(memory, kIdtBase, 1, 0x33, kDbHandler);
+
+  state.gpr[6] = kSrc;
+  state.gpr[7] = kDst;
+  state.gpr[1] = kCount;
+
+  for (std::uint64_t done = 1; done <= kCount; ++done) {
+    const auto trapped = executor.step(state, memory);
+    ASSERT_EQ(trapped.reason, seven::StopReason::none);
+    EXPECT_EQ(state.rip, kDbHandler) << "iteration " << done << " should have trapped";
+    EXPECT_EQ(state.gpr[1], kCount - done) << "only one iteration may retire per step";
+    EXPECT_EQ(state.gpr[6], kSrc + done);
+    EXPECT_EQ(state.gpr[7], kDst + done);
+
+    const auto returned = executor.step(state, memory);  // iretq
+    ASSERT_EQ(returned.reason, seven::StopReason::none);
+    EXPECT_EQ(state.rip, done == kCount ? kBase + 2 : kBase);
+  }
+}
+
 TEST(KuberaDebug, PopSsSuppressesExecuteBreakpointAndDelaysTf) {
   seven::CpuState state{};
   seven::Memory memory{};
