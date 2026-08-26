@@ -30,6 +30,14 @@ std::size_t vector_index(iced_x86::Register reg) {
 }
 
 ExecutionResult validate_memory_span(ExecutionContext& ctx, std::uint64_t base, std::size_t size, seven::MemoryAccessKind kind) {
+  // The whole point of this function is that the callers get to check the entire image before they
+  // touch any of it. base + offset below is plain uint64 arithmetic, so a span starting near the top
+  // of the address space wrapped around and validated page 0 instead, and then the store itself
+  // faulted partway through on Memory::read/write's own wrap check. Reject it here, the same way
+  // Memory::access_wraps does.
+  if (size != 0 && base + (static_cast<std::uint64_t>(size) - 1u) < base) {
+    return detail::memory_fault(ctx, base);
+  }
   std::size_t offset = 0;
   while (offset < size) {
     const auto address = base + offset;
@@ -652,7 +660,7 @@ ExecutionResult handle_code_FLD_M80FP(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_FLD_STI(ExecutionContext& ctx) {
-  if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || ctx.instr.op_kind(1) != iced_x86::OpKind::REGISTER) {
+  if (!x87_operand_is_st(ctx, 0)) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!ctx.state.x87_push(ctx.state.x87_get(x87_st_index(ctx.instr.op_register(0))))) {

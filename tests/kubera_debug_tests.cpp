@@ -643,7 +643,8 @@ TEST(KuberaDebug, DelayedDebugAfterMovSsEntersSoftwareInterruptHandlerFirst) {
   (void)memory.write(kInt3Handler, iretq, sizeof(iretq));
   (void)memory.write(kSelAddr, &new_ss, sizeof(new_ss));
   write_idt_gate64(memory, kIdtBase, 1, 0x33, kDbHandler);
-  write_idt_gate64(memory, kIdtBase, 3, 0x33, kInt3Handler);
+  // DPL 3, since int3 is issued from CPL 3 here and a DPL 0 gate would (correctly) #GP.
+  write_idt_gate64(memory, kIdtBase, 3, 0x33, kInt3Handler, 0xEF);
   state.dr[0] = kSelAddr;
   state.dr[7] = 0x1 | (0x7ull << 16);
   

@@ -231,8 +231,15 @@ std::uint64_t debug_data_breakpoint_hits(CpuState& state, std::uint64_t address,
 }
 
 
+// The gate's code selector lands in sreg[1] at the bottom of this function, and sreg[1] is the only
+// thing in the tree that records the current privilege level. The DPL check below is what stops a
+// guest the embedder placed at ring 3 from walking into an arbitrary vector and coming back out at
+// ring 0. It only covers the descriptor's own DPL: there is no supervisor bit in this memory model,
+// so an embedder that maps the IDT somewhere the guest can write has handed it the ability to
+// author its own gate, exactly as it would on hardware.
 ExecutionResult dispatch_interrupt(ExecutionContext& ctx, std::uint8_t vector, std::uint64_t return_rip,
-                                   std::optional<std::uint32_t> error_code, bool push_rf_in_frame) {
+                                   std::optional<std::uint32_t> error_code, bool push_rf_in_frame,
+                                   bool software_interrupt) {
   const auto gp_fault = [&]() -> ExecutionResult {
     return {StopReason::general_protection, 0,
             ExceptionInfo{StopReason::general_protection, ctx.state.rip, vector}, ctx.instr.code()};
@@ -301,6 +308,9 @@ ExecutionResult dispatch_interrupt(ExecutionContext& ctx, std::uint8_t vector, s
       if (!present || (gate_type != 0x0Eu && gate_type != 0x0Fu)) {
         return gp_fault();
       }
+      if (software_interrupt && ((type_attr >> 5) & 0x3u) < (ctx.state.sreg[1] & 0x3u)) {
+        return gp_fault();
+      }
       break;
     }
     case ExecutionMode::long64:
@@ -326,6 +336,9 @@ ExecutionResult dispatch_interrupt(ExecutionContext& ctx, std::uint8_t vector, s
       const bool present = (type_attr & 0x80u) != 0;
       gate_type = static_cast<std::uint8_t>(type_attr & 0x0Fu);
       if (!present || (gate_type != 0x0Eu && gate_type != 0x0Fu)) {
+        return gp_fault();
+      }
+      if (software_interrupt && ((type_attr >> 5) & 0x3u) < (ctx.state.sreg[1] & 0x3u)) {
         return gp_fault();
       }
       break;

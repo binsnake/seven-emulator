@@ -1014,6 +1014,78 @@ TEST(KuberaScalar, AFarReturnCannotLowerTheCurrentPrivilegeLevel) {
   EXPECT_EQ(state.sreg[1] & 0x3u, 3u) << "CPL must not have dropped";
 }
 
+// validate_memory_span exists so the x87 image stores can check the whole 108-byte image before
+// touching any of it. It computed base + offset as plain uint64, so a destination near the top of
+// the address space wrapped and it happily validated page 0, then the store itself faulted partway
+// through on Memory's own wrap check, leaving a half-written image behind.
+TEST(KuberaScalar, AnX87ImageStoreThatWrapsTheAddressSpaceFaultsBeforeWritingAnything) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  constexpr std::uint64_t kTopPage = 0xFFFFFFFFFFFFF000ull;
+  constexpr std::uint64_t kDest = 0xFFFFFFFFFFFFFFC0ull;  // 64 bytes short of wrapping
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.gpr[3] = kDest;
+  memory.map(kTopPage, 0x1000);
+  memory.map(0x0, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("DD 33"));  // fnsave [rbx]
+
+  const std::uint8_t sentinel = 0xA5;
+  for (std::uint64_t off = 0; off < 0x40; ++off) {
+    ASSERT_TRUE(memory.write(kDest + off, &sentinel, 1));
+  }
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::page_fault);
+  for (std::uint64_t off = 0; off < 0x40; ++off) {
+    std::uint8_t got = 0;
+    ASSERT_TRUE(memory.read(kDest + off, &got, 1));
+    EXPECT_EQ(got, sentinel) << "byte at +" << off << " was stored before the fault";
+  }
+}
+
+// sreg[1] is this emulator's only record of the current privilege level, and dispatch_interrupt
+// assigns it straight from the gate's code selector. Hardware only permits that for INT n, INT3 and
+// INTO when the gate's DPL is at least the caller's CPL; without that check a guest the embedder
+// put at ring 3 walks into any present vector and comes out at whatever ring the gate names, which
+// voids every CPL gate in the tree at once (MOV CR, WRMSR, SWAPGS, CLTS, XSETBV, CLI/STI).
+TEST(KuberaScalar, ASoftwareInterruptCannotEnterAGateItLacksThePrivilegeFor) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  constexpr std::uint64_t kIdt = 0x8000;
+  constexpr std::uint64_t kHandler = 0x9000;
+  constexpr std::uint64_t kStack = 0xA000;
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.sreg[1] = 0x33;  // CPL 3
+  state.gpr[4] = kStack + 0x800;
+  state.idtr.base = kIdt;
+  state.idtr.limit = 0x1000 - 1;
+
+  memory.map(kIdt, 0x1000);
+  memory.map(kHandler, 0x1000);
+  memory.map(kStack, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("CD 80"));  // int 0x80
+  const std::uint8_t hlt[] = {0xF4};
+  ASSERT_TRUE(memory.write(kHandler, hlt, sizeof(hlt)));
+
+  // Present 64-bit interrupt gate, DPL 0, pointing at a ring-0 code selector.
+  const std::uint64_t selector = 0x08;
+  const std::uint64_t type_attr = 0x8E;
+  const std::uint64_t desc_lo = (kHandler & 0xFFFFull) | (selector << 16) | (type_attr << 40) |
+                                (((kHandler >> 16) & 0xFFFFull) << 48);
+  const std::uint64_t desc_hi = (kHandler >> 32) & 0xFFFFFFFFull;
+  ASSERT_TRUE(memory.write(kIdt + 0x80 * 16, &desc_lo, sizeof(desc_lo)));
+  ASSERT_TRUE(memory.write(kIdt + 0x80 * 16 + 8, &desc_hi, sizeof(desc_hi)));
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::general_protection);
+  EXPECT_EQ(state.sreg[1] & 0x3u, 3u) << "CPL must not have been raised by the gate";
+  EXPECT_NE(state.rip, kHandler) << "the guest must not have entered the handler";
+}
+
 TEST(KuberaScalar, AFarReturnThatKeepsOrRaisesItsPrivilegeLevelStillWorks) {
   seven::Executor executor{};
   seven::CpuState state{};

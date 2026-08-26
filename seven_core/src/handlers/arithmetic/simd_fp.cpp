@@ -1176,6 +1176,9 @@ ExecutionResult handle_code_CVTPD2PI_MM_XMMM128(ExecutionContext& ctx) {
     auto result = sse_exception(ctx, exceptions);
     if (!result.ok()) return result;
   }
+  if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_mmx_register(ctx.instr.op_register(0))) {
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
+  }
   ctx.state.mmx_set(mmx_index(ctx.instr.op_register(0)), packed);
   return {};
 }
@@ -1195,6 +1198,9 @@ ExecutionResult handle_code_CVTTPD2PI_MM_XMMM128(ExecutionContext& ctx) {
   if (exceptions != 0) {
     auto result = sse_exception(ctx, exceptions);
     if (!result.ok()) return result;
+  }
+  if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_mmx_register(ctx.instr.op_register(0))) {
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   ctx.state.mmx_set(mmx_index(ctx.instr.op_register(0)), packed);
   return {};

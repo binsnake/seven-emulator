@@ -47,9 +47,13 @@ ExecutionResult read_memory_checked(ExecutionContext& ctx, std::uint64_t address
 ExecutionResult write_memory_checked(ExecutionContext& ctx, std::uint64_t address, const void* value, std::size_t width);
 ExecutionResult read_operand_checked(ExecutionContext& ctx, std::uint32_t operand_index, std::size_t width, std::uint64_t& value);
 ExecutionResult write_operand_checked(ExecutionContext& ctx, std::uint32_t operand_index, std::uint64_t value, std::size_t width);
+// software_interrupt selects the INT n / INT3 / INTO privilege rule: those three check the gate's
+// DPL against the current CPL, while a hardware-generated exception ignores it. Defaults to the
+// exception behaviour so the executor's own fault paths need no change.
 ExecutionResult dispatch_interrupt(ExecutionContext& ctx, std::uint8_t vector, std::uint64_t return_rip,
                                    std::optional<std::uint32_t> error_code = std::nullopt,
-                                   bool push_rf_in_frame = false);
+                                   bool push_rf_in_frame = false,
+                                   bool software_interrupt = false);
 
 std::uint64_t debug_data_breakpoint_hits(CpuState& state, std::uint64_t address, std::size_t size, bool is_read, bool is_write) noexcept;
 

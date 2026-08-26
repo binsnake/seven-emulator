@@ -122,24 +122,26 @@ ExecutionResult handle_code_SAHF(ExecutionContext& ctx) {
   return {};
 }
 
+// INT1 (ICEBP) is left out of the software-interrupt group deliberately: it delivers as a #DB trap
+// and is not subject to the gate DPL check the other three get.
 ExecutionResult handle_code_INT1(ExecutionContext& ctx) {
   return detail::dispatch_interrupt(ctx, 1u, ctx.next_rip);
 }
 
 ExecutionResult handle_code_INT3(ExecutionContext& ctx) {
-  return detail::dispatch_interrupt(ctx, 3u, ctx.next_rip);
+  return detail::dispatch_interrupt(ctx, 3u, ctx.next_rip, std::nullopt, false, true);
 }
 
 ExecutionResult handle_code_INT_IMM8(ExecutionContext& ctx) {
   const auto vector = static_cast<std::uint8_t>(ctx.instr.immediate8());
-  return detail::dispatch_interrupt(ctx, vector, ctx.next_rip);
+  return detail::dispatch_interrupt(ctx, vector, ctx.next_rip, std::nullopt, false, true);
 }
 
 ExecutionResult handle_code_INTO(ExecutionContext& ctx) {
   if ((ctx.state.rflags & kFlagOF) == 0) {
     return {};
   }
-  return detail::dispatch_interrupt(ctx, 4u, ctx.next_rip);
+  return detail::dispatch_interrupt(ctx, 4u, ctx.next_rip, std::nullopt, false, true);
 }
 
 ExecutionResult handle_code_RDTSC(ExecutionContext& ctx) {
