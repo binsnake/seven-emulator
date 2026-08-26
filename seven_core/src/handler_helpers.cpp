@@ -1,5 +1,7 @@
 #include "seven/handler_helpers.hpp"
 
+#include <algorithm>
+
 #include <iced_x86/instruction.hpp>
 #include <iced_x86/memory_size_info.hpp>
 #include <iced_x86/op_kind.hpp>
@@ -382,7 +384,12 @@ std::size_t operand_width(const iced_x86::Instruction& instr, std::uint32_t oper
     return register_width(instr.op_register(operand_index));
   }
   if (kind == iced_x86::OpKind::MEMORY) {
-    return iced_x86::memory_size_ext::get_size(static_cast<iced_x86::MemorySize>(instr.memory_size()));
+    // This iced port's memory_size() already resolves to a size in BYTES, unlike upstream's, which
+    // returns the MemorySize enum. Casting it back into the enum and looking it up a second time
+    // reindexed the table: 4 became UINT52 (8 bytes) and 8 became UINT512 (64), so a `crc32 r64,
+    // qword ptr [mem]` asked read_operand for 64 bytes and overran its 8-byte stack local. 1 and 2
+    // happened to land on UINT8/UINT16 and stayed correct, which is why only the wider forms broke.
+    return instr.memory_size();
   }
   switch (kind) {
     case iced_x86::OpKind::IMMEDIATE8:
@@ -623,6 +630,10 @@ std::uint64_t read_operand(ExecutionContext& ctx, std::uint32_t operand_index, s
   if (kind == iced_x86::OpKind::MEMORY) {
     const auto address = memory_address(ctx);
     std::uint64_t value = 0;
+    // These helpers carry a scalar in a uint64_t, so a width past 8 can only come from a caller
+    // bug -- but the copy below is sized by it, so an unclamped one smashes this frame instead of
+    // producing a merely wrong answer. Keep it contained no matter what the caller computes.
+    width = std::min(width, sizeof(value));
     if (!ctx.memory.read(address, &value, width)) {
       if (ok) {
         *ok = false;
@@ -642,6 +653,9 @@ bool write_operand(ExecutionContext& ctx, std::uint32_t operand_index, std::uint
     return true;
   }
   if (kind == iced_x86::OpKind::MEMORY) {
+    // Same containment as read_operand: an oversized width here would copy out of this frame and
+    // hand the surrounding host stack to the guest.
+    width = std::min(width, sizeof(value));
     return ctx.memory.write(memory_address(ctx), &value, width);
   }
   return false;

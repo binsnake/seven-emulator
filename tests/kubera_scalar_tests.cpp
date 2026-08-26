@@ -937,3 +937,48 @@ TEST(KuberaScalar, MovToAnAbsoluteMoffsAddressStoresTheAccumulator) {
                EXPECT_EQ(state.gpr[0], 0x1122334455667788ull) << "rax is unchanged";
              });
 }
+
+TEST(KuberaScalar, Crc32OverMemorySourcesUsesTheOperandsRealWidth) {
+  constexpr std::uint64_t kData = 0x4000;
+  constexpr std::uint64_t kValue = 0x0123456789ABCDEFull;
+  constexpr std::uint32_t kSeed = 0xB0051228u;
+
+  // F2 0F 38 F1 57 00 -- crc32 edx, dword ptr [rdi]. operand_width fed read_operand a width taken
+  // from a double-converted memory_size: 4 bytes came back as 8 and 8 came back as 64. The 64 case
+  // is the sharp one -- read_operand copies that many bytes into a uint64_t on its own stack, so
+  // `crc32 r64, qword ptr [mem]` overran the frame and took the process down with an access
+  // violation. Guest bytes, host stack.
+  run_single(seven::parse_hex_bytes("F2 0F 38 F1 57 00"),
+             [kData, kSeed, kValue](seven::CpuState& state, seven::Memory& memory) {
+               memory.map(kData, 0x1000);
+               state.gpr[7] = kData;
+               state.gpr[2] = kSeed;
+               ASSERT_TRUE(memory.write(kData, &kValue, sizeof(kValue)));
+             },
+             [kSeed, kValue](const seven::ExecutionResult&, const seven::CpuState& state, const seven::Memory&) {
+               EXPECT_EQ(state.gpr[2], crc32c_update(kSeed, kValue, 4))
+                   << "only the low four bytes feed the checksum";
+             });
+
+  // F2 48 0F 38 F1 57 00 -- crc32 rdx, qword ptr [rdi], the width that used to ask for 64 bytes.
+  run_single(seven::parse_hex_bytes("F2 48 0F 38 F1 57 00"),
+             [kData, kSeed, kValue](seven::CpuState& state, seven::Memory& memory) {
+               memory.map(kData, 0x1000);
+               state.gpr[7] = kData;
+               state.gpr[2] = kSeed;
+               ASSERT_TRUE(memory.write(kData, &kValue, sizeof(kValue)));
+             },
+             [kSeed, kValue](const seven::ExecutionResult&, const seven::CpuState& state, const seven::Memory&) {
+               EXPECT_EQ(state.gpr[2], crc32c_update(kSeed, kValue, 8));
+             });
+
+  // A register source was always fine, and has to stay that way.
+  run_single(seven::parse_hex_bytes("F2 48 0F 38 F1 D1"),
+             [kSeed, kValue](seven::CpuState& state, seven::Memory&) {
+               state.gpr[2] = kSeed;
+               state.gpr[1] = kValue;
+             },
+             [kSeed, kValue](const seven::ExecutionResult&, const seven::CpuState& state, const seven::Memory&) {
+               EXPECT_EQ(state.gpr[2], crc32c_update(kSeed, kValue, 8));
+             });
+}
