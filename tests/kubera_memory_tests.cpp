@@ -461,3 +461,25 @@ TEST(KuberaMemory, ReusingAnExecutorAcrossTwoMemoriesDoesNotReuseTheirDecodes) {
   ASSERT_EQ(executor.step(state, second).reason, seven::StopReason::none);
   EXPECT_EQ(state.gpr[0], 9u) << "the second memory ran the first memory's instruction";
 }
+
+TEST(KuberaMemory, PassthroughNeverSeesAWrappingRangeInEitherDirection) {
+  seven::Memory memory{};
+  bool saw_read = false;
+  bool saw_write = false;
+  memory.set_passthrough(
+      [&](std::uint64_t, void*, std::size_t) { saw_read = true; return true; },
+      [&](std::uint64_t, const void*, std::size_t) { saw_write = true; return true; });
+
+  const std::uint64_t near_top = ~std::uint64_t{0} - 3;
+  std::uint64_t value = 0;
+  EXPECT_FALSE(memory.read(near_top, &value, sizeof(value)));
+  EXPECT_FALSE(saw_read);
+  EXPECT_FALSE(memory.write(near_top, &value, sizeof(value)));
+  EXPECT_FALSE(saw_write) << "the write side used to forward a wrapping range the read side rejects";
+
+  // A range that stops exactly at the top is not a wrap and must still get through.
+  EXPECT_TRUE(memory.read(~std::uint64_t{0} - 7, &value, sizeof(value)));
+  EXPECT_TRUE(saw_read);
+  EXPECT_TRUE(memory.write(~std::uint64_t{0} - 7, &value, sizeof(value)));
+  EXPECT_TRUE(saw_write);
+}

@@ -321,7 +321,17 @@ bool Memory::read_code_page(std::uint64_t page_base, void* dst) const {
 }
 
 bool Memory::write(std::uint64_t address, const void* src, std::size_t size, MemoryAccessKind kind) {
-  if (passthrough_write_) return passthrough_write_(address, src, size);
+  if (passthrough_write_) {
+    // read() rejects a wrapping range before it ever reaches passthrough_read_, and a passthrough
+    // is an embedder's whole memory implementation rather than a hook with something to veto -- it
+    // should never be handed an (address, size) pair the read side is guaranteed never to see. The
+    // documented bridge in examples/live_memory_windows.hpp forwards both straight to
+    // Read/WriteProcessMemory.
+    if (access_wraps(address, size)) {
+      return false;
+    }
+    return passthrough_write_(address, src, size);
+  }
   // Fast path: no hooks, no MMIO, single-page access. Bypasses access_allowed
   // and all multi-page bookkeeping. We still maintain code_epoch for write
   // through executable pages so the decode cache stays correct.
