@@ -288,7 +288,10 @@ constexpr std::uint64_t kAluStatusFlagsMask = kFlagCF | kFlagPF | kFlagAF | kFla
 }
 
 [[nodiscard]] constexpr std::uint64_t sign_bit_for_width(std::size_t width) noexcept {
-  return 1ull << ((width * 8) - 1);
+  // Guarded the way mask_for_width above already is. Every caller today passes a literal, so the
+  // shift is always in range -- but the two are used interchangeably on the same width and only one
+  // of them survived a width of 0 or one past 8, which is the kind of asymmetry that bites later.
+  return width == 0 ? 0ull : (width >= 8 ? (1ull << 63) : (1ull << ((width * 8) - 1)));
 }
 
 [[nodiscard]] constexpr std::uint64_t sign_extend(std::uint64_t value, std::size_t width) noexcept {

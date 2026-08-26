@@ -1,5 +1,6 @@
 #include "seven/handler_helpers.hpp"
 
+#include <algorithm>
 #include <bit>
 
 namespace seven::handlers {
@@ -111,6 +112,11 @@ iced_x86::Register crc32_dest_register(iced_x86::Register reg, std::size_t width
 
 std::uint32_t crc32c_update(std::uint32_t crc, std::uint64_t value, std::size_t width) {
   constexpr std::uint32_t kPoly = 0x82F63B78u;
+  // Same clamp read_operand applies to the same number, for the same reason: a width past 8 can
+  // only come from a caller bug, but here it would shift a uint64_t by 64 or more, which is
+  // undefined rather than merely wrong. read_operand got this when the memory_size() mix-up was
+  // fixed; this second consumer of the value did not.
+  width = std::min(width, sizeof(value));
   for (std::size_t i = 0; i < width; ++i) {
     crc ^= static_cast<std::uint8_t>((value >> (i * 8)) & 0xFFu);
     for (unsigned bit = 0; bit < 8; ++bit) {
