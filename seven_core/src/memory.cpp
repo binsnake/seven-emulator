@@ -36,6 +36,14 @@ bool access_wraps(std::uint64_t base, std::size_t size) noexcept {
 }  // namespace
 
 Memory::PageEntry* Memory::lookup_page(std::uint64_t page_index) const noexcept {
+  if (cache_owner_ != this) [[unlikely]] {
+    // Filled for a different Memory -- see cache_owner_. Every path that could act on a cached
+    // pointer comes through here first (read/write/is_mapped directly, and the JIT via
+    // page_code_epoch/page_data before it trusts a jit_tlb slot), so this is where they get dropped.
+    const_cast<Memory&>(*this).invalidate_tlb();
+    const_cast<Memory&>(*this).clear_jit_tlb();
+    cache_owner_ = this;
+  }
   auto& slot = tlb_[page_index & (kTlbSize - 1)];
   if (slot.entry != nullptr && slot.page_index == page_index && slot.epoch == tlb_epoch_) {
     return slot.entry;

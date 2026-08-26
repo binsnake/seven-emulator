@@ -234,6 +234,14 @@ class Memory {
   void invalidate_tlb() noexcept { ++tlb_epoch_; }
 
   std::unordered_map<std::uint64_t, PageEntry> pages_;
+  // Whichever Memory the two caches below were filled for. Copying a Memory deep-copies pages_ into
+  // fresh PageEntry objects, but tlb_ and jit_tlb come across holding raw pointers into the SOURCE
+  // object's pages -- so without noticing, the copy would read and write straight through to the
+  // original, and keep doing so after the original is gone. Neither cache holds anything worth
+  // keeping, so a mismatch here just drops both and they refill on the next access. Moving is safe
+  // (an unordered_map move relocates the map, not its nodes) but is treated the same way; it costs
+  // one refill and nothing has to reason about which operation it was.
+  mutable const Memory* cache_owner_ = this;
   mutable std::array<TlbSlot, kTlbSize> tlb_{};
   std::uint64_t tlb_epoch_ = 1;
   std::vector<AccessHookEntry> access_hooks_;

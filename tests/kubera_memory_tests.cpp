@@ -385,3 +385,50 @@ TEST(KuberaMemory, WrmsrCannotGrowTheMsrMapWithoutBound) {
   EXPECT_EQ(result.reason, seven::StopReason::none);
   EXPECT_EQ(state.msr.at(0xC0000080u), 0x0D01u);
 }
+
+// Memory is copyable, and a copy deep-copies pages_ into fresh PageEntry objects. Its two page
+// caches came across holding raw pointers into the source object's pages, so the copy silently read
+// and wrote through to the original -- and would have kept doing so after the original was gone.
+
+TEST(KuberaMemory, CopyingDoesNotInheritPointersIntoTheOriginalsPages) {
+  seven::Memory original{};
+  original.map(0x1000, 0x1000);
+  const std::uint32_t before = 0xAAAAAAAA;
+  ASSERT_TRUE(original.write(0x1000, &before, sizeof(before)));
+
+  seven::Memory copy = original;
+  for (const auto& slot : copy.jit_tlb) {
+    EXPECT_EQ(slot.host_data, nullptr) << "a copy must not start out pointing into the original";
+  }
+
+  const std::uint32_t after = 0xBBBBBBBB;
+  ASSERT_TRUE(copy.write(0x1000, &after, sizeof(after)));
+
+  std::uint32_t original_value = 0;
+  ASSERT_TRUE(original.read(0x1000, &original_value, sizeof(original_value)));
+  EXPECT_EQ(original_value, before) << "the copy wrote into the original's page";
+
+  std::uint32_t copy_value = 0;
+  ASSERT_TRUE(copy.read(0x1000, &copy_value, sizeof(copy_value)));
+  EXPECT_EQ(copy_value, after);
+}
+
+TEST(KuberaMemory, CopyAssignmentAlsoDropsTheInheritedCaches) {
+  seven::Memory original{};
+  original.map(0x1000, 0x1000);
+  const std::uint32_t before = 0x11111111;
+  ASSERT_TRUE(original.write(0x1000, &before, sizeof(before)));
+
+  seven::Memory target{};
+  target.map(0x9000, 0x1000);
+  std::uint32_t warm = 0;
+  ASSERT_TRUE(target.read(0x9000, &warm, sizeof(warm)));
+
+  target = original;
+  const std::uint32_t after = 0x22222222;
+  ASSERT_TRUE(target.write(0x1000, &after, sizeof(after)));
+
+  std::uint32_t original_value = 0;
+  ASSERT_TRUE(original.read(0x1000, &original_value, sizeof(original_value)));
+  EXPECT_EQ(original_value, before);
+}
