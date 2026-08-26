@@ -446,7 +446,12 @@ void Memory::refresh_access_hook_state() noexcept {
 }
 
 void Memory::refresh_jit_fast_path_blocked() noexcept {
-  jit_fast_path_blocked = has_any_access_hooks_ || !mmio_regions_.empty() || (passthrough_read_ != nullptr);
+  // Both halves of the passthrough matter. set_passthrough takes them independently, so a
+  // write-only passthrough used to leave this false: reads went through the page path and
+  // warmed jit_tlb slots, then compiled writes stored straight into PageEntry::data and never
+  // called passthrough_write_ at all, diverging from what Memory::write itself would do.
+  jit_fast_path_blocked = has_any_access_hooks_ || !mmio_regions_.empty() ||
+                          passthrough_read_ != nullptr || passthrough_write_ != nullptr;
 }
 
 Memory::HookId Memory::map_mmio(std::uint64_t base, std::size_t size, MmioReadCallback on_read, MmioWriteCallback on_write) {
@@ -629,6 +634,19 @@ bool Memory::access_allowed(const MemoryAccessEvent& event) const {
   }
   auto& self = const_cast<Memory&>(*this);
 
+  // Save and restore rather than assign. A hook callback is free to touch guest memory, which
+  // re-enters here; if the nested call cleared the flag on its way out, the outer loop below would
+  // carry on iterating access_hooks_ with deferral switched off, so a later hook calling
+  // remove_access_hook would erase from the vector mid-iteration and leave this range-for walking
+  // freed std::function storage. Same reason the pending queue is only flushed at depth 0.
+  const bool was_dispatching = self.dispatching_access_hooks_;
+  const auto finish_dispatch = [&self, was_dispatching] {
+    self.dispatching_access_hooks_ = was_dispatching;
+    if (!was_dispatching) {
+      self.apply_pending_access_hook_ops();
+    }
+  };
+
   self.dispatching_access_hooks_ = true;
   for (const auto& hook : access_hooks_) {
     if ((hook.kinds & bit(event.kind)) == 0) {
@@ -653,13 +671,11 @@ bool Memory::access_allowed(const MemoryAccessEvent& event) const {
       }
     }
     if (!hook.callback(event)) {
-      self.dispatching_access_hooks_ = false;
-      self.apply_pending_access_hook_ops();
+      finish_dispatch();
       return false;
     }
   }
-  self.dispatching_access_hooks_ = false;
-  self.apply_pending_access_hook_ops();
+  finish_dispatch();
   return true;
 }
 

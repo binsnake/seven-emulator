@@ -229,3 +229,64 @@ TEST(KuberaMemory, RestoringMmioRegionsBlocksTheJitFastPathAgain) {
   });
   EXPECT_TRUE(restored.jit_fast_path_blocked);
 }
+
+// access_allowed assigned dispatching_access_hooks_ = true/false rather than saving and restoring
+// it, and flushed the pending add/remove queue at every nesting level. A hook callback that reads
+// guest memory re-enters access_allowed, and the nested call cleared the flag on its way out --
+// so a later hook in the OUTER loop calling remove_access_hook took the immediate branch and
+// erased from access_hooks_ while the outer range-for was still walking it, leaving the loop
+// calling through freed std::function storage.
+TEST(KuberaMemory, NestedAccessHookDispatchDoesNotInvalidateTheOuterLoop) {
+  seven::Memory memory{};
+  memory.map(0x1000, seven::Memory::kPageSize);
+
+  seven::Memory::HookId to_remove = 0;
+  int reentrant_calls = 0;
+  int remover_calls = 0;
+  int tail_calls = 0;
+
+  // First hook re-enters Memory, which re-enters access_allowed and used to clear the guard.
+  const auto reentrant = memory.add_access_hook([&](const seven::MemoryAccessEvent& event) {
+    if (event.kind == seven::MemoryAccessKind::data_read) {
+      return true;  // this is our own nested read, let it through without recursing further
+    }
+    ++reentrant_calls;
+    std::uint32_t sink = 0;
+    (void)memory.read(0x1000, &sink, sizeof(sink));
+    return true;
+  });
+  ASSERT_NE(reentrant, 0u);
+
+  // Second hook removes a hook mid-dispatch. With the guard wrongly cleared this erased in place.
+  const auto remover = memory.add_access_hook([&](const seven::MemoryAccessEvent& event) {
+    if (event.kind == seven::MemoryAccessKind::data_read) {
+      return true;
+    }
+    ++remover_calls;
+    EXPECT_TRUE(memory.remove_access_hook(to_remove));
+    return true;
+  });
+  ASSERT_NE(remover, 0u);
+
+  // Third hook is what the outer loop walks into after the erase. It has to still be callable.
+  to_remove = memory.add_access_hook([&](const seven::MemoryAccessEvent& event) {
+    if (event.kind == seven::MemoryAccessKind::data_read) {
+      return true;
+    }
+    ++tail_calls;
+    return true;
+  });
+  ASSERT_NE(to_remove, 0u);
+
+  const std::uint32_t value = 0xA5A5A5A5;
+  EXPECT_TRUE(memory.write(0x1000, &value, sizeof(value)));
+
+  EXPECT_EQ(reentrant_calls, 1);
+  EXPECT_EQ(remover_calls, 1);
+  EXPECT_EQ(tail_calls, 1) << "the removal must be deferred until dispatch unwinds";
+
+  // The deferred removal must actually have landed once dispatch finished.
+  EXPECT_FALSE(memory.remove_access_hook(to_remove)) << "hook should already be gone";
+  EXPECT_TRUE(memory.remove_access_hook(reentrant));
+  EXPECT_TRUE(memory.remove_access_hook(remover));
+}
