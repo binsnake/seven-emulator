@@ -498,31 +498,6 @@ bool resolve_dr_index_for_api(const seven::CpuState& state, x86_register reg, si
 class seven_x86_64_emulator final : public x86_64_emulator {
  public:
   seven_x86_64_emulator() {
-    static const bool trace_testproject = [] {
-      if (const char* v = std::getenv("SEVEN_TRACE_TESTPROJECT")) {
-        return v[0] != '\0' && v[0] != '0';
-      }
-      return false;
-    }();
-    if (trace_testproject) {
-      testproject_trace_hook_id_ = executor_.add_instruction_hook([](seven::InstructionHookContext& ctx) {
-        constexpr std::uint64_t kStart = 0x1400058A0ull;
-        constexpr std::uint64_t kEnd = 0x140006000ull;
-        if (ctx.state.rip >= kStart && ctx.state.rip < kEnd) {
-          std::fprintf(stderr,
-                       "[seven-testproject] rip=0x%llx code=%u len=%u rax=0x%llx rcx=0x%llx rdx=0x%llx rflags=0x%llx\n",
-                       static_cast<unsigned long long>(ctx.state.rip),
-                       static_cast<unsigned>(ctx.instr.code()),
-                       static_cast<unsigned>(ctx.instr.length()),
-                       static_cast<unsigned long long>(ctx.state.gpr[0]),
-                       static_cast<unsigned long long>(ctx.state.gpr[1]),
-                       static_cast<unsigned long long>(ctx.state.gpr[2]),
-                       static_cast<unsigned long long>(ctx.state.rflags));
-        }
-        return seven::InstructionHookResult{};
-      });
-    }
-
     static const bool trace_unique_instructions = [] {
       if (const char* v = std::getenv("SEVEN_TRACE_UNIQUE_INSTRUCTIONS")) {
         return v[0] != '\0' && v[0] != '0';
@@ -1305,7 +1280,6 @@ class seven_x86_64_emulator final : public x86_64_emulator {
   seven::ExecutionResult last_result_{};
   std::vector<std::unique_ptr<hook_object>> hooks_{};
   std::vector<mmio_binding> mmio_bindings_{};
-  std::optional<seven::Executor::HookId> testproject_trace_hook_id_{};
   bool unique_instruction_trace_enabled_{false};
   std::optional<seven::Executor::HookId> unique_instruction_trace_hook_id_{};
   std::map<std::uint32_t, std::uint32_t> unique_instruction_ids_{};
