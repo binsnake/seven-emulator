@@ -207,3 +207,41 @@ TEST(KuberaLiveness, JitBypassEligibleReflectsHooksAndTrapState) {
   state.dr[7] = 0;
   EXPECT_TRUE(executor.jit_bypass_eligible(state, memory));
 }
+
+// The whole cross-instruction masking argument rests on "a branch is always the LAST instruction in
+// a lifted span," which step_impl enforces by stopping the lift at the first instruction whose
+// flow_control() isn't NEXT. But this fork's flow_control() is a hand-rolled stub (see
+// instruction_info.cpp) that only knows Jcc/JMP/CALL/RET/INT3 -- LOOP, LOOPE/LOOPNE and
+// JCXZ/JECXZ/JRCXZ all fall through to NEXT. flag_liveness.cpp separately models plain
+// LOOP/JECXZ/JRCXZ as reading and writing nothing, so they're fully transparent to the backward
+// pass too. Together that let a span run straight THROUGH a branch: an instruction after the branch
+// could "cover" a flag write before it, and when the branch is actually taken that covering
+// instruction never executes, leaving the guest looking at a stale flag.
+//
+// jrcxz with rcx==0 jumps over the cmp, so the cmp can never be the thing that writes ZF here --
+// only the add's own (elided) write could have.
+TEST(KuberaLiveness, TakenJrcxzIsABlockBoundarySoEarlierFlagWriteIsNotElided) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  //   add eax, ebx     <- writes ZF (0 + 0 == 0, so ZF must end up SET)
+  //   jrcxz +2         <- taken (rcx == 0), jumps to the hlt
+  //   cmp ecx, edx     <- the "cover"; skipped entirely by the taken branch
+  //   hlt              <- stops run() before anything else can touch flags
+  write_bytes(memory, kBase, seven::parse_hex_bytes("01 D8 E3 02 39 D1 F4"));
+  state.gpr[0] = 0;   // rax
+  state.gpr[3] = 0;   // rbx
+  state.gpr[1] = 0;   // rcx: zero, so the jrcxz is taken
+  state.gpr[2] = 1;   // rdx: makes the skipped cmp a ZF-clearing compare
+  state.rflags = 0x202;  // ZF clear going in
+
+  // Budget well above kMaxBlockLiftLength so run() actually enables masking.
+  const auto result = executor.run(state, memory, 64);
+  ASSERT_EQ(result.reason, seven::StopReason::halted);
+  EXPECT_EQ(state.rip, kBase + 6);
+  EXPECT_NE(state.rflags & seven::kFlagZF, 0u)
+      << "add's ZF write was elided by a cmp that the taken jrcxz skipped over";
+}

@@ -95,6 +95,52 @@ constexpr std::size_t kZmmWidth = 64;
   }
 }
 
+// Instructions that can redirect control flow (or stop it) but that this fork's hand-rolled
+// InstructionExtensions::flow_control() stub still reports as FlowControl::NEXT -- it only knows
+// Jcc/JMP/CALL/RET/INT3. The block lifter below uses flow_control() to decide where a liveness span
+// ends, and the entire cross-instruction masking argument depends on a branch being the LAST
+// instruction of any span. LOOP/LOOPcc and JCXZ/JECXZ/JRCXZ slipping through as NEXT let a span run
+// straight past a branch, so an instruction after it could "cover" a flag write before it and then
+// never actually execute once the branch was taken -- leaving a stale flag visible to the guest.
+// flag_liveness.cpp separately models plain LOOP/JECXZ/JRCXZ as touching no flags at all, so they
+// were transparent to the backward pass too, with nothing else to stop the propagation.
+//
+// Kept as a supplement here rather than a change to the vendored stub: this is the consumer that
+// actually depends on the answer, and being conservative costs nothing but a shorter lift.
+[[nodiscard]] bool ends_lifted_block(const iced_x86::Instruction& instr) noexcept {
+  switch (instr.code()) {
+    case iced_x86::Code::LOOP_REL8_16_CX: case iced_x86::Code::LOOP_REL8_32_CX:
+    case iced_x86::Code::LOOP_REL8_16_ECX: case iced_x86::Code::LOOP_REL8_32_ECX:
+    case iced_x86::Code::LOOP_REL8_64_ECX: case iced_x86::Code::LOOP_REL8_16_RCX:
+    case iced_x86::Code::LOOP_REL8_64_RCX:
+    case iced_x86::Code::LOOPE_REL8_16_CX: case iced_x86::Code::LOOPE_REL8_32_CX:
+    case iced_x86::Code::LOOPE_REL8_16_ECX: case iced_x86::Code::LOOPE_REL8_32_ECX:
+    case iced_x86::Code::LOOPE_REL8_64_ECX: case iced_x86::Code::LOOPE_REL8_16_RCX:
+    case iced_x86::Code::LOOPE_REL8_64_RCX:
+    case iced_x86::Code::LOOPNE_REL8_16_CX: case iced_x86::Code::LOOPNE_REL8_32_CX:
+    case iced_x86::Code::LOOPNE_REL8_16_ECX: case iced_x86::Code::LOOPNE_REL8_32_ECX:
+    case iced_x86::Code::LOOPNE_REL8_64_ECX: case iced_x86::Code::LOOPNE_REL8_16_RCX:
+    case iced_x86::Code::LOOPNE_REL8_64_RCX:
+    case iced_x86::Code::JECXZ_REL8_16: case iced_x86::Code::JECXZ_REL8_32:
+    case iced_x86::Code::JECXZ_REL8_64:
+    case iced_x86::Code::JRCXZ_REL8_16: case iced_x86::Code::JRCXZ_REL8_64:
+    // Not branches, but they end the run just as hard -- execution never reaches the next
+    // sequential instruction, so nothing after them can be trusted to cover anything.
+    case iced_x86::Code::SYSENTER: case iced_x86::Code::SYSEXITD: case iced_x86::Code::SYSEXITQ:
+    case iced_x86::Code::SYSRETD: case iced_x86::Code::SYSRETQ:
+    case iced_x86::Code::IRETW: case iced_x86::Code::IRETD: case iced_x86::Code::IRETQ:
+    case iced_x86::Code::HLT:
+    case iced_x86::Code::UD0: case iced_x86::Code::UD0_R16_RM16:
+    case iced_x86::Code::UD0_R32_RM32: case iced_x86::Code::UD0_R64_RM64:
+    case iced_x86::Code::UD1_R16_RM16: case iced_x86::Code::UD1_R32_RM32:
+    case iced_x86::Code::UD1_R64_RM64: case iced_x86::Code::UD2:
+    case iced_x86::Code::XBEGIN_REL16: case iced_x86::Code::XBEGIN_REL32:
+      return true;
+    default:
+      return iced_x86::InstructionExtensions::flow_control(instr) != iced_x86::FlowControl::NEXT;
+  }
+}
+
 void maybe_trace_strrchr(const CpuState& state, const Memory& memory) noexcept {
   if (state.rip == 0x180126AF0ull) {
     std::array<std::uint8_t, 48> s{};
@@ -659,7 +705,7 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
       // instructions step() would decode-cache anyway on its next few calls; it doesn't change
       // what gets executed now or batch dispatch in any way. See IR and Flag Liveness.md.
       if (fetched && cache_entry.valid && cache_entry.trap_kind == 0xFFu && cache_entry.simd_allowed &&
-          iced_x86::InstructionExtensions::flow_control(cache_entry.instr) == iced_x86::FlowControl::NEXT) {
+          !ends_lifted_block(cache_entry.instr)) {
         std::array<std::size_t, kMaxBlockLiftLength> lifted_indices{};
         lifted_indices[0] = cache_index;
         std::size_t lifted_count = 1;
@@ -702,7 +748,7 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
           next_entry.valid = true;
           lifted_indices[lifted_count++] = next_index;
           const bool is_boundary = !next_entry.simd_allowed || next_entry.trap_kind != 0xFFu ||
-              iced_x86::InstructionExtensions::flow_control(next_entry.instr) != iced_x86::FlowControl::NEXT;
+              ends_lifted_block(next_entry.instr);
           if (is_boundary) {
             break;
           }
