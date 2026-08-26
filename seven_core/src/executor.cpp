@@ -397,6 +397,15 @@ bool Executor::jit_bypass_eligible(const CpuState& state, const Memory& memory) 
 }
 
 ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_masking) {
+  if (cache_memory_instance_ != memory.instance_id()) [[unlikely]] {
+    // Both caches below are validated on (rip, code_epoch, mode) alone, and code_epoch is a
+    // per-Memory counter that every Memory starts near zero. An Executor reused across two of them
+    // -- separate guests, or one guest rebuilt in a loop -- would find a cached decode from the
+    // first that matched the second's epoch and execute the first's bytes at that address.
+    for (auto& entry : *decode_cache_) entry.valid = false;
+    for (auto& entry : *code_page_cache_) entry.valid = false;
+    cache_memory_instance_ = memory.instance_id();
+  }
   clear_violation();
   if (collect_code_stats_) { ++total_steps_; }
   if (stop_requested_) {

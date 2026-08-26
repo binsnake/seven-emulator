@@ -432,3 +432,32 @@ TEST(KuberaMemory, CopyAssignmentAlsoDropsTheInheritedCaches) {
   ASSERT_TRUE(original.read(0x1000, &original_value, sizeof(original_value)));
   EXPECT_EQ(original_value, before);
 }
+
+// Executor's decode and code-page caches are validated on (rip, code_epoch, mode), and code_epoch
+// is a per-Memory counter that every Memory starts near zero. Reusing one Executor across two of
+// them -- separate guests, or one guest torn down and rebuilt -- meant the second could hit a
+// cached decode belonging to the first and execute its bytes at that address.
+
+TEST(KuberaMemory, ReusingAnExecutorAcrossTwoMemoriesDoesNotReuseTheirDecodes) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  state.mode = seven::ExecutionMode::long64;
+
+  seven::Memory first{};
+  first.map(0x1000, 0x1000);
+  const std::uint8_t inc_rax[] = {0x48, 0xFF, 0xC0};
+  ASSERT_TRUE(first.write(0x1000, inc_rax, sizeof(inc_rax)));
+  state.rip = 0x1000;
+  state.gpr[0] = 0;
+  ASSERT_EQ(executor.step(state, first).reason, seven::StopReason::none);
+  ASSERT_EQ(state.gpr[0], 1u);
+
+  seven::Memory second{};
+  second.map(0x1000, 0x1000);
+  const std::uint8_t dec_rax[] = {0x48, 0xFF, 0xC8};
+  ASSERT_TRUE(second.write(0x1000, dec_rax, sizeof(dec_rax)));
+  state.rip = 0x1000;
+  state.gpr[0] = 10;
+  ASSERT_EQ(executor.step(state, second).reason, seven::StopReason::none);
+  EXPECT_EQ(state.gpr[0], 9u) << "the second memory ran the first memory's instruction";
+}

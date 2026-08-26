@@ -172,6 +172,9 @@ class Executor {
   // to be evaluated on every single step_impl() dispatch, dwarfing the actual cost of decoding and
   // executing an instruction.
   bool decode_cache_disabled_by_env_ = false;
+  // Which Memory the decode and code-page caches were filled from -- see step_impl. 0 is never a
+  // real instance id, so the first step always refills.
+  std::uint64_t cache_memory_instance_ = 0;
   ContextSyncCallback context_read_cb_{};
   ContextSyncCallback context_write_cb_{};
   bool stop_requested_ = false;

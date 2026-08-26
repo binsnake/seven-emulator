@@ -109,6 +109,14 @@ class Memory {
   // Memory never reads or writes this itself.
   std::uint64_t jit_fast_path_hits = 0;
 
+  // Identifies this exact Memory for as long as the process runs, and never carries over to a copy.
+  // Anything caching something derived from this object's contents needs it: the code_epoch counters
+  // those caches compare against are per-Memory and every Memory starts one near zero, so two of
+  // them hold equal values almost immediately and one's cached decode would happily validate
+  // against the other's bytes. An address is not enough on its own, since a destroyed Memory's
+  // address gets handed straight back out for the next one.
+  [[nodiscard]] std::uint64_t instance_id() const noexcept { return instance_id_.value(); }
+
   void map(std::uint64_t base, std::size_t size, MemoryPermissionMask permissions = kMemoryPermissionAll);
   void unmap(std::uint64_t base, std::size_t size);
   void reprotect(std::uint64_t base, std::size_t size, MemoryPermissionMask permissions);
@@ -232,6 +240,24 @@ class Memory {
   };
   [[nodiscard]] PageEntry* lookup_page(std::uint64_t page_index) const noexcept;
   void invalidate_tlb() noexcept { ++tlb_epoch_; }
+
+  // A copy is a different Memory, so it takes a fresh number rather than inheriting one that a
+  // consumer's cache is already tagged with. A move keeps it: the map relocates but its nodes do
+  // not, so a cache filled before the move is still describing the right object.
+  class InstanceIdentity {
+   public:
+    InstanceIdentity() noexcept : value_(allocate()) {}
+    InstanceIdentity(const InstanceIdentity&) noexcept : value_(allocate()) {}
+    InstanceIdentity& operator=(const InstanceIdentity&) noexcept { value_ = allocate(); return *this; }
+    InstanceIdentity(InstanceIdentity&&) noexcept = default;
+    InstanceIdentity& operator=(InstanceIdentity&&) noexcept = default;
+    [[nodiscard]] std::uint64_t value() const noexcept { return value_; }
+
+   private:
+    static std::uint64_t allocate() noexcept;
+    std::uint64_t value_;
+  };
+  InstanceIdentity instance_id_{};
 
   std::unordered_map<std::uint64_t, PageEntry> pages_;
   // Whichever Memory the two caches below were filled for. Copying a Memory deep-copies pages_ into

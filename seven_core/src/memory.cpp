@@ -1,6 +1,7 @@
 #include "seven/memory.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <utility>
 
@@ -34,6 +35,11 @@ bool access_wraps(std::uint64_t base, std::size_t size) noexcept {
 }
 
 }  // namespace
+
+std::uint64_t Memory::InstanceIdentity::allocate() noexcept {
+  static std::atomic<std::uint64_t> next{1};
+  return next.fetch_add(1, std::memory_order_relaxed);
+}
 
 Memory::PageEntry* Memory::lookup_page(std::uint64_t page_index) const noexcept {
   if (cache_owner_ != this) [[unlikely]] {
