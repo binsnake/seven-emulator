@@ -902,3 +902,38 @@ TEST(KuberaScalar, XaddWithTheSameRegisterTwiceDoublesItRatherThanCancelling) {
                EXPECT_EQ(state.gpr[0], 0x2222ull) << "source gets the old destination";
              });
 }
+
+TEST(KuberaScalar, MovToAnAbsoluteMoffsAddressStoresTheAccumulator) {
+  constexpr std::uint64_t kData = 0x4000;
+
+  // A2 00 40 00 00 00 00 00 00 -- mov byte ptr [0x4000], al. The A0/A1 load forms read operand 1
+  // and write operand 0, and the A2/A3 store forms had simply been given the same shape with the
+  // indices swapped, which makes them load as well: the store never happened and the accumulator
+  // was overwritten with whatever the address held.
+  run_single(seven::parse_hex_bytes("A2 00 40 00 00 00 00 00 00"),
+             [](seven::CpuState& state, seven::Memory& memory) {
+               memory.map(kData, 0x1000);
+               state.gpr[0] = 0xCAFEF00DDEADBE5Aull;
+               const std::uint8_t existing = 0xC3;
+               ASSERT_TRUE(memory.write(kData, &existing, sizeof(existing)));
+             },
+             [](const seven::ExecutionResult&, const seven::CpuState& state, const seven::Memory& memory) {
+               std::uint8_t stored = 0;
+               ASSERT_TRUE(memory.read(kData, &stored, sizeof(stored)));
+               EXPECT_EQ(stored, 0x5Au) << "al is stored to the absolute address";
+               EXPECT_EQ(state.gpr[0], 0xCAFEF00DDEADBE5Aull) << "rax is the source, not the destination";
+             });
+
+  // A3 with REX.W -- mov qword ptr [0x4000], rax, the 64-bit form of the same store.
+  run_single(seven::parse_hex_bytes("48 A3 00 40 00 00 00 00 00 00"),
+             [](seven::CpuState& state, seven::Memory& memory) {
+               memory.map(kData, 0x1000);
+               state.gpr[0] = 0x1122334455667788ull;
+             },
+             [](const seven::ExecutionResult&, const seven::CpuState& state, const seven::Memory& memory) {
+               std::uint64_t stored = 0;
+               ASSERT_TRUE(memory.read(kData, &stored, sizeof(stored)));
+               EXPECT_EQ(stored, 0x1122334455667788ull);
+               EXPECT_EQ(state.gpr[0], 0x1122334455667788ull) << "rax is unchanged";
+             });
+}

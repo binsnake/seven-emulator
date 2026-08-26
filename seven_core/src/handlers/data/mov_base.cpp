@@ -164,49 +164,37 @@ ExecutionResult handle_code_MOV_RAX_MOFFS64(ExecutionContext& ctx) {
   return {};
 }
 
+// A2/A3 store the accumulator TO the absolute address, the opposite direction from the A0/A1
+// loads above. These had the loads' shape with the operand indices swapped, which just makes
+// them load as well: the store never landed and the accumulator was overwritten with whatever
+// the address held.
 ExecutionResult handle_code_MOV_MOFFS8_AL(ExecutionContext& ctx) {
-  bool src_ok = false;
-  const auto value = detail::read_operand(ctx, 0, 1, &src_ok);
-  if (!src_ok) {
-    return detail::memory_fault(ctx, detail::memory_address(ctx));
-  }
-  if (!detail::write_operand(ctx, 1, value, 1)) {
+  const auto value = detail::read_register(ctx.state, ctx.instr.op_register(1));
+  if (!detail::write_operand(ctx, 0, value, 1)) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
 
 ExecutionResult handle_code_MOV_MOFFS16_AX(ExecutionContext& ctx) {
-  bool src_ok = false;
-  const auto value = detail::read_operand(ctx, 0, 2, &src_ok);
-  if (!src_ok) {
-    return detail::memory_fault(ctx, detail::memory_address(ctx));
-  }
-  if (!detail::write_operand(ctx, 1, value, 2)) {
+  const auto value = detail::read_register(ctx.state, ctx.instr.op_register(1));
+  if (!detail::write_operand(ctx, 0, value, 2)) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
 
 ExecutionResult handle_code_MOV_MOFFS32_EAX(ExecutionContext& ctx) {
-  bool src_ok = false;
-  const auto value = detail::read_operand(ctx, 0, 4, &src_ok);
-  if (!src_ok) {
-    return detail::memory_fault(ctx, detail::memory_address(ctx));
-  }
-  if (!detail::write_operand(ctx, 1, value, 4)) {
+  const auto value = detail::read_register(ctx.state, ctx.instr.op_register(1));
+  if (!detail::write_operand(ctx, 0, value, 4)) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
 
 ExecutionResult handle_code_MOV_MOFFS64_RAX(ExecutionContext& ctx) {
-  bool src_ok = false;
-  const auto value = detail::read_operand(ctx, 0, 8, &src_ok);
-  if (!src_ok) {
-    return detail::memory_fault(ctx, detail::memory_address(ctx));
-  }
-  if (!detail::write_operand(ctx, 1, value, 8)) {
+  const auto value = detail::read_register(ctx.state, ctx.instr.op_register(1));
+  if (!detail::write_operand(ctx, 0, value, 8)) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
