@@ -263,11 +263,17 @@ TEST(KuberaLiveness, TakenJrcxzIsABlockBoundarySoEarlierFlagWriteIsNotElided) {
 // close.
 TEST(KuberaLiveness, StringInstructionsAreRecognizedAsFaultCapable) {
   struct Case { const char* name; const char* bytes; };
-  // rep-prefixed and bare forms both decode to the same underlying string Code.
+  // rep-prefixed and bare forms both decode to the same underlying string Code. The maskmov pair
+  // is here for the same reason: their destination is an implicit ES:[rDI] operand, so they were
+  // reported as unable to fault while writing up to 16 bytes of guest memory, which also made them
+  // eligible for the JIT's callout bridge and let a self-modifying maskmovdqu leave the rest of a
+  // compiled block running the bytes it was compiled from.
   const Case cases[] = {
       {"movsb", "A4"},   {"movsq", "48 A5"}, {"cmpsb", "A6"},   {"cmpsq", "48 A7"},
       {"scasb", "AE"},   {"scasq", "48 AF"}, {"stosb", "AA"},   {"stosq", "48 AB"},
       {"lodsb", "AC"},   {"lodsq", "48 AD"},
+      {"maskmovdqu", "66 0F F7 C1"}, {"maskmovq", "0F F7 C1"},
+      {"vmaskmovdqu", "C5 F9 F7 C1"},
   };
   for (const auto& c : cases) {
     const auto raw = seven::parse_hex_bytes(c.bytes);

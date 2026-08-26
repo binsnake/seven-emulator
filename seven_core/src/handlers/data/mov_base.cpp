@@ -323,6 +323,13 @@ ExecutionResult load_sreg(ExecutionContext& ctx, std::size_t register_width) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto dst_reg = ctx.instr.op_register(0);
+  // MOV to CS has no encoding on hardware, and write_register would put the value straight into
+  // sreg[1], which is the only record of the current privilege level in this emulator. iced does
+  // reject the encoding today, so this is belt and braces rather than a live hole, but the cost of
+  // being wrong about the decoder here is a guest reaching ring 0 in two bytes.
+  if (dst_reg == iced_x86::Register::CS) {
+    return ud_fault(ctx);
+  }
   detail::write_register(ctx.state, dst_reg, value, 2);
   if (dst_reg == iced_x86::Register::SS) {
     ctx.state.debug_suppression = 1;

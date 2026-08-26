@@ -293,7 +293,13 @@ struct FlagsInfo {
 bool can_fault(const iced_x86::Instruction& instr) noexcept {
   const auto op_count = instr.op_count();
   for (std::uint32_t i = 0; i < op_count; ++i) {
-    if (instr.op_kind(i) == iced_x86::OpKind::MEMORY) {
+    // Every memory operand kind, not just OpKind::MEMORY. iced gives the implicit rsi/rdi operands
+    // their own kinds (MEMORY_SEG_SI through MEMORY_ESRDI) which are distinct enum values, so a
+    // plain == MEMORY comparison missed the string instructions and MASKMOVDQU/MASKMOVQ entirely
+    // even though addressing guest memory is the whole point of them. The memory kinds sit at the
+    // top of the enum, 15 through 24 with MEMORY last, so one comparison covers all of them and
+    // there is no per-opcode list left to fall behind.
+    if (instr.op_kind(i) >= iced_x86::OpKind::MEMORY_SEG_SI) {
       return true;
     }
   }
@@ -318,28 +324,12 @@ bool can_fault(const iced_x86::Instruction& instr) noexcept {
     case iced_x86::Code::RETFW_IMM16: case iced_x86::Code::RETFD_IMM16: case iced_x86::Code::RETFQ_IMM16:
       return true;
 
-    // String instructions address memory through rsi/rdi, and iced gives those operands their own
-    // kinds (MEMORY_SEG_SI/ESI/RSI, MEMORY_ESDI/ESEDI/ESRDI) which are distinct enum values from
-    // OpKind::MEMORY -- so the operand loop above never sees them even though reading or writing
-    // guest memory is the entire point of these instructions. Same implicit-access gap as CALL/RET
-    // below, and it matters twice over: flag liveness must stay conservative across anything that
-    // can fault mid-span, and seven-jit's callout bridge uses this same predicate to decide what it
-    // may inline into a compiled block (a rep-prefixed string op can also return with
-    // control_flow_taken set, which that bridge does not model).
-    case iced_x86::Code::MOVSB_M8_M8: case iced_x86::Code::MOVSW_M16_M16:
-    case iced_x86::Code::MOVSD_M32_M32: case iced_x86::Code::MOVSQ_M64_M64:
-    case iced_x86::Code::CMPSB_M8_M8: case iced_x86::Code::CMPSW_M16_M16:
-    case iced_x86::Code::CMPSD_M32_M32: case iced_x86::Code::CMPSQ_M64_M64:
-    case iced_x86::Code::SCASB_AL_M8: case iced_x86::Code::SCASW_AX_M16:
-    case iced_x86::Code::SCASD_EAX_M32: case iced_x86::Code::SCASQ_RAX_M64:
-    case iced_x86::Code::STOSB_M8_AL: case iced_x86::Code::STOSW_M16_AX:
-    case iced_x86::Code::STOSD_M32_EAX: case iced_x86::Code::STOSQ_M64_RAX:
-    case iced_x86::Code::LODSB_AL_M8: case iced_x86::Code::LODSW_AX_M16:
-    case iced_x86::Code::LODSD_EAX_M32: case iced_x86::Code::LODSQ_RAX_M64:
-    case iced_x86::Code::INSB_M8_DX: case iced_x86::Code::INSW_M16_DX:
-    case iced_x86::Code::INSD_M32_DX:
-    case iced_x86::Code::OUTSB_DX_M8: case iced_x86::Code::OUTSW_DX_M16:
-    case iced_x86::Code::OUTSD_DX_M32:
+    // MASKMOVDQU's destination is an implicit ES:[rDI] operand, and the vendored decoder is not
+    // consistent about it: OpCodeHandler_rDI_VX_RX gives the non-VEX form OpKind::MEMORY_SEG_RDI,
+    // which the loop above catches, while OpCodeHandler_VEX_rDI_VX_RX gives the VEX form a plain
+    // REGISTER operand holding RDI. Both handlers write up to 16 bytes of guest memory through
+    // Memory::write, so the VEX one needs saying out loud rather than relying on the decoder.
+    case iced_x86::Code::VEX_VMASKMOVDQU_R_DI_XMM_XMM:
       return true;
 
     // Same implicit-stack-access gap as CALL/RET, just for the rest of the instructions that push

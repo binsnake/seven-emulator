@@ -1014,6 +1014,25 @@ TEST(KuberaScalar, AFarReturnCannotLowerTheCurrentPrivilegeLevel) {
   EXPECT_EQ(state.sreg[1] & 0x3u, 3u) << "CPL must not have dropped";
 }
 
+// MOV to a segment register writes sreg[] by index, and index 1 is CS, the only place this
+// emulator records the current privilege level. There is no MOV CS encoding on hardware and iced
+// declines to decode one, so this pins both halves: the decoder rejects it, and if it ever stopped
+// rejecting it the handler would too.
+TEST(KuberaScalar, MovToCsCannotSetThePrivilegeLevel) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.sreg[1] = 0x33;
+  state.gpr[0] = 0x08;
+  write_bytes(memory, kBase, seven::parse_hex_bytes("8E C8"));  // mov cs, ax
+
+  const auto result = executor.step(state, memory);
+  EXPECT_NE(result.reason, seven::StopReason::none);
+  EXPECT_EQ(state.sreg[1] & 0x3u, 3u) << "CPL must not have dropped";
+}
+
 // validate_memory_span exists so the x87 image stores can check the whole 108-byte image before
 // touching any of it. It computed base + offset as plain uint64, so a destination near the top of
 // the address space wrapped and it happily validated page 0, then the store itself faulted partway
