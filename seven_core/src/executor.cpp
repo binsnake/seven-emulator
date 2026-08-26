@@ -766,18 +766,25 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
     }
 
     ExecutionContext ctx{state, memory, instr, next_rip, false};
-    if (has_execution_hooks_) {
-      for (auto& [id, hook] : execution_hooks_) {
-        (void)id;
-        hook(state.rip);
-      }
-    }
-    if (has_execution_address_hooks_) {
-      const auto exec_addr_it = execution_address_hooks_.find(state.rip);
-      if (exec_addr_it != execution_address_hooks_.end()) {
-        for (auto& [id, hook] : exec_addr_it->second) {
+    if (has_execution_hooks_ || has_execution_address_hooks_) {
+      // One scope across both loops: a hook in the first is just as free to remove one from the
+      // second. Without this these two were the only dispatches in the class that ran unguarded, so
+      // a hook that removed itself -- a one-shot breakpoint, the obvious use for an execution hook --
+      // erased from the vector this range-for is walking and left it reading destroyed storage.
+      HookDispatchScope scope{*this};
+      if (has_execution_hooks_) {
+        for (auto& [id, hook] : execution_hooks_) {
           (void)id;
           hook(state.rip);
+        }
+      }
+      if (has_execution_address_hooks_) {
+        const auto exec_addr_it = execution_address_hooks_.find(state.rip);
+        if (exec_addr_it != execution_address_hooks_.end()) {
+          for (auto& [id, hook] : exec_addr_it->second) {
+            (void)id;
+            hook(state.rip);
+          }
         }
       }
     }
@@ -1121,19 +1128,15 @@ InstructionHookAction Executor::run_instruction_hooks(InstructionHookContext& ct
     return InstructionHookAction::continue_to_core;
   }
 
-  dispatching_hooks_ = true;
+  HookDispatchScope scope{*this};
   for (auto& [id, hook] : instruction_hooks_) {
     (void)id;
     const auto result = hook(ctx);
     if (result.action == InstructionHookAction::stop) {
-      dispatching_hooks_ = false;
-      apply_pending_hook_mutations();
       stop_result = result.stop_result.value_or(ExecutionResult{StopReason::unsupported_instruction, 0, std::nullopt, ctx.instr.code()});
       return result.action;
     }
     if (result.action == InstructionHookAction::skip_core) {
-      dispatching_hooks_ = false;
-      apply_pending_hook_mutations();
       return result.action;
     }
   }
@@ -1142,20 +1145,14 @@ InstructionHookAction Executor::run_instruction_hooks(InstructionHookContext& ct
       (void)id;
       const auto result = hook(ctx);
       if (result.action == InstructionHookAction::stop) {
-        dispatching_hooks_ = false;
-        apply_pending_hook_mutations();
         stop_result = result.stop_result.value_or(ExecutionResult{StopReason::unsupported_instruction, 0, std::nullopt, ctx.instr.code()});
         return result.action;
       }
       if (result.action == InstructionHookAction::skip_core) {
-        dispatching_hooks_ = false;
-        apply_pending_hook_mutations();
         return result.action;
       }
     }
   }
-  dispatching_hooks_ = false;
-  apply_pending_hook_mutations();
   return InstructionHookAction::continue_to_core;
 }
 
@@ -1164,18 +1161,14 @@ TrapHookResult Executor::run_trap_hooks(TrapHookContext& ctx) {
   if (it == trap_hooks_.end()) {
     return {};
   }
-  dispatching_hooks_ = true;
+  HookDispatchScope scope{*this};
   for (auto& [id, hook] : it->second) {
     (void)id;
     const auto result = hook(ctx);
     if (result.action != TrapHookAction::continue_to_core) {
-      dispatching_hooks_ = false;
-      apply_pending_hook_mutations();
       return result;
     }
   }
-  dispatching_hooks_ = false;
-  apply_pending_hook_mutations();
   return {};
 }
 
@@ -1183,18 +1176,14 @@ FaultHookAction Executor::run_fault_hooks(const FaultHookEvent& event) {
   if (fault_hooks_.empty()) {
     return FaultHookAction::stop;
   }
-  dispatching_hooks_ = true;
+  HookDispatchScope scope{*this};
   for (auto& [id, hook] : fault_hooks_) {
     (void)id;
     const auto action = hook(event);
     if (action != FaultHookAction::stop) {
-      dispatching_hooks_ = false;
-      apply_pending_hook_mutations();
       return action;
     }
   }
-  dispatching_hooks_ = false;
-  apply_pending_hook_mutations();
   return FaultHookAction::stop;
 }
 
@@ -1203,14 +1192,24 @@ void Executor::notify_stop_hooks(CpuState& state, Memory& memory, const Executio
     return;
   }
   auto& self = const_cast<Executor&>(*this);
-  self.dispatching_hooks_ = true;
+  HookDispatchScope scope{self};
   const StopHookEvent event{state, memory, result, fault_address};
   for (const auto& [id, hook] : stop_hooks_) {
     (void)id;
     hook(event);
   }
-  self.dispatching_hooks_ = false;
-  self.apply_pending_hook_mutations();
+}
+
+Executor::HookDispatchScope::HookDispatchScope(Executor& executor) noexcept
+    : self(executor), was_dispatching(executor.dispatching_hooks_) {
+  self.dispatching_hooks_ = true;
+}
+
+Executor::HookDispatchScope::~HookDispatchScope() {
+  self.dispatching_hooks_ = was_dispatching;
+  if (!was_dispatching) {
+    self.apply_pending_hook_mutations();
+  }
 }
 
 void Executor::apply_pending_hook_mutations() {

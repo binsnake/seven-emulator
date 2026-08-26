@@ -483,3 +483,75 @@ TEST(KuberaMemory, PassthroughNeverSeesAWrappingRangeInEitherDirection) {
   EXPECT_TRUE(memory.write(~std::uint64_t{0} - 7, &value, sizeof(value)));
   EXPECT_TRUE(saw_write);
 }
+
+// Every hook dispatch in Executor sets a flag so that add/remove/clear called from inside a callback
+// queue themselves instead of mutating the container being walked -- every dispatch except the two
+// execution-hook loops, which ran unguarded. A hook that removed itself, which is exactly what a
+// one-shot breakpoint does, therefore erased from the vector the range-for was iterating.
+
+TEST(KuberaMemory, AnExecutionHookMayRemoveHooksFromInsideItsOwnCallback) {
+  seven::CpuState state{};
+  seven::Memory memory{};
+  seven::Executor executor{};
+  state.mode = seven::ExecutionMode::long64;
+  memory.map(0x1000, 0x1000);
+  const std::uint8_t nops[] = {0x90, 0x90, 0x90};
+  ASSERT_TRUE(memory.write(0x1000, nops, sizeof(nops)));
+
+  int first_calls = 0;
+  int second_calls = 0;
+  int third_calls = 0;
+  seven::Executor::HookId second = 0;
+  seven::Executor::HookId third = 0;
+
+  const auto first = executor.add_execution_hook([&](std::uint64_t) {
+    ++first_calls;
+    // Drop the two hooks queued behind this one, from inside the dispatch that is walking them.
+    (void)executor.remove_hook(second);
+    (void)executor.remove_hook(third);
+  });
+  ASSERT_NE(first, 0u);
+  second = executor.add_execution_hook([&](std::uint64_t) { ++second_calls; });
+  third = executor.add_execution_hook([&](std::uint64_t) { ++third_calls; });
+  ASSERT_NE(second, 0u);
+  ASSERT_NE(third, 0u);
+
+  state.rip = 0x1000;
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+  EXPECT_EQ(first_calls, 1);
+  EXPECT_EQ(second_calls, 1) << "a removal must not take effect until the walk finishes";
+  EXPECT_EQ(third_calls, 1) << "a removal must not take effect until the walk finishes";
+
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+  EXPECT_EQ(first_calls, 2);
+  EXPECT_EQ(second_calls, 1) << "the deferred removal has to actually land";
+  EXPECT_EQ(third_calls, 1) << "the deferred removal has to actually land";
+}
+
+TEST(KuberaMemory, AnExecutionHookMayAddAHookFromInsideItsOwnCallback) {
+  seven::CpuState state{};
+  seven::Memory memory{};
+  seven::Executor executor{};
+  state.mode = seven::ExecutionMode::long64;
+  memory.map(0x1000, 0x1000);
+  const std::uint8_t nops[] = {0x90, 0x90, 0x90};
+  ASSERT_TRUE(memory.write(0x1000, nops, sizeof(nops)));
+
+  int added_calls = 0;
+  bool has_added = false;
+  const auto id = executor.add_execution_hook([&](std::uint64_t) {
+    if (has_added) {
+      return;
+    }
+    has_added = true;
+    // An immediate emplace_back here would reallocate the vector the dispatch loop is walking.
+    (void)executor.add_execution_hook([&](std::uint64_t) { ++added_calls; });
+  });
+  ASSERT_NE(id, 0u);
+
+  state.rip = 0x1000;
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+  EXPECT_EQ(added_calls, 0) << "a hook added mid-walk must not run until the next instruction";
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+  EXPECT_EQ(added_calls, 1);
+}

@@ -101,6 +101,20 @@ class Executor {
   void notify_stop_hooks(CpuState& state, Memory& memory, const ExecutionResult& result, std::uint64_t fault_address) const;
   void apply_pending_hook_mutations();
   void refresh_hook_flags() noexcept;
+  // Held for the duration of any hook dispatch, so add/remove/clear queue themselves instead of
+  // mutating a container that is currently being walked. Saved and restored rather than assigned,
+  // for the reason Memory::access_allowed spells out for its own dispatch: a hook callback may
+  // re-enter the executor, and a nested dispatch that cleared the flag on the way out would leave
+  // the outer loop iterating with deferral switched off. Only the outermost scope flushes the queue.
+  struct HookDispatchScope {
+    explicit HookDispatchScope(Executor& executor) noexcept;
+    ~HookDispatchScope();
+    HookDispatchScope(const HookDispatchScope&) = delete;
+    HookDispatchScope& operator=(const HookDispatchScope&) = delete;
+
+    Executor& self;
+    bool was_dispatching;
+  };
 
   static ExecutionResult unsupported(ExecutionContext& ctx);
   // The shared dispatch core behind both step() and run()'s internal loop. `allow_masking` gates
