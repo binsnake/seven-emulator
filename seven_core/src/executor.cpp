@@ -36,8 +36,6 @@ Executor::Executor()
     : code_execution_counts_(kCodeCount, 0),
       stop_reason_counts_(kStopReasonCount, 0) {
   trace_semantics_ = env_flag_set("SEVEN_TRACE_SEMANTICS");
-  trace_openkey_probe_ = env_flag_set("SEVEN_TRACE_OPENKEY");
-  trace_strrchr_ = env_flag_set("SEVEN_TRACE_STRRCHR");
   collect_code_stats_ = env_flag_set("SEVEN_COLLECT_CODE_STATS");
   decode_cache_disabled_by_env_ = env_flag_set("SEVEN_DISABLE_DECODE_CACHE");
 }
@@ -139,153 +137,6 @@ constexpr std::size_t kZmmWidth = 64;
     default:
       return iced_x86::InstructionExtensions::flow_control(instr) != iced_x86::FlowControl::NEXT;
   }
-}
-
-void maybe_trace_strrchr(const CpuState& state, const Memory& memory) noexcept {
-  if (state.rip == 0x180126AF0ull) {
-    std::array<std::uint8_t, 48> s{};
-    const bool ok = memory.read(state.gpr[1], s.data(), s.size(), MemoryAccessKind::data_read);
-    std::fprintf(stderr,
-        "[seven-strrchr] enter rcx=0x%llx dl=0x%02llx ok=%u bytes=",
-        static_cast<unsigned long long>(state.gpr[1]),
-        static_cast<unsigned long long>(state.gpr[2] & 0xFFull),
-        ok ? 1u : 0u);
-    if (ok) {
-      for (std::size_t i = 0; i < s.size(); ++i) {
-        std::fprintf(stderr, "%02x", static_cast<unsigned>(s[i]));
-      }
-    }
-    std::fprintf(stderr, "\n");
-  } else if (state.rip == 0x180126BECull) {
-    std::fprintf(stderr,
-        "[seven-strrchr] exit rax=0x%llx r9=0x%llx r10=0x%llx\n",
-        static_cast<unsigned long long>(state.gpr[0]),
-        static_cast<unsigned long long>(state.gpr[9]),
-        static_cast<unsigned long long>(state.gpr[10]));
-  }
-}
-
-void maybe_trace_openkey_probe(const CpuState& state, const Memory& memory) noexcept {
-  if (state.rip != 0x180161cd2ull) {
-    return;
-  }
-  const std::uint32_t sysno = static_cast<std::uint32_t>(state.gpr[0] & 0xFFFFFFFFull);
-  if (sysno != 0x12u) {
-    return;
-  }
-
-  std::uint64_t ret_addr = 0;
-  const bool have_ret = memory.read(state.gpr[4], &ret_addr, sizeof(ret_addr), MemoryAccessKind::data_read);
-  if (!have_ret || ret_addr != 0x1800ac33cull) {
-    return;
-  }
-
-  struct ObjAttrs64 {
-    std::uint32_t length;
-    std::uint32_t pad0;
-    std::uint64_t root_dir;
-    std::uint64_t object_name;
-    std::uint32_t attributes;
-    std::uint32_t pad1;
-    std::uint64_t security_descriptor;
-    std::uint64_t security_qos;
-  } attrs{};
-
-  const std::uint64_t key_handle_ptr = state.gpr[1];
-  const std::uint64_t desired_access = state.gpr[2];
-  const std::uint64_t obj_attr_ptr = state.gpr[8];
-  const bool have_attrs = memory.read(obj_attr_ptr, &attrs, sizeof(attrs), MemoryAccessKind::data_read);
-
-  struct UnicodeString64 {
-    std::uint16_t length;
-    std::uint16_t max_length;
-    std::uint32_t pad0;
-    std::uint64_t buffer;
-  } us{};
-  bool have_us = false;
-  if (have_attrs && attrs.object_name != 0) {
-    have_us = memory.read(attrs.object_name, &us, sizeof(us), MemoryAccessKind::data_read);
-  }
-
-  std::array<char16_t, 260> name_buf{};
-  std::size_t name_chars = 0;
-  bool have_name = false;
-  if (have_us && us.buffer != 0 && us.length > 0) {
-    name_chars = std::min<std::size_t>(name_buf.size() - 1, static_cast<std::size_t>(us.length / 2u));
-    have_name = memory.read(us.buffer, name_buf.data(), name_chars * sizeof(char16_t), MemoryAccessKind::data_read);
-  }
-
-  std::fprintf(stderr,
-      "[seven-openkey] rip=0x%llx ret=0x%llx rcx=0x%llx rdx=0x%llx r8=0x%llx attrs_ok=%u attrs_len=0x%x root=0x%llx name_ptr=0x%llx attrs=0x%x us_ok=%u us_len=0x%x us_max=0x%x us_buf=0x%llx\n",
-      static_cast<unsigned long long>(state.rip),
-      static_cast<unsigned long long>(ret_addr),
-      static_cast<unsigned long long>(key_handle_ptr),
-      static_cast<unsigned long long>(desired_access),
-      static_cast<unsigned long long>(obj_attr_ptr),
-      have_attrs ? 1u : 0u,
-      have_attrs ? attrs.length : 0u,
-      static_cast<unsigned long long>(have_attrs ? attrs.root_dir : 0ull),
-      static_cast<unsigned long long>(have_attrs ? attrs.object_name : 0ull),
-      have_attrs ? attrs.attributes : 0u,
-      have_us ? 1u : 0u,
-      have_us ? us.length : 0u,
-      have_us ? us.max_length : 0u,
-      static_cast<unsigned long long>(have_us ? us.buffer : 0ull));
-
-  if (have_name && name_chars != 0) {
-    std::fprintf(stderr, "[seven-openkey] name_utf16:");
-    for (std::size_t i = 0; i < name_chars; ++i) {
-      std::fprintf(stderr, " %04x", static_cast<unsigned>(name_buf[i]));
-    }
-    std::fprintf(stderr, "\n");
-  }
-}
-
-void maybe_trace_semantics(const CpuState& state, const iced_x86::Instruction& instr, const Memory& memory) noexcept {
-  constexpr std::uint64_t kCxxThrowStart = 0x1059751E0ull;
-  constexpr std::uint64_t kCxxThrowEnd = 0x105975288ull;
-  if (!(state.rip >= kCxxThrowStart && state.rip < kCxxThrowEnd)) {
-    return;
-  }
-  std::uint64_t call_target = 0;
-  const bool call_target_ok = memory.read(0x105984080ull, &call_target, sizeof(call_target), MemoryAccessKind::data_read);
-  std::uint64_t stack0 = 0;
-  std::uint64_t stack1 = 0;
-  std::uint64_t stack_c0 = 0;
-  std::uint64_t stack_c8 = 0;
-  const bool stack0_ok = memory.read(state.gpr[4], &stack0, sizeof(stack0), MemoryAccessKind::data_read);
-  const bool stack1_ok = memory.read(state.gpr[4] + 8, &stack1, sizeof(stack1), MemoryAccessKind::data_read);
-  const bool stack_c0_ok = memory.read(state.gpr[4] + 0xC0, &stack_c0, sizeof(stack_c0), MemoryAccessKind::data_read);
-  const bool stack_c8_ok = memory.read(state.gpr[4] + 0xC8, &stack_c8, sizeof(stack_c8), MemoryAccessKind::data_read);
-  std::fprintf(stderr,
-      "[seven-trace] rip=0x%llx code=%u len=%u rax=0x%llx rbx=0x%llx rcx=0x%llx rdx=0x%llx rsp=0x%llx [rsp]=%s0x%llx [rsp+8]=%s0x%llx [rsp+c0]=%s0x%llx [rsp+c8]=%s0x%llx iat=%s0x%llx rbp=0x%llx rsi=0x%llx rdi=0x%llx r8=0x%llx r9=0x%llx cf=%u zf=%u sf=%u of=%u\n",
-      static_cast<unsigned long long>(state.rip),
-      static_cast<unsigned>(instr.code()),
-      static_cast<unsigned>(instr.length()),
-      static_cast<unsigned long long>(state.gpr[0]),
-      static_cast<unsigned long long>(state.gpr[3]),
-      static_cast<unsigned long long>(state.gpr[1]),
-      static_cast<unsigned long long>(state.gpr[2]),
-      static_cast<unsigned long long>(state.gpr[4]),
-      stack0_ok ? "" : "err:",
-      static_cast<unsigned long long>(stack0),
-      stack1_ok ? "" : "err:",
-      static_cast<unsigned long long>(stack1),
-      stack_c0_ok ? "" : "err:",
-      static_cast<unsigned long long>(stack_c0),
-      stack_c8_ok ? "" : "err:",
-      static_cast<unsigned long long>(stack_c8),
-      call_target_ok ? "" : "err:",
-      static_cast<unsigned long long>(call_target),
-      static_cast<unsigned long long>(state.gpr[5]),
-      static_cast<unsigned long long>(state.gpr[6]),
-      static_cast<unsigned long long>(state.gpr[7]),
-      static_cast<unsigned long long>(state.gpr[8]),
-      static_cast<unsigned long long>(state.gpr[9]),
-      (state.rflags & kFlagCF) ? 1u : 0u,
-      (state.rflags & kFlagZF) ? 1u : 0u,
-      (state.rflags & kFlagSF) ? 1u : 0u,
-      (state.rflags & kFlagOF) ? 1u : 0u);
 }
 
 struct DebugMemoryAccess {
@@ -806,10 +657,6 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
       return fault;
     }
 
-    if (trace_strrchr_) {
-      maybe_trace_strrchr(state, memory);
-    }
-
     if (!cache_entry.simd_allowed) {
       const ExecutionResult fault{StopReason::unsupported_instruction, 0, ExceptionInfo{StopReason::unsupported_instruction, state.rip, 0}, instr.code()};
       if (try_recover_fault(fault, fault_address_of(fault, state.rip))) {
@@ -853,9 +700,6 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
 
     if (cache_entry.trap_kind != 0xFFu) {
       const auto trap_kind = static_cast<TrapKind>(cache_entry.trap_kind);
-      if (trace_openkey_probe_) {
-        maybe_trace_openkey_probe(state, memory);
-      }
       TrapHookContext trap_ctx{state, memory, instr, next_rip, trap_kind};
       const auto trap_result = run_trap_hooks(trap_ctx);
       if (trap_result.action == TrapHookAction::handled) {

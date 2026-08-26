@@ -166,8 +166,6 @@ class Executor {
   bool has_trap_hooks_ = false;
   // Tracing flags resolved once at construction.
   bool trace_semantics_ = false;
-  bool trace_openkey_probe_ = false;
-  bool trace_strrchr_ = false;
   bool collect_code_stats_ = false;
   // Resolved once at construction, not per-dispatch: std::getenv() is not a cheap call (measured
   // ~2.4us on this machine, backed by a linear scan and possibly a lock in some CRTs) and this used
