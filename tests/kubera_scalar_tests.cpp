@@ -684,3 +684,115 @@ TEST(KuberaScalar, MovSegmentRegisterFromMemoryReadsOnlyTwoBytes) {
                EXPECT_EQ(state.sreg[0], 0x33u);
              });
 }
+
+TEST(KuberaScalar, FnsaveWritesOnlyTheArchitecturalImage) {
+  // fsave() ignored the size its handler passed and always validated and wrote 160 bytes: a
+  // 24-byte private environment plus eight 16-byte ST slots. The architectural FNSAVE image is
+  // 108 bytes (a 28-byte environment plus eight 10-byte slots) for the 32-bit form and 94 for the
+  // 16-bit one, so this scribbled 52 bytes of unrelated guest memory past the end of a correctly
+  // sized buffer, and refused a 108-byte buffer that ended on a page boundary.
+  constexpr std::uint64_t kSave = 0x4000;
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  memory.map(kSave, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("DD 33"));  // fnsave [rbx]
+  state.gpr[3] = kSave;
+
+  const std::vector<std::uint8_t> guard(64, 0xEE);
+  ASSERT_TRUE(memory.write(kSave + 108, guard.data(), guard.size()));
+  ASSERT_TRUE(state.x87_push(seven::X87Scalar(1)));
+
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+
+  std::vector<std::uint8_t> after(guard.size(), 0);
+  ASSERT_TRUE(memory.read(kSave + 108, after.data(), after.size()));
+  EXPECT_EQ(after, guard) << "fnsave must not write past the 108-byte image";
+}
+
+TEST(KuberaScalar, FnsaveFrstorRoundTripKeepsTheStackWhenTopIsNotZero) {
+  // The environment's tag word is two bits per PHYSICAL register, but the data slots are
+  // top-relative. The old code built the tag word by physical index and then read and wrote the
+  // slots by ST index, so after an fld1 (which leaves TOP at 7) the save wrote ST0's data into a
+  // slot the restore then read as a different register, and ST(0) came back empty.
+  constexpr std::uint64_t kSave = 0x4000;
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  memory.map(kSave, 0x1000);
+  // fld1; fnsave [rbx]; frstor [rbx]
+  write_bytes(memory, kBase, seven::parse_hex_bytes("D9 E8 DD 33 DD 23"));
+  state.gpr[3] = kSave;
+
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);  // fld1
+  ASSERT_EQ(state.get_x87_top(), 7u) << "sanity: fld1 must decrement TOP to 7";
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);  // fnsave
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);  // frstor
+
+  EXPECT_EQ(state.get_x87_top(), 7u);
+  ASSERT_FALSE(state.x87_is_empty(0)) << "ST(0) must survive the round trip";
+  EXPECT_EQ(static_cast<double>(state.x87_get(0)), 1.0);
+}
+
+TEST(KuberaScalar, FnstenvWritesOnlyTheRequestedEnvironmentSize) {
+  // store_x87_env() wrote 26 bytes for both forms, so the 14-byte form clobbered 12 bytes past its
+  // image, and the 28-byte form left its last two bytes stale while laying the fields out at the
+  // 16-bit offsets.
+  constexpr std::uint64_t kEnv = 0x4000;
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  memory.map(kEnv, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("66 D9 33"));  // fnstenv [rbx], 14-byte form
+  state.gpr[3] = kEnv;
+
+  const std::vector<std::uint8_t> guard(32, 0xEE);
+  ASSERT_TRUE(memory.write(kEnv + 14, guard.data(), guard.size()));
+
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+
+  std::vector<std::uint8_t> after(guard.size(), 0);
+  ASSERT_TRUE(memory.read(kEnv + 14, after.data(), after.size()));
+  EXPECT_EQ(after, guard) << "the 14-byte fnstenv must not write past its image";
+
+  // Control word round-trips at offset 0 in both forms.
+  std::uint16_t fcw = 0;
+  ASSERT_TRUE(memory.read(kEnv, &fcw, sizeof(fcw)));
+  EXPECT_EQ(fcw, state.get_x87_control_word());
+}
+
+TEST(KuberaScalar, FstpTbyteWritesTheArchitecturalEightyBitEncoding) {
+  // softfloat's extFloat80M swaps its two fields on LITTLEENDIAN, and the build only defined that
+  // for softfloat's own sources. seven_core therefore disagreed with the library it links about
+  // where signif and signExp live, so every direct field access read the wrong offset: 1.0 came
+  // out of encode_ext80 as ff3f followed by eight zero bytes instead of the real encoding. That
+  // corrupts every 80-bit memory format the guest can see, fstp tbyte included.
+  constexpr std::uint64_t kData = 0x4000;
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  memory.map(kData, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("D9 E8 DB 3B"));  // fld1; fstp tbyte ptr [rbx]
+  state.gpr[3] = kData;
+
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+
+  std::vector<std::uint8_t> stored(10, 0);
+  ASSERT_TRUE(memory.read(kData, stored.data(), stored.size()));
+  // 1.0: significand 0x8000000000000000 little-endian, then the biased exponent 0x3FFF.
+  const std::vector<std::uint8_t> expected = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xFF, 0x3F};
+  EXPECT_EQ(stored, expected);
+}

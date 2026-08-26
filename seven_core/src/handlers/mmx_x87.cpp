@@ -152,34 +152,65 @@ uint8_t x87_ftw(const CpuState& state) {
   return ftw;
 }
 
-ExecutionResult store_x87_env(ExecutionContext& ctx, std::uint64_t base) {
-  const std::uint16_t fcw = ctx.state.get_x87_control_word();
-  const std::uint16_t fsw = ctx.state.get_x87_status_word();
-  const std::uint16_t ftw = static_cast<std::uint16_t>(x87_ftw(ctx.state));
-  const std::uint16_t zero16 = 0;
-  const std::uint64_t zero64 = 0;
-  if (!ctx.memory.write(base + 0, &fcw, 2)) return detail::memory_fault(ctx, base + 0);
-  if (!ctx.memory.write(base + 2, &fsw, 2)) return detail::memory_fault(ctx, base + 2);
-  if (!ctx.memory.write(base + 4, &ftw, 2)) return detail::memory_fault(ctx, base + 4);
-  if (!ctx.memory.write(base + 6, &zero16, 2)) return detail::memory_fault(ctx, base + 6);
-  if (!ctx.memory.write(base + 8, &zero64, 8)) return detail::memory_fault(ctx, base + 8);
-  if (!ctx.memory.write(base + 16, &zero64, 8)) return detail::memory_fault(ctx, base + 16);
-  if (!ctx.memory.write(base + 24, &zero16, 2)) return detail::memory_fault(ctx, base + 24);
+// FNSTENV/FLDENV and FNSAVE/FRSTOR each come in a 16-bit form with a 14-byte environment and a
+// 32-bit form with a 28-byte one, and the two lay their fields out at different offsets. FNSAVE
+// follows the environment with ST0..ST7 as eight 10-byte ext80 slots, which is what makes the
+// images exactly 94 and 108 bytes. The environment's tag word is two bits per PHYSICAL register
+// while the data slots are top-relative; crossing those two conventions is what used to lose
+// registers across a save/restore whenever TOP was not 0.
+constexpr std::size_t kX87Slots = 8;
+constexpr std::size_t kX87SlotBytes = 10;
+
+struct X87EnvLayout {
+  std::size_t fcw;
+  std::size_t fsw;
+  std::size_t ftw;
+};
+
+constexpr X87EnvLayout x87_env_layout(std::size_t env_size) {
+  // The 32-bit form widens each of these to four bytes, with the upper half reserved.
+  return env_size == 14 ? X87EnvLayout{0, 2, 4} : X87EnvLayout{0, 4, 8};
+}
+
+std::uint16_t x87_full_tag_word(const CpuState& state) {
+  std::uint16_t ftw = 0;
+  for (std::size_t phys = 0; phys < kX87Slots; ++phys) {
+    ftw |= static_cast<std::uint16_t>((state.x87_tags[phys] & 0x3u) << (phys * 2));
+  }
+  return ftw;
+}
+
+void put_le16(std::uint8_t* dst, std::uint16_t value) {
+  dst[0] = static_cast<std::uint8_t>(value);
+  dst[1] = static_cast<std::uint8_t>(value >> 8);
+}
+
+std::uint16_t get_le16(const std::uint8_t* src) {
+  return static_cast<std::uint16_t>(src[0] | (static_cast<std::uint16_t>(src[1]) << 8));
+}
+
+ExecutionResult store_x87_env(ExecutionContext& ctx, std::uint64_t base, std::size_t env_size) {
+  std::array<std::uint8_t, 28> image{};
+  const auto layout = x87_env_layout(env_size);
+  put_le16(image.data() + layout.fcw, ctx.state.get_x87_control_word());
+  put_le16(image.data() + layout.fsw, ctx.state.get_x87_status_word());
+  put_le16(image.data() + layout.ftw, x87_full_tag_word(ctx.state));
+  // FIP/FCS/FDP/FDS stay zero; this emulator does not track the x87 instruction or data pointers.
+  if (!ctx.memory.write(base, image.data(), env_size)) return detail::memory_fault(ctx, base);
   return {};
 }
 
-ExecutionResult load_x87_env(ExecutionContext& ctx, std::uint64_t base) {
-  std::uint16_t fcw = 0;
-  std::uint16_t fsw = 0;
-  std::uint16_t ftw = 0;
-  if (!ctx.memory.read(base + 0, &fcw, 2)) return detail::memory_fault(ctx, base + 0);
-  if (!ctx.memory.read(base + 2, &fsw, 2)) return detail::memory_fault(ctx, base + 2);
-  if (!ctx.memory.read(base + 4, &ftw, 2)) return detail::memory_fault(ctx, base + 4);
-  if ((fcw & 0xE0C0u) != 0) return detail::memory_fault(ctx, base);
-  ctx.state.set_x87_control_word(fcw);
-  ctx.state.set_x87_status_word(fsw);
-  for (std::size_t i = 0; i < 8; ++i) {
-    ctx.state.x87_tags[ctx.state.x87_phys_index(i)] = ((ftw >> i) & 1u) ? 0x0 : 0x3;
+ExecutionResult load_x87_env(ExecutionContext& ctx, std::uint64_t base, std::size_t env_size) {
+  std::array<std::uint8_t, 28> image{};
+  if (!ctx.memory.read(base, image.data(), env_size)) return detail::memory_fault(ctx, base);
+  const auto layout = x87_env_layout(env_size);
+  // No reserved-bit check on the control word. FLDENV loads whatever is there rather than faulting
+  // on the value, and the old check reported it as a page fault at that.
+  ctx.state.set_x87_control_word(get_le16(image.data() + layout.fcw));
+  ctx.state.set_x87_status_word(get_le16(image.data() + layout.fsw));
+  const auto ftw = get_le16(image.data() + layout.ftw);
+  for (std::size_t phys = 0; phys < kX87Slots; ++phys) {
+    ctx.state.x87_tags[phys] = static_cast<std::uint8_t>((ftw >> (phys * 2)) & 0x3u);
   }
   return {};
 }
@@ -219,47 +250,43 @@ ExecutionResult write_fpu_state(ExecutionContext& ctx, std::uint64_t base, std::
   return {};
 }
 
-ExecutionResult fsave(ExecutionContext& ctx, std::size_t env_size) {
-  (void)env_size;
+ExecutionResult fsave(ExecutionContext& ctx, std::size_t image_size) {
   const auto base = detail::memory_address(ctx);
-  if ((base & 0x7) != 0) {
-    return detail::memory_fault(ctx, base);
+  const auto env_size = image_size - (kX87Slots * kX87SlotBytes);
+  // No alignment requirement: FSAVE/FNSAVE/FRSTOR take any address on real hardware.
+  // Validate the whole image before touching anything, the same way fxsave does. Hardware faults
+  // before any of the store happens, and the x87_reset() below must not wipe guest FPU state for a
+  // save that never landed.
+  if (const auto span = validate_memory_span(ctx, base, image_size, seven::MemoryAccessKind::data_write); !span.ok()) {
+    return span;
   }
-  // Validate the whole 160-byte footprint (env + the 8 ST slots) before touching anything, the same
-  // way fxsave does. Real hardware faults before any of the store happens, and the x87_reset() below
-  // must not wipe guest FPU state for a save that never landed.
-  if (const auto span = validate_memory_span(ctx, base, 160, seven::MemoryAccessKind::data_write); !span.ok()) return span;
-  if (const auto r = write_fpu_state(ctx, base, 0); !r.ok()) return r;
-  for (std::size_t i = 0; i < 8; ++i) {
-    if (const auto r = write_fxsave_st(ctx, base, i, ctx.state.x87_get(i)); !r.ok()) return r;
+  if (const auto r = store_x87_env(ctx, base, env_size); !r.ok()) return r;
+  for (std::size_t i = 0; i < kX87Slots; ++i) {
+    std::array<std::uint8_t, kX87SlotBytes> raw{};
+    x87_encoding::encode_ext80(ctx.state.x87_get(i), raw.data());
+    const auto slot = base + env_size + (i * kX87SlotBytes);
+    if (!ctx.memory.write(slot, raw.data(), raw.size())) return detail::memory_fault(ctx, slot);
   }
   ctx.state.x87_reset();
   return {};
 }
 
-ExecutionResult frstor(ExecutionContext& ctx, std::size_t env_size) {
-  (void)env_size;
+ExecutionResult frstor(ExecutionContext& ctx, std::size_t image_size) {
   const auto base = detail::memory_address(ctx);
-  if ((base & 0x7) != 0) {
-    return detail::memory_fault(ctx, base);
+  const auto env_size = image_size - (kX87Slots * kX87SlotBytes);
+  if (const auto span = validate_memory_span(ctx, base, image_size, seven::MemoryAccessKind::data_read); !span.ok()) {
+    return span;
   }
-  if (const auto span = validate_memory_span(ctx, base, 160, seven::MemoryAccessKind::data_read); !span.ok()) return span;
-  std::uint16_t fcw = 0;
-  std::uint16_t fsw = 0;
-  std::uint8_t ftw = 0;
-  if (!ctx.memory.read(base + 0, &fcw, 2)) return detail::memory_fault(ctx, base + 0);
-  if (!ctx.memory.read(base + 2, &fsw, 2)) return detail::memory_fault(ctx, base + 2);
-  if (!ctx.memory.read(base + 4, &ftw, 1)) return detail::memory_fault(ctx, base + 4);
-  ctx.state.set_x87_control_word(fcw);
-  ctx.state.set_x87_status_word(fsw);
-  for (std::size_t i = 0; i < 8; ++i) {
-    if ((ftw >> i) & 1u) {
-      X87Scalar loaded{};
-      if (const auto r = read_fxsave_st(ctx, base, i, loaded); !r.ok()) return r;
-      ctx.state.x87_set(i, loaded);
-    } else {
-      ctx.state.x87_mark_empty(i);
-    }
+  // The environment has to land first: it carries TOP, which is what makes the top-relative slot
+  // indexing below resolve to the right physical registers.
+  if (const auto r = load_x87_env(ctx, base, env_size); !r.ok()) return r;
+  for (std::size_t i = 0; i < kX87Slots; ++i) {
+    std::array<std::uint8_t, kX87SlotBytes> raw{};
+    const auto slot = base + env_size + (i * kX87SlotBytes);
+    if (!ctx.memory.read(slot, raw.data(), raw.size())) return detail::memory_fault(ctx, slot);
+    // Straight into the stack rather than through x87_set, which would stamp the tag valid and
+    // undo the tag word the environment just restored.
+    ctx.state.x87_stack[ctx.state.x87_phys_index(i)] = x87_encoding::decode_ext80(raw.data());
   }
   return {};
 }
@@ -605,11 +632,11 @@ ExecutionResult handle_code_FSCALE(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_FLDENV_M14BYTE(ExecutionContext& ctx) {
-  return load_x87_env(ctx, detail::memory_address(ctx));
+  return load_x87_env(ctx, detail::memory_address(ctx), 14);
 }
 
 ExecutionResult handle_code_FLDENV_M28BYTE(ExecutionContext& ctx) {
-  return load_x87_env(ctx, detail::memory_address(ctx));
+  return load_x87_env(ctx, detail::memory_address(ctx), 28);
 }
 
 ExecutionResult handle_code_FLD_M32FP(ExecutionContext& ctx) {
@@ -635,7 +662,7 @@ ExecutionResult handle_code_FLD_STI(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_FNSTENV_M14BYTE(ExecutionContext& ctx) {
-  return store_x87_env(ctx, detail::memory_address(ctx));
+  return store_x87_env(ctx, detail::memory_address(ctx), 14);
 }
 
 ExecutionResult handle_code_FSTENV_M14BYTE(ExecutionContext& ctx) {
@@ -643,7 +670,7 @@ ExecutionResult handle_code_FSTENV_M14BYTE(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_FNSTENV_M28BYTE(ExecutionContext& ctx) {
-  return store_x87_env(ctx, detail::memory_address(ctx));
+  return store_x87_env(ctx, detail::memory_address(ctx), 28);
 }
 
 ExecutionResult handle_code_FSTENV_M28BYTE(ExecutionContext& ctx) {

@@ -82,7 +82,10 @@ if(NOT softfloat_POPULATED)
     "${softfloat_SOURCE_DIR}/source/8086"
   )
   target_include_directories(softfloat PRIVATE "${_sf_platform_dir}")
-  target_compile_definitions(softfloat PUBLIC SOFTFLOAT_FAST_INT64)
+  # LITTLEENDIAN has to reach consumers, not just softfloat's own sources. softfloat_types.h swaps
+  # the field order of extFloat80M on it, so a consumer compiling without it disagrees with the
+  # library about where signif and signExp live and reads both from the wrong offset.
+  target_compile_definitions(softfloat PUBLIC SOFTFLOAT_FAST_INT64 LITTLEENDIAN=1)
   if(MSVC)
     target_compile_options(softfloat PRIVATE /WX- /wd4146 /wd4244 /wd4267)
   endif()
