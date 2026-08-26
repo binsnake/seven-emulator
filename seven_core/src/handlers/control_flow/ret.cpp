@@ -24,6 +24,9 @@ ExecutionResult retf_width(ExecutionContext& ctx, std::size_t offset_width, std:
   if (auto result = pop_width(ctx, selector, 2); !result.ok()) {
     return result;
   }
+  if (!far_transfer_allowed(ctx.state, selector)) {
+    return far_transfer_fault(ctx);
+  }
   ctx.state.mode = mode_for_far_width(offset_width);
   ctx.state.sreg[1] = static_cast<std::uint16_t>(selector);
   ctx.state.rip = mask_instruction_pointer(ctx.state, target);
@@ -46,16 +49,35 @@ ExecutionResult iret_width(ExecutionContext& ctx, std::size_t offset_width, std:
     return result;
   }
 
+  if (!far_transfer_allowed(ctx.state, selector)) {
+    return far_transfer_fault(ctx);
+  }
+  const auto cpl = ctx.state.sreg[1] & 0x3u;
+  const auto iopl = (ctx.state.rflags >> 12) & 0x3u;
   ctx.state.mode = mode_for_far_width(offset_width);
   ctx.state.sreg[1] = static_cast<std::uint16_t>(selector);
   ctx.state.rip = mask_instruction_pointer(ctx.state, target);
-  if (flags_width == 8) {
-    ctx.state.rflags = flags;
-  } else if (flags_width == 4) {
-    ctx.state.rflags = (ctx.state.rflags & ~0xFFFFFFFFull) | (flags & 0xFFFFFFFFull);
-  } else {
-    ctx.state.rflags = (ctx.state.rflags & ~0xFFFFull) | (flags & 0xFFFFull);
+  // IRET is the one instruction that can legitimately rewrite the system bits, but only from the
+  // privilege level entitled to each: IOPL only at CPL 0, IF only at CPL <= IOPL. Below that they
+  // stay as they were, which is the same thing POPFQ above already does unconditionally. Without
+  // this, ring 3 could hand itself IOPL 3 and then CLI/STI, which cli_sti_allowed gates on exactly
+  // this comparison. VM/VIF/VIP are preserved outright -- nothing here emulates virtual-8086.
+  std::uint64_t protected_bits = (1ull << 17) | (1ull << 19) | (1ull << 20);
+  if (cpl != 0) {
+    protected_bits |= 3ull << 12;
   }
+  if (cpl > iopl) {
+    protected_bits |= kFlagIF;
+  }
+  std::uint64_t merged = ctx.state.rflags;
+  if (flags_width == 8) {
+    merged = flags;
+  } else if (flags_width == 4) {
+    merged = (ctx.state.rflags & ~0xFFFFFFFFull) | (flags & 0xFFFFFFFFull);
+  } else {
+    merged = (ctx.state.rflags & ~0xFFFFull) | (flags & 0xFFFFull);
+  }
+  ctx.state.rflags = (merged & ~protected_bits) | (ctx.state.rflags & protected_bits);
   ctx.control_flow_taken = true;
   return {};
 }

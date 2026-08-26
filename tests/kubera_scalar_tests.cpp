@@ -982,3 +982,85 @@ TEST(KuberaScalar, Crc32OverMemorySourcesUsesTheOperandsRealWidth) {
                EXPECT_EQ(state.gpr[2], crc32c_update(kSeed, kValue, 8));
              });
 }
+
+// sreg[1] is the only thing in this emulator that says what privilege level the guest is at, and
+// there are no descriptor tables, so a far branch writing it straight from a guest-supplied
+// selector hands the guest ring 0. Every CPL gate in the tree is derived from the same field, so
+// one RETF voids all of them at once. Real hardware faults instead: a far return can stay where it
+// is or move outward, never inward, and it validates the selector through the GDT/LDT to get there.
+
+TEST(KuberaScalar, AFarReturnCannotLowerTheCurrentPrivilegeLevel) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  constexpr std::uint64_t kStack = 0x8000;
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.sreg[1] = 0x33;  // CS selector with RPL 3 -- CPL 3
+  memory.map(kBase, 0x1000);
+  memory.map(kStack, 0x1000);
+  state.gpr[4] = kStack + 0x800;
+
+  write_bytes(memory, kBase, seven::parse_hex_bytes("48 CB"));  // retfq
+
+  // The frame this emulator's retf_width expects: 8-byte target, then a 2-byte selector.
+  const std::uint64_t target = kBase + 0x100;
+  const std::uint16_t ring0_selector = 0x08;  // RPL 0
+  ASSERT_TRUE(memory.write(kStack + 0x800, &target, sizeof(target)));
+  ASSERT_TRUE(memory.write(kStack + 0x808, &ring0_selector, sizeof(ring0_selector)));
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::general_protection);
+  EXPECT_EQ(state.sreg[1] & 0x3u, 3u) << "CPL must not have dropped";
+}
+
+TEST(KuberaScalar, AFarReturnThatKeepsOrRaisesItsPrivilegeLevelStillWorks) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  constexpr std::uint64_t kStack = 0x8000;
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.sreg[1] = 0x2B;  // CPL 3
+  memory.map(kBase, 0x1000);
+  memory.map(kStack, 0x1000);
+  state.gpr[4] = kStack + 0x800;
+
+  write_bytes(memory, kBase, seven::parse_hex_bytes("48 CB"));  // retfq
+
+  const std::uint64_t target = kBase + 0x100;
+  const std::uint16_t same_ring_selector = 0x33;  // RPL 3, same level
+  ASSERT_TRUE(memory.write(kStack + 0x800, &target, sizeof(target)));
+  ASSERT_TRUE(memory.write(kStack + 0x808, &same_ring_selector, sizeof(same_ring_selector)));
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::none);
+  EXPECT_EQ(state.rip, target);
+  EXPECT_EQ(state.sreg[1], 0x33u);
+}
+
+TEST(KuberaScalar, IretDoesNotLetRingThreeRewriteItsOwnIopl) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  constexpr std::uint64_t kStack = 0x8000;
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.sreg[1] = 0x33;   // CPL 3
+  state.rflags = 0x202;   // IOPL 0
+  memory.map(kBase, 0x1000);
+  memory.map(kStack, 0x1000);
+  state.gpr[4] = kStack + 0x800;
+
+  write_bytes(memory, kBase, seven::parse_hex_bytes("48 CF"));  // iretq
+
+  const std::uint64_t target = kBase + 0x100;
+  const std::uint16_t same_ring_selector = 0x33;
+  const std::uint64_t flags = 0x3202;  // IOPL 3
+  ASSERT_TRUE(memory.write(kStack + 0x800, &target, sizeof(target)));
+  ASSERT_TRUE(memory.write(kStack + 0x808, &same_ring_selector, sizeof(same_ring_selector)));
+  ASSERT_TRUE(memory.write(kStack + 0x80A, &flags, sizeof(flags)));
+
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+  EXPECT_EQ((state.rflags >> 12) & 0x3u, 0u) << "IOPL is writable only from CPL 0";
+}

@@ -80,6 +80,9 @@ ExecutionResult handle_code_CALL_M1616(ExecutionContext& ctx) {
   if (auto result = read_far_mem(ctx, 2, target, selector); result.reason != StopReason::none) {
     return result;
   }
+  if (!far_transfer_allowed(ctx.state, selector)) {
+    return far_transfer_fault(ctx);
+  }
   if (auto result = push_far_return(ctx, selector, ctx.next_rip, 2); result.reason != StopReason::none) {
     return result;
   }
@@ -95,6 +98,9 @@ ExecutionResult handle_code_CALL_M1632(ExecutionContext& ctx) {
   std::uint16_t selector = 0;
   if (auto result = read_far_mem(ctx, 4, target, selector); result.reason != StopReason::none) {
     return result;
+  }
+  if (!far_transfer_allowed(ctx.state, selector)) {
+    return far_transfer_fault(ctx);
   }
   if (auto result = push_far_return(ctx, selector, ctx.next_rip, 4); result.reason != StopReason::none) {
     return result;
@@ -112,6 +118,9 @@ ExecutionResult handle_code_CALL_M1664(ExecutionContext& ctx) {
   if (auto result = read_far_mem(ctx, 8, target, selector); result.reason != StopReason::none) {
     return result;
   }
+  if (!far_transfer_allowed(ctx.state, selector)) {
+    return far_transfer_fault(ctx);
+  }
   if (auto result = push_far_return(ctx, selector, ctx.next_rip, 8); result.reason != StopReason::none) {
     return result;
   }
@@ -125,6 +134,9 @@ ExecutionResult handle_code_CALL_M1664(ExecutionContext& ctx) {
 ExecutionResult handle_code_CALL_PTR1616(ExecutionContext& ctx) {
   const std::uint16_t selector = ctx.instr.far_branch_selector();
   const std::uint16_t target = ctx.instr.far_branch16();
+  if (!far_transfer_allowed(ctx.state, selector)) {
+    return far_transfer_fault(ctx);
+  }
   if (auto result = push_far_return(ctx, selector, ctx.next_rip, 2); result.reason != StopReason::none) {
     return result;
   }
@@ -138,6 +150,9 @@ ExecutionResult handle_code_CALL_PTR1616(ExecutionContext& ctx) {
 ExecutionResult handle_code_CALL_PTR1632(ExecutionContext& ctx) {
   const std::uint16_t selector = ctx.instr.far_branch_selector();
   const std::uint64_t target = ctx.instr.far_branch32();
+  if (!far_transfer_allowed(ctx.state, selector)) {
+    return far_transfer_fault(ctx);
+  }
   if (auto result = push_far_return(ctx, selector, ctx.next_rip, 4); result.reason != StopReason::none) {
     return result;
   }

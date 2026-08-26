@@ -227,6 +227,24 @@ ExecutionResult call_rm_width(ExecutionContext& ctx, std::size_t width) {
   return {};
 }
 
+// sreg[1] is the only thing in this emulator that records the current privilege level -- every CPL
+// gate in the tree, and cli_sti_allowed's IOPL comparison, reads it and nothing else. The far
+// branches all load it straight from a guest-supplied selector (off the stack, out of memory, or
+// out of the instruction's own bytes), so without this one RETF or IRET puts the guest at CPL 0 and
+// voids all of those at once. On hardware a far transfer may keep the current privilege level or
+// move outward, never inward; gaining privilege needs a call gate or SYSCALL/SYSENTER, each of
+// which validates through a descriptor table. There are no descriptor tables here -- gdtr is
+// host-written and read nowhere -- so the selector's RPL is all there is to check, but it is the
+// half that matters.
+[[nodiscard]] inline bool far_transfer_allowed(const CpuState& state, std::uint64_t selector) noexcept {
+  return (selector & 0x3u) >= (state.sreg[1] & 0x3u);
+}
+
+[[nodiscard]] inline ExecutionResult far_transfer_fault(ExecutionContext& ctx) {
+  return {StopReason::general_protection, 0,
+          ExceptionInfo{StopReason::general_protection, ctx.state.rip, 0}, ctx.instr.code()};
+}
+
 ExecutionResult ret_width(ExecutionContext& ctx, std::size_t width, std::uint16_t imm16) {
   std::uint64_t target = 0;
   if (auto result = pop_width(ctx, target, width); !result.ok()) {
