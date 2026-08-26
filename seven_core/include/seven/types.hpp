@@ -206,11 +206,16 @@ struct CpuState {
   }
 
   bool x87_pop() noexcept {
-    if (x87_tags[x87_top] == 0x3) {
+    // Every other x87_tags access in the tree resolves its index through x87_phys_index or a
+    // literal bound; this was the one place that read x87_top raw and trusted every writer to have
+    // masked it. Masking here makes the 0..7 invariant hold at the point of use instead of being a
+    // contract each writer has to remember, which is a promise a deserializer has already broken.
+    const auto phys = x87_phys_index(0);
+    if (x87_tags[phys] == 0x3) {
       return false;
     }
-    x87_tags[x87_top] = 0x3;
-    x87_top = static_cast<std::uint8_t>((x87_top + 1) & 0x7);
+    x87_tags[phys] = 0x3;
+    x87_top = static_cast<std::uint8_t>((phys + 1) & 0x7);
     set_x87_top(x87_top);
     return true;
   }

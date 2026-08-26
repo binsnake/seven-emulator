@@ -1170,7 +1170,14 @@ class seven_x86_64_emulator final : public x86_64_emulator {
     d.read(state_.mxcsr);
     d.read(state_.x87_control_word);
     d.read(state_.x87_status_word);
-    d.read(state_.x87_top);
+    {
+      // Straight into the field, this was the one writer in either repo that skipped the 0..7 mask
+      // every other one applies. x87_top indexes an 8-entry array, so a byte of 8..255 out of a
+      // blob reached past it -- inside CpuState, but past the array all the same.
+      std::uint8_t top{};
+      d.read(top);
+      state_.set_x87_top(top);
+    }
     d.read(state_.gdtr.base);
     d.read(state_.gdtr.limit);
     d.read(state_.idtr.base);
@@ -1191,6 +1198,11 @@ class seven_x86_64_emulator final : public x86_64_emulator {
       uint64_t val{};
       d.read(id);
       d.read(val);
+      // Same ceiling write_msr enforces on the guest-driven path, for the same reason: the count
+      // here is just a number out of the blob, and this map is otherwise free to grow to it.
+      if (state_.msr.size() >= 4096) {
+        continue;
+      }
       state_.msr.emplace(id, val);
     }
 
