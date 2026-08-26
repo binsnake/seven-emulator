@@ -132,6 +132,29 @@ TEST(KuberaLiveness, MaskedWriteSurvivesMovCrUdFaultViaRun) {
   EXPECT_NE(state.rflags & seven::kFlagZF, 0u);
 }
 
+TEST(KuberaLiveness, MaskedWriteSurvivesWrmsrGpFaultViaRun) {
+  // Same shape as MaskedWriteSurvivesMovCrUdFaultViaRun, but for the CPL0-only system
+  // instructions (CLTS/SWAPGS/WRMSR*/RDMSR*/XSETBV) added to can_fault() alongside CR/DR --
+  // WRMSR reads its operands from fixed registers (ECX/EAX/EDX), never an OpKind::MEMORY operand,
+  // so it needs the same explicit can_fault() case. CPL 3 makes it #GP before ever writing the MSR.
+  seven::CpuState state{};
+  seven::Memory memory{};
+  seven::Executor executor{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.gpr[4] = kStackTop;
+  state.sreg[1] = 0x2B;  // CS selector with RPL 3 -- CPL 3
+  write_bytes(memory, kBase, {0x48, 0x01, 0xD8, 0x0F, 0x30});  // add rax,rbx ; wrmsr
+  state.gpr[0] = 0xFFFFFFFFFFFFFFFFull;  // rax
+  state.gpr[3] = 1ull;                   // rbx
+
+  const auto result = executor.run(state, memory, 100);
+  ASSERT_EQ(result.reason, seven::StopReason::general_protection);
+  EXPECT_EQ(state.gpr[0], 0u);
+  EXPECT_NE(state.rflags & seven::kFlagCF, 0u);
+  EXPECT_NE(state.rflags & seven::kFlagZF, 0u);
+}
+
 TEST(KuberaLiveness, JitBypassEligibleReflectsHooksAndTrapState) {
   // jit_bypass_eligible() is a narrow public surface for an external native-codegen consumer (see
   // seven-jit's JitExecutor) to ask "can I run my own code for a span of instructions without

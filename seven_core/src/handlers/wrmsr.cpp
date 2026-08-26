@@ -2,7 +2,25 @@
 
 namespace seven::handlers {
 
+namespace {
+
+[[nodiscard]] bool cpl_is_zero(const CpuState& state) {
+  return (state.sreg[1] & 0x3u) == 0;
+}
+
+[[nodiscard]] ExecutionResult gp_fault(ExecutionContext& ctx) {
+  return {StopReason::general_protection, 0, ExceptionInfo{StopReason::general_protection, ctx.state.rip, 0}, ctx.instr.code()};
+}
+
+}  // namespace
+
+// WRMSR/WRMSRNS/WRMSRLIST are CPL0-only on real hardware (#GP(0) otherwise) -- any privilege
+// level could otherwise overwrite an arbitrary MSR, including ones (STAR/LSTAR/FMASK/
+// KERNEL_GS_BASE) that other privilege levels rely on for their own control-flow/addressing.
 ExecutionResult handle_code_WRMSR(ExecutionContext& ctx) {
+  if (!cpl_is_zero(ctx.state)) {
+    return gp_fault(ctx);
+  }
   const auto ecx = static_cast<std::uint32_t>(detail::read_register(ctx.state, iced_x86::Register::ECX));
   const std::uint64_t eax = detail::read_register(ctx.state, iced_x86::Register::EAX);
   const std::uint64_t edx = detail::read_register(ctx.state, iced_x86::Register::EDX);
@@ -11,6 +29,9 @@ ExecutionResult handle_code_WRMSR(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_WRMSRNS(ExecutionContext& ctx) {
+  if (!cpl_is_zero(ctx.state)) {
+    return gp_fault(ctx);
+  }
   bool msr_ok = false;
   const auto msr_index = static_cast<std::uint32_t>(detail::read_operand(ctx, 0, 4, &msr_ok));
   if (!msr_ok) {
@@ -23,6 +44,9 @@ ExecutionResult handle_code_WRMSRNS(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_WRMSRLIST(ExecutionContext& ctx) {
+  if (!cpl_is_zero(ctx.state)) {
+    return gp_fault(ctx);
+  }
   const auto rdi = detail::read_register(ctx.state, iced_x86::Register::RDI);
   const auto rsi = detail::read_register(ctx.state, iced_x86::Register::RSI);
   if (((rdi | rsi) & 0x7ull) != 0ull) {

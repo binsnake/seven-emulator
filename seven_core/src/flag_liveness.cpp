@@ -341,6 +341,15 @@ bool can_fault(const iced_x86::Instruction& instr) noexcept {
     case iced_x86::Code::MOV_R32_DR: case iced_x86::Code::MOV_R64_DR:
     case iced_x86::Code::MOV_DR_R32: case iced_x86::Code::MOV_DR_R64:
       return true;
+
+    // Same implicit-fault gap as the CR/DR moves above -- these read their operands from fixed
+    // registers (ECX/EAX/EDX) or state, never an explicit OpKind::MEMORY operand, but now #GP at
+    // CPL>0 (see clts.cpp/swapgs.cpp/wrmsr.cpp/rdmsr.cpp/xsetbv.cpp).
+    case iced_x86::Code::CLTS: case iced_x86::Code::SWAPGS:
+    case iced_x86::Code::WRMSR: case iced_x86::Code::WRMSRNS: case iced_x86::Code::WRMSRLIST:
+    case iced_x86::Code::RDMSR: case iced_x86::Code::RDMSRLIST:
+    case iced_x86::Code::XSETBV:
+      return true;
     default:
       return false;
   }

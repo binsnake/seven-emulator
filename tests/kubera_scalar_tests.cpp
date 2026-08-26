@@ -372,6 +372,83 @@ TEST(KuberaScalar, MovCrRoundTripsArchitecturallyValidRegister) {
   EXPECT_EQ(state.gpr[3], 0xFull);  // ebx, zero-extended
 }
 
+TEST(KuberaScalar, CltsRequiresCplZero) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.sreg[1] = 0x2B;  // CS selector with RPL 3 -- CPL 3
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("0F 06"));  // clts
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::general_protection);
+}
+
+TEST(KuberaScalar, SwapgsRequiresCplZero) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.sreg[1] = 0x2B;  // CPL 3
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("0F 01 F8"));  // swapgs
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::general_protection);
+}
+
+TEST(KuberaScalar, WrmsrRequiresCplZero) {
+  // Ordinary user-mode code being able to rewrite an arbitrary MSR (STAR/LSTAR/FMASK/
+  // KERNEL_GS_BASE and friends) is a real privilege violation, not just a fidelity gap.
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.sreg[1] = 0x2B;  // CPL 3
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("0F 30"));  // wrmsr
+  state.gpr[1] = 0xC0000082;  // ecx: LSTAR
+  state.gpr[0] = 0xDEAD;      // eax
+  state.gpr[2] = 0;           // edx
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::general_protection);
+}
+
+TEST(KuberaScalar, RdmsrRequiresCplZero) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.sreg[1] = 0x2B;  // CPL 3
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("0F 32"));  // rdmsr
+  state.gpr[1] = 0xC0000082;  // ecx: LSTAR
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::general_protection);
+}
+
+TEST(KuberaScalar, XsetbvRequiresCplZero) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.sreg[1] = 0x2B;  // CPL 3
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("0F 01 D1"));  // xsetbv
+  state.gpr[1] = 0;  // ecx: XCR0
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::general_protection);
+}
+
 TEST(KuberaScalar, RdsspReportsNoShadowStack) {
   run_single(seven::parse_hex_bytes("F3 48 0F 1E CA"),
              [](seven::CpuState& state, seven::Memory&) {
