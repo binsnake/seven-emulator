@@ -600,3 +600,45 @@ TEST(KuberaMemory, AReentrantHookCannotSwapTheInstructionUnderTheOuterHandler) {
   EXPECT_EQ(state.gpr[0], 3u) << "the outer add rax, rbx has to be the one that ran";
   EXPECT_EQ(state.gpr[1], 100u) << "the nested instruction's operands must not leak into it";
 }
+
+// A passthrough embedder replaces Memory's page table wholesale, so nothing stamps a PageEntry and
+// page_code_epoch() read back 0 for every page forever. Neither the decode cache nor a compiled
+// block ever went stale, and self-modifying code through a passthrough kept running the bytes it
+// was first decoded from.
+
+TEST(KuberaMemory, SelfModifyingCodeThroughAPassthroughInvalidatesTheDecodeCache) {
+  std::array<std::uint8_t, 0x1000> backing{};
+  backing[0] = 0x48;  // add rax, rcx
+  backing[1] = 0x01;
+  backing[2] = 0xC8;
+
+  seven::Memory memory{};
+  memory.set_passthrough(
+      [&](std::uint64_t address, void* dst, std::size_t size) {
+        if (address < 0x1000 || address + size > 0x1000 + backing.size()) return false;
+        std::memcpy(dst, backing.data() + (address - 0x1000), size);
+        return true;
+      },
+      [&](std::uint64_t address, const void* src, std::size_t size) {
+        if (address < 0x1000 || address + size > 0x1000 + backing.size()) return false;
+        std::memcpy(backing.data() + (address - 0x1000), src, size);
+        return true;
+      });
+
+  seven::CpuState state{};
+  state.mode = seven::ExecutionMode::long64;
+  state.gpr[0] = 10;  // rax
+  state.gpr[1] = 3;   // rcx
+
+  seven::Executor executor{};
+  state.rip = 0x1000;
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+  EXPECT_EQ(state.gpr[0], 13u) << "sanity: add rax, rcx";
+
+  const std::uint8_t sub_opcode = 0x29;  // add -> sub
+  ASSERT_TRUE(memory.write(0x1001, &sub_opcode, 1));
+
+  state.rip = 0x1000;
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+  EXPECT_EQ(state.gpr[0], 10u) << "the rewritten sub rax, rcx has to be what ran";
+}

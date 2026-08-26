@@ -343,7 +343,15 @@ bool Memory::write(std::uint64_t address, const void* src, std::size_t size, Mem
     if (access_wraps(address, size)) {
       return false;
     }
-    return passthrough_write_(address, src, size);
+    if (!passthrough_write_(address, src, size)) {
+      return false;
+    }
+    // A passthrough can't tell us whether what it just wrote was executable, so every write has to
+    // count as one that might have rewritten code. page_code_epoch() reports this counter for every
+    // page while a passthrough is installed, which is what makes cached decodes and compiled blocks
+    // go stale at all in that configuration.
+    ++code_epoch_;
+    return true;
   }
   // Fast path: no hooks, no MMIO, single-page access. Bypasses access_allowed
   // and all multi-page bookkeeping. We still maintain code_epoch for write

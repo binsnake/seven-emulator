@@ -156,6 +156,14 @@ class Memory {
   // of everything. Values share code_epoch_'s counter so a remapped page never reuses an old one's
   // epoch; an unmapped page reads back 0.
   [[nodiscard]] std::uint64_t page_code_epoch(std::uint64_t page_index) const noexcept {
+    // A passthrough embedder owns the whole address space, so there are no PageEntries to stamp and
+    // every page would otherwise read back 0 forever -- meaning no decode cache and no compiled
+    // block ever went stale, and self-modifying code through a passthrough replayed the bytes it
+    // was first compiled from. There is no per-page information to be had in that configuration, so
+    // every page reports the global counter and any write invalidates everything.
+    if (passthrough_read_) {
+      return code_epoch_;
+    }
     const auto* entry = lookup_page(page_index);
     return entry != nullptr ? entry->code_epoch : 0;
   }
