@@ -23,8 +23,12 @@ ExecutionResult read_bt_base_value(ExecutionContext& ctx, std::size_t width, std
     // out-of-bounds addresses (seven-fuzzer finding).
     const auto shift = static_cast<unsigned>(std::countr_zero(bit_span));
     const auto elem_index = static_cast<std::int64_t>(bit_index) >> shift;
-    const auto address = static_cast<std::uint64_t>(
-        static_cast<std::int64_t>(detail::memory_address(ctx)) + elem_index * static_cast<std::int64_t>(width));
+    // Unsigned throughout: the signed form overflows int64 for a base near the top of the address
+    // space, which is undefined rather than the wraparound it looks like. Casting the (possibly
+    // negative) element index to uint64 first gives the identical two's-complement result with
+    // defined behaviour, and the range check downstream is what actually rejects a bad address.
+    const auto address = detail::memory_address(ctx) +
+        static_cast<std::uint64_t>(elem_index) * static_cast<std::uint64_t>(width);
     bit_out = bit_index & (bit_span - 1ull);
     return detail::read_memory_checked(ctx, address, &value_out, width);
   }

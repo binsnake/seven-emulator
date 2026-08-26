@@ -20,8 +20,10 @@ ExecutionResult bts_rmw(ExecutionContext& ctx, std::size_t width, std::uint64_t 
     // floor division (arithmetic shift), not unsigned truncating division.
     const auto shift = static_cast<unsigned>(std::countr_zero(bit_span));
     const auto elem_index = static_cast<std::int64_t>(bit_index) >> shift;
-    address = static_cast<std::uint64_t>(
-        static_cast<std::int64_t>(detail::memory_address(ctx)) + elem_index * static_cast<std::int64_t>(width));
+    // See bt.cpp: unsigned throughout, since the signed form overflows int64 near the top of the
+    // address space and that is undefined, not wraparound.
+    address = detail::memory_address(ctx) +
+        static_cast<std::uint64_t>(elem_index) * static_cast<std::uint64_t>(width);
     bit = bit_index & (bit_span - 1ull);
     const auto rr = detail::read_memory_checked(ctx, address, &value, width);
     if (!rr.ok()) {
