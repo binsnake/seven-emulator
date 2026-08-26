@@ -456,12 +456,12 @@ StopReason Executor::violation_reason() const noexcept {
 // run before anything external -- the step() caller, a fault hook, a debugger -- can observe
 // rflags. Three separate things can break that guarantee, all now handled:
 //   1. The caller simply not calling step() again (a bare step() call, a debugger single-stepping,
-//      devirt-suite's tracer). Fixed by never trusting the cache's mask on a raw step() call --
+//      an external tracer). Fixed by never trusting the cache's mask on a raw step() call --
 //      only step_impl's allow_masking=true path (used exclusively by run()'s own internal loop,
 //      which really does keep advancing) may apply it.
 //   2. A FAULT partway through the covering span (page fault on a memory operand, a divide error)
 //      -- exposes state to a fault hook or the caller before the cover happens, and this is not
-//      hypothetical: VMProtect-style guard pages and SEH-based obfuscation routinely fault as
+//      hypothetical: guard-page tricks and SEH-based control-flow obfuscation routinely fault as
 //      normal operation, and exception handlers commonly read the full CONTEXT/EFlags. Fixed in
 //      flag_liveness.cpp: any fault-capable instruction (can_fault()) is treated as reading every
 //      flag, which forces liveness back to "everything live" at that point and makes masking
@@ -893,7 +893,7 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
     // PUSHD_IMM32 / PUSHD_IMM8 (dword operand size), but in 64-bit mode PUSH imm defaults to a 64-bit
     // stack slot (rsp -= 8). normalize_reported_code maps those to the PUSHQ_* forms; previously that
     // mapping only affected the *reported* code while dispatch used the raw code, so seven executed the
-    // 4-byte handler (rsp -= 4) -- corrupting the stack for any VMProtect VM that pushes an imm.
+    // 4-byte handler (rsp -= 4) -- corrupting the stack for any guest code that pushes an imm.
     const auto code = reported_code;
     // The precomputed mask is only actually trustworthy right now if: (1) the caller guarantees
     // it will keep draining through the rest of the block (allow_masking -- only run() promises

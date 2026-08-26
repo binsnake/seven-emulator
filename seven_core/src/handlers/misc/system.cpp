@@ -87,7 +87,7 @@ ExecutionResult handle_code_POPFQ(ExecutionContext& ctx) {
   // seven emulates ring 3 only. At CPL 3 (IOPL 0) POPFQ CANNOT modify IF/IOPL/VIF/VIP/VM and it
   // clears RF -- it never disables interrupts. Measured on an i9-11900K: user-mode POPF always
   // leaves IF=1 regardless of the popped value. Blindly loading IF (as before) let it go to 0,
-  // which VMProtect's baked flag checks then detect. Preserve the system bits, force IF=1, clear RF.
+  // which naive flag checks in obfuscated code would then detect. Preserve the system bits, force IF=1, clear RF.
   constexpr std::uint64_t kSysBits = kFlagIF | (3ull << 12) | (1ull << 17) | (1ull << 19) | (1ull << 20);
   constexpr std::uint64_t kRF = 1ull << 16;
   ctx.state.rflags = (value & ~kSysBits & ~kRF) | (ctx.state.rflags & kSysBits);
