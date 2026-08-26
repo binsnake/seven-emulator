@@ -460,3 +460,110 @@ TEST(KuberaSimd, EvexBroadcastRepeatsTheElementNotTheWholeOperand) {
                }
              });
 }
+
+TEST(KuberaSimd, PackedArithmeticRequiresAnAlignedMemoryOperand) {
+  std::vector<std::uint8_t> bytes;
+  const auto mem = iced_x86::MemoryOperand::with_base_displ(iced_x86::Register::RAX, 0);
+  const auto instr = iced_x86::InstructionFactory::with2(iced_x86::Code::ADDPS_XMM_XMMM128, iced_x86::Register::XMM0, mem);
+  ASSERT_TRUE(encode_to_bytes(instr, bytes, "addps xmm0, [rax]"));
+
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.rflags = 0x202;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, bytes);
+  memory.map(0x8000, 0x1000);
+  std::vector<std::uint8_t> src(16, 0);
+  ASSERT_TRUE(memory.write(0x8000, src.data(), src.size()));
+  set_reg(state, iced_x86::Register::RAX, 0x8004);
+  set_xmm_u64(state, 0, 0, 0);
+
+  EXPECT_EQ(executor.step(state, memory).reason, seven::StopReason::general_protection);
+}
+
+TEST(KuberaSimd, PackedSqrtRequiresAnAlignedMemoryOperand) {
+  std::vector<std::uint8_t> bytes;
+  const auto mem = iced_x86::MemoryOperand::with_base_displ(iced_x86::Register::RAX, 0);
+  const auto instr = iced_x86::InstructionFactory::with2(iced_x86::Code::SQRTPD_XMM_XMMM128, iced_x86::Register::XMM0, mem);
+  ASSERT_TRUE(encode_to_bytes(instr, bytes, "sqrtpd xmm0, [rax]"));
+
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.rflags = 0x202;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, bytes);
+  memory.map(0x8000, 0x1000);
+  std::vector<std::uint8_t> src(16, 0);
+  ASSERT_TRUE(memory.write(0x8000, src.data(), src.size()));
+  set_reg(state, iced_x86::Register::RAX, 0x8008);
+  set_xmm_u64(state, 0, 0, 0);
+
+  EXPECT_EQ(executor.step(state, memory).reason, seven::StopReason::general_protection);
+}
+
+// x86 MIN/MAX are defined as one compare with a fixed tie-break -- (SRC1 < SRC2) ? SRC1 : SRC2 --
+// so SRC2 wins whenever the comparison is false: either operand a NaN, or both operands zero of
+// whatever sign. std::fmin/std::fmax, which every MIN/MAX handler used, return the operand that is
+// NOT a NaN and pick a zero by value, so a guest reading a NaN back out of MINPS got the wrong lane.
+
+TEST(KuberaSimd, MinpsFollowsX86OperandOrderForNanAndSignedZero) {
+  std::vector<std::uint8_t> bytes;
+  const auto instr = iced_x86::InstructionFactory::with2(
+      iced_x86::Code::MINPS_XMM_XMMM128, iced_x86::Register::XMM0, iced_x86::Register::XMM1);
+  ASSERT_TRUE(encode_to_bytes(instr, bytes, "minps xmm0, xmm1"));
+
+  run_single(bytes,
+             [](seven::CpuState& state, seven::Memory&) {
+               // lanes, low to high: 1.0 vs 3.0 | 2.0 vs QNaN | QNaN vs 5.0 | +0.0 vs -0.0
+               set_xmm_u64(state, 0, 0x40000000'3F800000ull, 0x00000000'7FC00000ull);
+               set_xmm_u64(state, 1, 0x7FC00000'40400000ull, 0x80000000'40A00000ull);
+             },
+             [](const seven::ExecutionResult&, const seven::CpuState& state, const seven::Memory&) {
+               EXPECT_EQ(xmm_u64(state, 0, 0), 0x7FC00000'3F800000ull)
+                   << "lane 0 takes the smaller SRC1; lane 1 must take SRC2's NaN";
+               EXPECT_EQ(xmm_u64(state, 0, 1), 0x80000000'40A00000ull)
+                   << "a NaN in SRC1 yields SRC2, and +0.0 against -0.0 yields SRC2";
+             });
+}
+
+TEST(KuberaSimd, MaxpsFollowsX86OperandOrderForNanAndSignedZero) {
+  std::vector<std::uint8_t> bytes;
+  const auto instr = iced_x86::InstructionFactory::with2(
+      iced_x86::Code::MAXPS_XMM_XMMM128, iced_x86::Register::XMM0, iced_x86::Register::XMM1);
+  ASSERT_TRUE(encode_to_bytes(instr, bytes, "maxps xmm0, xmm1"));
+
+  run_single(bytes,
+             [](seven::CpuState& state, seven::Memory&) {
+               // lanes, low to high: 9.0 vs 3.0 | 2.0 vs QNaN | QNaN vs 5.0 | +0.0 vs -0.0
+               set_xmm_u64(state, 0, 0x40000000'41100000ull, 0x00000000'7FC00000ull);
+               set_xmm_u64(state, 1, 0x7FC00000'40400000ull, 0x80000000'40A00000ull);
+             },
+             [](const seven::ExecutionResult&, const seven::CpuState& state, const seven::Memory&) {
+               EXPECT_EQ(xmm_u64(state, 0, 0), 0x7FC00000'41100000ull)
+                   << "lane 0 takes the larger SRC1; lane 1 must take SRC2's NaN";
+               EXPECT_EQ(xmm_u64(state, 0, 1), 0x80000000'40A00000ull)
+                   << "a NaN in SRC1 yields SRC2, and +0.0 against -0.0 yields SRC2 even for MAX";
+             });
+}
+
+TEST(KuberaSimd, ScalarMinsdAlsoTakesSrc2WhenEitherOperandIsNan) {
+  std::vector<std::uint8_t> bytes;
+  const auto instr = iced_x86::InstructionFactory::with2(
+      iced_x86::Code::MINSD_XMM_XMMM64, iced_x86::Register::XMM0, iced_x86::Register::XMM1);
+  ASSERT_TRUE(encode_to_bytes(instr, bytes, "minsd xmm0, xmm1"));
+
+  run_single(bytes,
+             [](seven::CpuState& state, seven::Memory&) {
+               set_xmm_u64(state, 0, 0x4000000000000000ull, 0);  // 2.0
+               set_xmm_u64(state, 1, 0x7FF8000000000000ull, 0);  // QNaN
+             },
+             [](const seven::ExecutionResult&, const seven::CpuState& state, const seven::Memory&) {
+               EXPECT_EQ(xmm_u64(state, 0, 0), 0x7FF8000000000000ull);
+             });
+}

@@ -186,11 +186,32 @@ void set_sse_cmp_flags(CpuState& state, int relation) {
   state.rflags = rf;
 }
 
+// x86 MIN/MAX are not IEEE minNum/maxNum and not std::fmin/fmax. The SDM spells them out as a
+// single compare with a fixed tie-break: DEST := (SRC1 < SRC2) ? SRC1 : SRC2, which falls to SRC2
+// whenever the comparison is false -- when either operand is a NaN, and when both are zeros of
+// whatever sign. std::fmin does the opposite for NaN (it returns the operand that is NOT a NaN), so
+// a guest that fed a NaN in as the second source read back the first one instead of the NaN, and
+// min(+0.0, -0.0) picked by value rather than by operand order. Every MIN/MAX in the file, legacy,
+// VEX and EVEX alike, went through those two.
+template <typename T>
+[[nodiscard]] T x86_min(T src1, T src2) noexcept {
+  return src1 < src2 ? src1 : src2;
+}
+
+template <typename T>
+[[nodiscard]] T x86_max(T src1, T src2) noexcept {
+  return src1 > src2 ? src1 : src2;
+}
+
 template <typename T, typename Fn>
 ExecutionResult packed_binary(ExecutionContext& ctx, Fn&& fn, bool zero_upper = false) {
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
+  // Only the legacy XMM/m128 forms reach here (the VEX ones go through vex_packed_binary), and every
+  // one of them requires a 16-byte-aligned memory source -- #GP(0) otherwise, the same rule the
+  // logic and integer families already enforce. Register sources fall straight through.
+  if (auto fault = detail::require_aligned_memory_operand(ctx, 1, 0xFULL)) return *fault;
   bool ok = false;
   const auto dst_reg = ctx.instr.op_register(0);
   const auto lhs_bits = read_vec(ctx.state, dst_reg);
@@ -301,6 +322,8 @@ ExecutionResult packed_unary(ExecutionContext& ctx, Fn&& fn, bool zero_upper = f
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
+  // Same legacy m128 alignment requirement as packed_binary above.
+  if (auto fault = detail::require_aligned_memory_operand(ctx, 1, 0xFULL)) return *fault;
   const auto dst_reg = ctx.instr.op_register(0);
   const auto input_bits = read_vec(ctx.state, dst_reg);
   big_uint out = input_bits;
@@ -781,10 +804,10 @@ KUBERA_PACKED_BIN(MULPS_XMM_XMMM128, float, [](float a, float b) { return a * b;
 KUBERA_PACKED_BIN(MULPD_XMM_XMMM128, double, [](double a, double b) { return a * b; })
 KUBERA_PACKED_BIN(DIVPS_XMM_XMMM128, float, [](float a, float b) { return a / b; })
 KUBERA_PACKED_BIN(DIVPD_XMM_XMMM128, double, [](double a, double b) { return a / b; })
-KUBERA_PACKED_BIN(MINPS_XMM_XMMM128, float, [](float a, float b) { return std::fmin(a, b); })
-KUBERA_PACKED_BIN(MINPD_XMM_XMMM128, double, [](double a, double b) { return std::fmin(a, b); })
-KUBERA_PACKED_BIN(MAXPS_XMM_XMMM128, float, [](float a, float b) { return std::fmax(a, b); })
-KUBERA_PACKED_BIN(MAXPD_XMM_XMMM128, double, [](double a, double b) { return std::fmax(a, b); })
+KUBERA_PACKED_BIN(MINPS_XMM_XMMM128, float, [](float a, float b) { return x86_min(a, b); })
+KUBERA_PACKED_BIN(MINPD_XMM_XMMM128, double, [](double a, double b) { return x86_min(a, b); })
+KUBERA_PACKED_BIN(MAXPS_XMM_XMMM128, float, [](float a, float b) { return x86_max(a, b); })
+KUBERA_PACKED_BIN(MAXPD_XMM_XMMM128, double, [](double a, double b) { return x86_max(a, b); })
 KUBERA_PACKED_UNARY(SQRTPS_XMM_XMMM128, float, [](float a) { return std::sqrt(a); })
 KUBERA_PACKED_UNARY(SQRTPD_XMM_XMMM128, double, [](double a) { return std::sqrt(a); })
 ExecutionResult handle_code_ADDSUBPS_XMM_XMMM128(ExecutionContext& ctx) { return packed_addsub<float>(ctx); }
@@ -802,10 +825,10 @@ KUBERA_SCALAR_BIN(MULSS_XMM_XMMM32, float, [](float a, float b) { return a * b; 
 KUBERA_SCALAR_BIN(MULSD_XMM_XMMM64, double, [](double a, double b) { return a * b; })
 KUBERA_SCALAR_BIN(DIVSS_XMM_XMMM32, float, [](float a, float b) { return a / b; })
 KUBERA_SCALAR_BIN(DIVSD_XMM_XMMM64, double, [](double a, double b) { return a / b; })
-KUBERA_SCALAR_BIN(MINSS_XMM_XMMM32, float, [](float a, float b) { return std::fmin(a, b); })
-KUBERA_SCALAR_BIN(MINSD_XMM_XMMM64, double, [](double a, double b) { return std::fmin(a, b); })
-KUBERA_SCALAR_BIN(MAXSS_XMM_XMMM32, float, [](float a, float b) { return std::fmax(a, b); })
-KUBERA_SCALAR_BIN(MAXSD_XMM_XMMM64, double, [](double a, double b) { return std::fmax(a, b); })
+KUBERA_SCALAR_BIN(MINSS_XMM_XMMM32, float, [](float a, float b) { return x86_min(a, b); })
+KUBERA_SCALAR_BIN(MINSD_XMM_XMMM64, double, [](double a, double b) { return x86_min(a, b); })
+KUBERA_SCALAR_BIN(MAXSS_XMM_XMMM32, float, [](float a, float b) { return x86_max(a, b); })
+KUBERA_SCALAR_BIN(MAXSD_XMM_XMMM64, double, [](double a, double b) { return x86_max(a, b); })
 KUBERA_SCALAR_UNARY(SQRTSS_XMM_XMMM32, float, [](float a) { return std::sqrt(a); })
 KUBERA_SCALAR_UNARY(SQRTSD_XMM_XMMM64, double, [](double a) { return std::sqrt(a); })
 
@@ -1193,14 +1216,14 @@ KUBERA_VEX_PACKED_BIN(VEX_VDIVPS_XMM_XMM_XMMM128, float, [](float a, float b) { 
 KUBERA_VEX_PACKED_BIN(VEX_VDIVPD_XMM_XMM_XMMM128, double, [](double a, double b) { return a / b; })
 KUBERA_VEX_PACKED_BIN(VEX_VDIVPS_YMM_YMM_YMMM256, float, [](float a, float b) { return a / b; })
 KUBERA_VEX_PACKED_BIN(VEX_VDIVPD_YMM_YMM_YMMM256, double, [](double a, double b) { return a / b; })
-KUBERA_VEX_PACKED_BIN(VEX_VMINPS_XMM_XMM_XMMM128, float, [](float a, float b) { return std::fmin(a, b); })
-KUBERA_VEX_PACKED_BIN(VEX_VMINPD_XMM_XMM_XMMM128, double, [](double a, double b) { return std::fmin(a, b); })
-KUBERA_VEX_PACKED_BIN(VEX_VMINPS_YMM_YMM_YMMM256, float, [](float a, float b) { return std::fmin(a, b); })
-KUBERA_VEX_PACKED_BIN(VEX_VMINPD_YMM_YMM_YMMM256, double, [](double a, double b) { return std::fmin(a, b); })
-KUBERA_VEX_PACKED_BIN(VEX_VMAXPS_XMM_XMM_XMMM128, float, [](float a, float b) { return std::fmax(a, b); })
-KUBERA_VEX_PACKED_BIN(VEX_VMAXPD_XMM_XMM_XMMM128, double, [](double a, double b) { return std::fmax(a, b); })
-KUBERA_VEX_PACKED_BIN(VEX_VMAXPS_YMM_YMM_YMMM256, float, [](float a, float b) { return std::fmax(a, b); })
-KUBERA_VEX_PACKED_BIN(VEX_VMAXPD_YMM_YMM_YMMM256, double, [](double a, double b) { return std::fmax(a, b); })
+KUBERA_VEX_PACKED_BIN(VEX_VMINPS_XMM_XMM_XMMM128, float, [](float a, float b) { return x86_min(a, b); })
+KUBERA_VEX_PACKED_BIN(VEX_VMINPD_XMM_XMM_XMMM128, double, [](double a, double b) { return x86_min(a, b); })
+KUBERA_VEX_PACKED_BIN(VEX_VMINPS_YMM_YMM_YMMM256, float, [](float a, float b) { return x86_min(a, b); })
+KUBERA_VEX_PACKED_BIN(VEX_VMINPD_YMM_YMM_YMMM256, double, [](double a, double b) { return x86_min(a, b); })
+KUBERA_VEX_PACKED_BIN(VEX_VMAXPS_XMM_XMM_XMMM128, float, [](float a, float b) { return x86_max(a, b); })
+KUBERA_VEX_PACKED_BIN(VEX_VMAXPD_XMM_XMM_XMMM128, double, [](double a, double b) { return x86_max(a, b); })
+KUBERA_VEX_PACKED_BIN(VEX_VMAXPS_YMM_YMM_YMMM256, float, [](float a, float b) { return x86_max(a, b); })
+KUBERA_VEX_PACKED_BIN(VEX_VMAXPD_YMM_YMM_YMMM256, double, [](double a, double b) { return x86_max(a, b); })
 KUBERA_VEX_PACKED_UNARY(VEX_VSQRTPS_XMM_XMM_XMMM128, float, [](float a) { return std::sqrt(a); })
 KUBERA_VEX_PACKED_UNARY(VEX_VSQRTPD_XMM_XMM_XMMM128, double, [](double a) { return std::sqrt(a); })
 KUBERA_VEX_PACKED_UNARY(VEX_VSQRTPS_YMM_YMM_YMMM256, float, [](float a) { return std::sqrt(a); })
@@ -1214,10 +1237,10 @@ KUBERA_VEX_SCALAR_BIN(VEX_VMULSS_XMM_XMM_XMMM32, float, [](float a, float b) { r
 KUBERA_VEX_SCALAR_BIN(VEX_VMULSD_XMM_XMM_XMMM64, double, [](double a, double b) { return a * b; })
 KUBERA_VEX_SCALAR_BIN(VEX_VDIVSS_XMM_XMM_XMMM32, float, [](float a, float b) { return a / b; })
 KUBERA_VEX_SCALAR_BIN(VEX_VDIVSD_XMM_XMM_XMMM64, double, [](double a, double b) { return a / b; })
-KUBERA_VEX_SCALAR_BIN(VEX_VMINSS_XMM_XMM_XMMM32, float, [](float a, float b) { return std::fmin(a, b); })
-KUBERA_VEX_SCALAR_BIN(VEX_VMINSD_XMM_XMM_XMMM64, double, [](double a, double b) { return std::fmin(a, b); })
-KUBERA_VEX_SCALAR_BIN(VEX_VMAXSS_XMM_XMM_XMMM32, float, [](float a, float b) { return std::fmax(a, b); })
-KUBERA_VEX_SCALAR_BIN(VEX_VMAXSD_XMM_XMM_XMMM64, double, [](double a, double b) { return std::fmax(a, b); })
+KUBERA_VEX_SCALAR_BIN(VEX_VMINSS_XMM_XMM_XMMM32, float, [](float a, float b) { return x86_min(a, b); })
+KUBERA_VEX_SCALAR_BIN(VEX_VMINSD_XMM_XMM_XMMM64, double, [](double a, double b) { return x86_min(a, b); })
+KUBERA_VEX_SCALAR_BIN(VEX_VMAXSS_XMM_XMM_XMMM32, float, [](float a, float b) { return x86_max(a, b); })
+KUBERA_VEX_SCALAR_BIN(VEX_VMAXSD_XMM_XMM_XMMM64, double, [](double a, double b) { return x86_max(a, b); })
 KUBERA_VEX_SCALAR_UNARY(VEX_VSQRTSS_XMM_XMM_XMMM32, float, [](float a) { return std::sqrt(a); })
 KUBERA_VEX_SCALAR_UNARY(VEX_VSQRTSD_XMM_XMM_XMMM64, double, [](double a) { return std::sqrt(a); })
 
@@ -1267,18 +1290,18 @@ KUBERA_VEX_PACKED_BIN(EVEX_VDIVPS_YMM_K1Z_YMM_YMMM256, float, [](float a, float 
 KUBERA_VEX_PACKED_BIN(EVEX_VDIVPD_YMM_K1Z_YMM_YMMM256, double, [](double a, double b) { return a / b; })
 KUBERA_VEX_PACKED_BIN(EVEX_VDIVPS_ZMM_K1Z_ZMM_ZMMM512, float, [](float a, float b) { return a / b; })
 KUBERA_VEX_PACKED_BIN(EVEX_VDIVPD_ZMM_K1Z_ZMM_ZMMM512, double, [](double a, double b) { return a / b; })
-KUBERA_VEX_PACKED_BIN(EVEX_VMINPS_XMM_K1Z_XMM_XMMM128, float, [](float a, float b) { return std::fmin(a, b); })
-KUBERA_VEX_PACKED_BIN(EVEX_VMINPD_XMM_K1Z_XMM_XMMM128, double, [](double a, double b) { return std::fmin(a, b); })
-KUBERA_VEX_PACKED_BIN(EVEX_VMINPS_YMM_K1Z_YMM_YMMM256, float, [](float a, float b) { return std::fmin(a, b); })
-KUBERA_VEX_PACKED_BIN(EVEX_VMINPD_YMM_K1Z_YMM_YMMM256, double, [](double a, double b) { return std::fmin(a, b); })
-KUBERA_VEX_PACKED_BIN(EVEX_VMINPS_ZMM_K1Z_ZMM_ZMMM512, float, [](float a, float b) { return std::fmin(a, b); })
-KUBERA_VEX_PACKED_BIN(EVEX_VMINPD_ZMM_K1Z_ZMM_ZMMM512, double, [](double a, double b) { return std::fmin(a, b); })
-KUBERA_VEX_PACKED_BIN(EVEX_VMAXPS_XMM_K1Z_XMM_XMMM128, float, [](float a, float b) { return std::fmax(a, b); })
-KUBERA_VEX_PACKED_BIN(EVEX_VMAXPD_XMM_K1Z_XMM_XMMM128, double, [](double a, double b) { return std::fmax(a, b); })
-KUBERA_VEX_PACKED_BIN(EVEX_VMAXPS_YMM_K1Z_YMM_YMMM256, float, [](float a, float b) { return std::fmax(a, b); })
-KUBERA_VEX_PACKED_BIN(EVEX_VMAXPD_YMM_K1Z_YMM_YMMM256, double, [](double a, double b) { return std::fmax(a, b); })
-KUBERA_VEX_PACKED_BIN(EVEX_VMAXPS_ZMM_K1Z_ZMM_ZMMM512, float, [](float a, float b) { return std::fmax(a, b); })
-KUBERA_VEX_PACKED_BIN(EVEX_VMAXPD_ZMM_K1Z_ZMM_ZMMM512, double, [](double a, double b) { return std::fmax(a, b); })
+KUBERA_VEX_PACKED_BIN(EVEX_VMINPS_XMM_K1Z_XMM_XMMM128, float, [](float a, float b) { return x86_min(a, b); })
+KUBERA_VEX_PACKED_BIN(EVEX_VMINPD_XMM_K1Z_XMM_XMMM128, double, [](double a, double b) { return x86_min(a, b); })
+KUBERA_VEX_PACKED_BIN(EVEX_VMINPS_YMM_K1Z_YMM_YMMM256, float, [](float a, float b) { return x86_min(a, b); })
+KUBERA_VEX_PACKED_BIN(EVEX_VMINPD_YMM_K1Z_YMM_YMMM256, double, [](double a, double b) { return x86_min(a, b); })
+KUBERA_VEX_PACKED_BIN(EVEX_VMINPS_ZMM_K1Z_ZMM_ZMMM512, float, [](float a, float b) { return x86_min(a, b); })
+KUBERA_VEX_PACKED_BIN(EVEX_VMINPD_ZMM_K1Z_ZMM_ZMMM512, double, [](double a, double b) { return x86_min(a, b); })
+KUBERA_VEX_PACKED_BIN(EVEX_VMAXPS_XMM_K1Z_XMM_XMMM128, float, [](float a, float b) { return x86_max(a, b); })
+KUBERA_VEX_PACKED_BIN(EVEX_VMAXPD_XMM_K1Z_XMM_XMMM128, double, [](double a, double b) { return x86_max(a, b); })
+KUBERA_VEX_PACKED_BIN(EVEX_VMAXPS_YMM_K1Z_YMM_YMMM256, float, [](float a, float b) { return x86_max(a, b); })
+KUBERA_VEX_PACKED_BIN(EVEX_VMAXPD_YMM_K1Z_YMM_YMMM256, double, [](double a, double b) { return x86_max(a, b); })
+KUBERA_VEX_PACKED_BIN(EVEX_VMAXPS_ZMM_K1Z_ZMM_ZMMM512, float, [](float a, float b) { return x86_max(a, b); })
+KUBERA_VEX_PACKED_BIN(EVEX_VMAXPD_ZMM_K1Z_ZMM_ZMMM512, double, [](double a, double b) { return x86_max(a, b); })
 KUBERA_VEX_PACKED_UNARY(EVEX_VSQRTPS_XMM_K1Z_XMM_XMMM128, float, [](float a) { return std::sqrt(a); })
 KUBERA_VEX_PACKED_UNARY(EVEX_VSQRTPD_XMM_K1Z_XMM_XMMM128, double, [](double a) { return std::sqrt(a); })
 KUBERA_VEX_PACKED_UNARY(EVEX_VSQRTPS_YMM_K1Z_YMM_YMMM256, float, [](float a) { return std::sqrt(a); })
@@ -1294,10 +1317,10 @@ KUBERA_VEX_SCALAR_BIN(EVEX_VMULSS_XMM_K1Z_XMM_XMMM32, float, [](float a, float b
 KUBERA_VEX_SCALAR_BIN(EVEX_VMULSD_XMM_K1Z_XMM_XMMM64, double, [](double a, double b) { return a * b; })
 KUBERA_VEX_SCALAR_BIN(EVEX_VDIVSS_XMM_K1Z_XMM_XMMM32, float, [](float a, float b) { return a / b; })
 KUBERA_VEX_SCALAR_BIN(EVEX_VDIVSD_XMM_K1Z_XMM_XMMM64, double, [](double a, double b) { return a / b; })
-KUBERA_VEX_SCALAR_BIN(EVEX_VMINSS_XMM_K1Z_XMM_XMMM32, float, [](float a, float b) { return std::fmin(a, b); })
-KUBERA_VEX_SCALAR_BIN(EVEX_VMINSD_XMM_K1Z_XMM_XMMM64, double, [](double a, double b) { return std::fmin(a, b); })
-KUBERA_VEX_SCALAR_BIN(EVEX_VMAXSS_XMM_K1Z_XMM_XMMM32, float, [](float a, float b) { return std::fmax(a, b); })
-KUBERA_VEX_SCALAR_BIN(EVEX_VMAXSD_XMM_K1Z_XMM_XMMM64, double, [](double a, double b) { return std::fmax(a, b); })
+KUBERA_VEX_SCALAR_BIN(EVEX_VMINSS_XMM_K1Z_XMM_XMMM32, float, [](float a, float b) { return x86_min(a, b); })
+KUBERA_VEX_SCALAR_BIN(EVEX_VMINSD_XMM_K1Z_XMM_XMMM64, double, [](double a, double b) { return x86_min(a, b); })
+KUBERA_VEX_SCALAR_BIN(EVEX_VMAXSS_XMM_K1Z_XMM_XMMM32, float, [](float a, float b) { return x86_max(a, b); })
+KUBERA_VEX_SCALAR_BIN(EVEX_VMAXSD_XMM_K1Z_XMM_XMMM64, double, [](double a, double b) { return x86_max(a, b); })
 KUBERA_VEX_SCALAR_UNARY(EVEX_VSQRTSS_XMM_K1Z_XMM_XMMM32, float, [](float a) { return std::sqrt(a); })
 KUBERA_VEX_SCALAR_UNARY(EVEX_VSQRTSD_XMM_K1Z_XMM_XMMM64, double, [](double a) { return std::sqrt(a); })
 
