@@ -473,14 +473,19 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
       return false;
     };
 
-    const auto rip_page_epoch = memory.page_code_epoch(state.rip / Memory::kPageSize);
+    const auto rip_page = state.rip / Memory::kPageSize;
+    const auto rip_page_epoch = memory.page_code_epoch(rip_page);
     // Epoch of the page holding an instruction's final byte. Only differs from rip's own page for
-    // one that straddles a boundary; `spans` is false when the span runs off the end of the address
-    // space, which is never cacheable.
+    // one that straddles a boundary, which is the only case worth a second lookup; `spans` is false
+    // when the span runs off the end of the address space, which is never cacheable.
     const auto last_byte_epoch = [&](std::uint32_t length, bool& spans) -> std::uint64_t {
       const auto last_byte = state.rip + (length - 1);
       spans = last_byte >= state.rip;
-      return spans ? memory.page_code_epoch(last_byte / Memory::kPageSize) : 0;
+      if (!spans) {
+        return 0;
+      }
+      const auto last_page = last_byte / Memory::kPageSize;
+      return last_page == rip_page ? rip_page_epoch : memory.page_code_epoch(last_page);
     };
     const bool can_use_decode_cache =
         !nested && !memory.has_fetch_access_hooks() && !decode_cache_disabled_by_env_;
@@ -660,9 +665,8 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
           // fetch window fitting inside one page, so every instruction it decodes lives on rip's
           // page and shares its epoch. Bail rather than stamp the wrong one if that ever changes.
           const auto next_last_byte = next_rip + (next_decoded.value().length() - 1);
-          if (next_rip / Memory::kPageSize != state.rip / Memory::kPageSize ||
-              next_last_byte < next_rip ||
-              next_last_byte / Memory::kPageSize != state.rip / Memory::kPageSize) {
+          if (next_rip / Memory::kPageSize != rip_page || next_last_byte < next_rip ||
+              next_last_byte / Memory::kPageSize != rip_page) {
             break;
           }
           auto& next_entry = (*decode_cache_)[next_index];
