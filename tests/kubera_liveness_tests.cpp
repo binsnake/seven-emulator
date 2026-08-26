@@ -3,6 +3,11 @@
 
 #include <gtest/gtest.h>
 
+#include <span>
+
+#include <iced_x86/decoder.hpp>
+
+#include "seven/flag_liveness.hpp"
 #include "seven/handler_helpers.hpp"
 
 // Regression tests for the flag-liveness masking soundness fix: masking a flag write because a
@@ -244,4 +249,30 @@ TEST(KuberaLiveness, TakenJrcxzIsABlockBoundarySoEarlierFlagWriteIsNotElided) {
   EXPECT_EQ(state.rip, kBase + 6);
   EXPECT_NE(state.rflags & seven::kFlagZF, 0u)
       << "add's ZF write was elided by a cmp that the taken jrcxz skipped over";
+}
+
+// can_fault() decides two separate things: whether flag liveness must stay conservative across an
+// instruction, and (in seven-jit) whether the JIT's callout bridge may inline it. Its operand loop
+// tests for OpKind::MEMORY, but iced gives the string instructions their own operand kinds --
+// MEMORY_SEG_RSI / MEMORY_ESRDI and the 16/32-bit variants, all distinct enum values from MEMORY --
+// so MOVS/CMPS/SCAS/STOS/LODS fell through to the explicit switch, which never listed them, and
+// can_fault() reported false for instructions whose whole purpose is touching guest memory. Exactly
+// the implicit-memory-access gap the CALL/RET and PUSH/POP entries in that switch already exist to
+// close.
+TEST(KuberaLiveness, StringInstructionsAreRecognizedAsFaultCapable) {
+  struct Case { const char* name; const char* bytes; };
+  // rep-prefixed and bare forms both decode to the same underlying string Code.
+  const Case cases[] = {
+      {"movsb", "A4"},   {"movsq", "48 A5"}, {"cmpsb", "A6"},   {"cmpsq", "48 A7"},
+      {"scasb", "AE"},   {"scasq", "48 AF"}, {"stosb", "AA"},   {"stosq", "48 AB"},
+      {"lodsb", "AC"},   {"lodsq", "48 AD"},
+  };
+  for (const auto& c : cases) {
+    const auto raw = seven::parse_hex_bytes(c.bytes);
+    iced_x86::Decoder decoder(64, std::span<const std::uint8_t>(raw.data(), raw.size()), 0x1000);
+    const auto decoded = decoder.decode();
+    ASSERT_TRUE(decoded.has_value()) << c.name;
+    EXPECT_TRUE(seven::can_fault(decoded.value()))
+        << c.name << " reads or writes guest memory, so it must be treated as fault-capable";
+  }
 }
