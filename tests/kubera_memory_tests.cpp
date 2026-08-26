@@ -1,5 +1,8 @@
+#include <array>
 #include <cstdint>
 #include <cstring>
+#include <optional>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -130,4 +133,99 @@ TEST(KuberaMemory, TopOfAddressSpacePageIsActuallyMappedUnmappedAndReprotected) 
 
   memory.unmap(kTopPage, 0x1000);
   EXPECT_FALSE(memory.is_mapped(kTopPage, 0x1000));
+}
+
+// Memory::read/write took a single-page fast path guarded by `first_offset + size <= kPageSize`.
+// size is a full-width size_t, so that sum wraps: an access based in page 0 whose size covers the
+// rest of the address space produced a sum of exactly 2^64, which reads as 0 and sails through the
+// guard straight into a memcpy of ~2^64 bytes out of (or into) a 4096-byte page buffer.
+TEST(KuberaMemory, HugeSizeCannotWrapPastTheSinglePageFastPath) {
+  seven::Memory memory{};
+  memory.map(0, seven::Memory::kPageSize);
+
+  // Last byte of page 0, sized so that kBase + kSize lands exactly on 2^64. The access itself does
+  // not wrap, so a top-of-address-space check alone would let it past, but first_offset + kSize
+  // does. Basing it on the final byte keeps the correct slow path down to a single byte before it
+  // runs out of mapped pages, so the buffer below is all the destination this can legitimately use.
+  constexpr std::uint64_t kBase = seven::Memory::kPageSize - 1;
+  constexpr std::size_t kSize = static_cast<std::size_t>(~std::uint64_t{0} - kBase + 1);
+
+  std::uint8_t scratch[64]{};
+  EXPECT_FALSE(memory.read(kBase, scratch, kSize));
+  EXPECT_FALSE(memory.write(kBase, scratch, kSize));
+}
+
+// The page-walking loops advance a plain uint64 cursor, so an access starting near the top of the
+// address space used to wrap to zero and carry on reading (or writing) page 0. Hardware faults
+// there instead of wrapping, and quietly splicing in unrelated memory is worse than either.
+TEST(KuberaMemory, AccessRunningOffTheTopOfMemoryFailsInsteadOfWrappingToPageZero) {
+  seven::Memory memory{};
+  constexpr std::uint64_t kTopPage = ~std::uint64_t{0} - seven::Memory::kPageSize + 1;
+  memory.map(kTopPage, seven::Memory::kPageSize);
+  memory.map(0, seven::Memory::kPageSize);
+
+  const std::vector<std::uint8_t> marker(seven::Memory::kPageSize, 0xAB);
+  ASSERT_TRUE(memory.write(0, marker.data(), marker.size()));
+
+  constexpr std::uint64_t kStart = ~std::uint64_t{0} - 0xFF;  // last 256 bytes
+  std::array<std::uint8_t, 0x200> buffer{};
+  EXPECT_FALSE(memory.read(kStart, buffer.data(), buffer.size()));
+  EXPECT_FALSE(memory.write(kStart, buffer.data(), buffer.size()));
+  EXPECT_FALSE(memory.is_mapped(kStart, buffer.size()));
+
+  // Page 0 must be untouched by the rejected write.
+  std::array<std::uint8_t, 8> readback{};
+  ASSERT_TRUE(memory.read(0, readback.data(), readback.size()));
+  EXPECT_EQ(readback[0], 0xAB);
+
+  // An access ending exactly on the last byte is legal and must still work.
+  EXPECT_TRUE(memory.read(kStart, buffer.data(), 0x100));
+}
+
+// page_range_end rounds its end up, so with an unaligned base a size of 0 used to resolve to one
+// page. reprotect is the sharp edge: an empty request could revoke (or grant) permissions on a
+// page the caller never named.
+TEST(KuberaMemory, ZeroSizedRangeNeverTouchesAPage) {
+  seven::Memory memory{};
+  memory.map(0x1000, seven::Memory::kPageSize, static_cast<seven::MemoryPermissionMask>(seven::MemoryPermission::read) |
+                                                   static_cast<seven::MemoryPermissionMask>(seven::MemoryPermission::write));
+
+  const std::uint32_t value = 0x11223344;
+  ASSERT_TRUE(memory.write(0x1000, &value, sizeof(value)));
+
+  memory.reprotect(0x1800, 0, static_cast<seven::MemoryPermissionMask>(seven::MemoryPermission::read));
+  std::uint32_t probe = 0;
+  EXPECT_TRUE(memory.write(0x1000, &value, sizeof(value))) << "a zero-sized reprotect must not revoke write access";
+  EXPECT_TRUE(memory.read(0x1000, &probe, sizeof(probe)));
+  EXPECT_EQ(probe, value);
+
+  memory.unmap(0x1800, 0);
+  EXPECT_TRUE(memory.is_mapped(0x1000, 1)) << "a zero-sized unmap must not erase a page";
+}
+
+// Every other mmio mutator refreshes jit_fast_path_blocked. restore_mmio_regions did not, so a
+// snapshot restore left compiled code believing the raw-page fast path was still safe while mmio
+// regions were live again, and the callbacks never fired for anything also backed by a real page.
+TEST(KuberaMemory, RestoringMmioRegionsBlocksTheJitFastPathAgain) {
+  seven::Memory memory{};
+  ASSERT_FALSE(memory.jit_fast_path_blocked);
+
+  const auto id = memory.map_mmio(
+      0x4000, seven::Memory::kPageSize,
+      [](std::uint64_t, void*, std::size_t) { return true; },
+      [](std::uint64_t, const void*, std::size_t) { return true; });
+  ASSERT_NE(id, 0u);
+  ASSERT_TRUE(memory.jit_fast_path_blocked);
+
+  const auto regions = memory.snapshot_mmio_regions();
+  ASSERT_EQ(regions.size(), 1u);
+
+  seven::Memory restored{};
+  ASSERT_FALSE(restored.jit_fast_path_blocked);
+  restored.restore_mmio_regions(regions, [](const seven::Memory::MmioRegionSnapshot&) {
+    return std::make_optional(std::make_pair(
+        seven::Memory::MmioReadCallback{[](std::uint64_t, void*, std::size_t) { return true; }},
+        seven::Memory::MmioWriteCallback{[](std::uint64_t, const void*, std::size_t) { return true; }}));
+  });
+  EXPECT_TRUE(restored.jit_fast_path_blocked);
 }

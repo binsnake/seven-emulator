@@ -23,6 +23,16 @@ std::uint64_t page_range_end(std::uint64_t base, std::size_t size) noexcept {
   return (end / Memory::kPageSize) + ((end % Memory::kPageSize) != 0 ? 1 : 0);
 }
 
+// True when [base, base+size) runs off the top of the address space. Hardware faults there rather
+// than wrapping to zero, and the page-walking loops below all advance a plain uint64 cursor, so
+// without this they would happily carry on splicing in whatever lives at address 0.
+bool access_wraps(std::uint64_t base, std::size_t size) noexcept {
+  if (size == 0) {
+    return false;
+  }
+  return base + (static_cast<std::uint64_t>(size) - 1) < base;
+}
+
 }  // namespace
 
 Memory::PageEntry* Memory::lookup_page(std::uint64_t page_index) const noexcept {
@@ -56,6 +66,12 @@ void Memory::clear_passthrough() {
 }
 
 void Memory::map(std::uint64_t base, std::size_t size, MemoryPermissionMask permissions) {
+  // An empty range must not touch anything. page_range_end rounds its end up, so with an unaligned
+  // base a size of 0 otherwise resolves to one page and this quietly maps, erases or reprotects a
+  // page the caller never named.
+  if (size == 0) {
+    return;
+  }
   ++page_epoch_;
   // map() may insert new entries; std::unordered_map insertion can rehash and
   // invalidate iterators, but does not invalidate references / pointers to
@@ -81,6 +97,12 @@ void Memory::map(std::uint64_t base, std::size_t size, MemoryPermissionMask perm
 }
 
 void Memory::unmap(std::uint64_t base, std::size_t size) {
+  // An empty range must not touch anything. page_range_end rounds its end up, so with an unaligned
+  // base a size of 0 otherwise resolves to one page and this quietly maps, erases or reprotects a
+  // page the caller never named.
+  if (size == 0) {
+    return;
+  }
   ++page_epoch_;
   ++code_epoch_;
   invalidate_tlb();  // erase invalidates references; flush TLB
@@ -95,6 +117,12 @@ void Memory::unmap(std::uint64_t base, std::size_t size) {
 }
 
 void Memory::reprotect(std::uint64_t base, std::size_t size, MemoryPermissionMask permissions) {
+  // An empty range must not touch anything. page_range_end rounds its end up, so with an unaligned
+  // base a size of 0 otherwise resolves to one page and this quietly maps, erases or reprotects a
+  // page the caller never named.
+  if (size == 0) {
+    return;
+  }
   ++page_epoch_;
   // Reprotect does not erase entries, so cached PageEntry* pointers stay
   // valid. Permissions are read through the pointer, so we don't have to
@@ -117,6 +145,9 @@ void Memory::reprotect(std::uint64_t base, std::size_t size, MemoryPermissionMas
 }
 
 bool Memory::is_mapped(std::uint64_t address, std::size_t size) const {
+  if (access_wraps(address, size)) {
+    return false;
+  }
   std::size_t remaining = size;
   std::uint64_t current = address;
   while (remaining != 0) {
@@ -133,6 +164,9 @@ bool Memory::is_mapped(std::uint64_t address, std::size_t size) const {
 }
 
 bool Memory::has_permissions(std::uint64_t address, std::size_t size, MemoryPermissionMask required) const {
+  if (access_wraps(address, size)) {
+    return false;
+  }
   std::size_t remaining = size;
   std::uint64_t current = address;
   while (remaining != 0) {
@@ -157,6 +191,9 @@ bool Memory::has_permissions(std::uint64_t address, std::size_t size, MemoryPerm
 }
 
 bool Memory::read(std::uint64_t address, void* dst, std::size_t size, MemoryAccessKind kind) const {
+  if (access_wraps(address, size)) {
+    return false;
+  }
   if (passthrough_read_) return passthrough_read_(address, dst, size);
   // Fast path: most reads in real workloads are entirely within a single page
   // and target a non-MMIO address with no access hooks installed. Inline that
@@ -164,7 +201,9 @@ bool Memory::read(std::uint64_t address, void* dst, std::size_t size, MemoryAcce
   if (!has_any_access_hooks_ && mmio_regions_.empty()) [[likely]] {
     const auto first_page = address / kPageSize;
     const auto first_offset = address % kPageSize;
-    if (first_offset + size <= kPageSize) [[likely]] {
+    // Not `first_offset + size <= kPageSize`: size is a full-width size_t, so that sum wraps and a
+    // huge size sails through the single-page guard straight into the memcpy below.
+    if (size <= kPageSize - first_offset) [[likely]] {
       auto* entry = lookup_page(first_page);
       if (entry == nullptr || !has_permission(entry->permissions, kind)) {
         return false;
@@ -227,6 +266,9 @@ bool Memory::read(std::uint64_t address, void* dst, std::size_t size, MemoryAcce
 }
 
 bool Memory::read_unchecked(std::uint64_t address, void* dst, std::size_t size) const {
+  if (access_wraps(address, size)) {
+    return false;
+  }
   if (const auto* mmio = find_mmio_region(address, size)) {
     return mmio->on_read != nullptr ? mmio->on_read(address - mmio->base, dst, size) : false;
   }
@@ -272,7 +314,9 @@ bool Memory::write(std::uint64_t address, const void* src, std::size_t size, Mem
   if (!has_any_access_hooks_ && mmio_regions_.empty()) [[likely]] {
     const auto first_page = address / kPageSize;
     const auto first_offset = address % kPageSize;
-    if (first_offset + size <= kPageSize) [[likely]] {
+    // Not `first_offset + size <= kPageSize`: size is a full-width size_t, so that sum wraps and a
+    // huge size sails through the single-page guard straight into the memcpy below.
+    if (size <= kPageSize - first_offset) [[likely]] {
       auto* entry = lookup_page(first_page);
       if (entry == nullptr || !has_permission(entry->permissions, kind)) {
         return false;
@@ -286,6 +330,13 @@ bool Memory::write(std::uint64_t address, const void* src, std::size_t size, Mem
   }
 
   if (!access_allowed(MemoryAccessEvent{kind, address, size, src, size})) {
+    return false;
+  }
+  // Deliberately after access_allowed rather than at the top of the function: a range-scoped write
+  // hook has to keep getting the chance to see and veto a wrapping access, which is the property
+  // the overlap-check fix relies on. The single-page fast path above cannot be reached by a
+  // wrapping access anyway, since one always straddles the last page boundary.
+  if (access_wraps(address, size)) {
     return false;
   }
   if (const auto* mmio = find_mmio_region(address, size)) {
@@ -315,6 +366,9 @@ bool Memory::write(std::uint64_t address, const void* src, std::size_t size, Mem
 }
 
 bool Memory::write_unchecked(std::uint64_t address, const void* src, std::size_t size) {
+  if (access_wraps(address, size)) {
+    return false;
+  }
   if (const auto* mmio = find_mmio_region(address, size)) {
     return mmio->on_write != nullptr ? mmio->on_write(address - mmio->base, src, size) : false;
   }
@@ -501,6 +555,10 @@ void Memory::restore_mmio_regions(const std::vector<MmioRegionSnapshot>& regions
       mmio_max_end_ = std::max(mmio_max_end_, region.base + region.size);
     }
   }
+  // Every other mmio mutator refreshes this. Without it a restore that brings regions back into an
+  // empty Memory leaves compiled code believing it can still take the raw-page fast path, so the
+  // mmio callbacks never fire for anything that is also backed by a real page.
+  refresh_jit_fast_path_blocked();
 }
 
 void Memory::apply_pending_access_hook_ops() {
