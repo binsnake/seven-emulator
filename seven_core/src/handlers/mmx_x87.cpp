@@ -152,19 +152,20 @@ uint8_t x87_ftw(const CpuState& state) {
   return ftw;
 }
 
-void store_x87_env(ExecutionContext& ctx, std::uint64_t base) {
+ExecutionResult store_x87_env(ExecutionContext& ctx, std::uint64_t base) {
   const std::uint16_t fcw = ctx.state.get_x87_control_word();
   const std::uint16_t fsw = ctx.state.get_x87_status_word();
   const std::uint16_t ftw = static_cast<std::uint16_t>(x87_ftw(ctx.state));
   const std::uint16_t zero16 = 0;
   const std::uint64_t zero64 = 0;
-  ctx.memory.write(base + 0, &fcw, 2);
-  ctx.memory.write(base + 2, &fsw, 2);
-  ctx.memory.write(base + 4, &ftw, 2);
-  ctx.memory.write(base + 6, &zero16, 2);
-  ctx.memory.write(base + 8, &zero64, 8);
-  ctx.memory.write(base + 16, &zero64, 8);
-  ctx.memory.write(base + 24, &zero16, 2);
+  if (!ctx.memory.write(base + 0, &fcw, 2)) return detail::memory_fault(ctx, base + 0);
+  if (!ctx.memory.write(base + 2, &fsw, 2)) return detail::memory_fault(ctx, base + 2);
+  if (!ctx.memory.write(base + 4, &ftw, 2)) return detail::memory_fault(ctx, base + 4);
+  if (!ctx.memory.write(base + 6, &zero16, 2)) return detail::memory_fault(ctx, base + 6);
+  if (!ctx.memory.write(base + 8, &zero64, 8)) return detail::memory_fault(ctx, base + 8);
+  if (!ctx.memory.write(base + 16, &zero64, 8)) return detail::memory_fault(ctx, base + 16);
+  if (!ctx.memory.write(base + 24, &zero16, 2)) return detail::memory_fault(ctx, base + 24);
+  return {};
 }
 
 ExecutionResult load_x87_env(ExecutionContext& ctx, std::uint64_t base) {
@@ -183,36 +184,39 @@ ExecutionResult load_x87_env(ExecutionContext& ctx, std::uint64_t base) {
   return {};
 }
 
-void write_fxsave_st(ExecutionContext& ctx, std::uint64_t base, std::size_t phys, X87Scalar value) {
+ExecutionResult write_fxsave_st(ExecutionContext& ctx, std::uint64_t base, std::size_t phys, X87Scalar value) {
   std::array<std::uint8_t, 16> raw{};
   x87_encoding::encode_ext80(value, raw.data());
   const auto slot = base + 32 + (phys * 16);
   for (std::size_t i = 0; i < raw.size(); ++i) {
-    ctx.memory.write(slot + i, &raw[i], 1);
+    if (!ctx.memory.write(slot + i, &raw[i], 1)) return detail::memory_fault(ctx, slot + i);
   }
+  return {};
 }
 
-X87Scalar read_fxsave_st(ExecutionContext& ctx, std::uint64_t base, std::size_t phys) {
+ExecutionResult read_fxsave_st(ExecutionContext& ctx, std::uint64_t base, std::size_t phys, X87Scalar& out) {
   std::array<std::uint8_t, 16> raw{};
   const auto slot = base + 32 + (phys * 16);
   for (std::size_t i = 0; i < raw.size(); ++i) {
-    ctx.memory.read(slot + i, &raw[i], 1);
+    if (!ctx.memory.read(slot + i, &raw[i], 1)) return detail::memory_fault(ctx, slot + i);
   }
-  return x87_encoding::decode_ext80(raw.data());
+  out = x87_encoding::decode_ext80(raw.data());
+  return {};
 }
 
-void write_fpu_state(ExecutionContext& ctx, std::uint64_t base, std::size_t offset) {
+ExecutionResult write_fpu_state(ExecutionContext& ctx, std::uint64_t base, std::size_t offset) {
   const std::uint16_t fcw = ctx.state.get_x87_control_word();
   const std::uint16_t fsw = ctx.state.get_x87_status_word();
   const std::uint8_t ftw = x87_ftw(ctx.state);
   const std::uint64_t zero64 = 0;
-  ctx.memory.write(base + offset + 0, &fcw, 2);
-  ctx.memory.write(base + offset + 2, &fsw, 2);
-  ctx.memory.write(base + offset + 4, &ftw, 1);
-  ctx.memory.write(base + offset + 5, &zero64, 1);
-  ctx.memory.write(base + offset + 6, &zero64, 2);
-  ctx.memory.write(base + offset + 8, &zero64, 8);
-  ctx.memory.write(base + offset + 16, &zero64, 8);
+  if (!ctx.memory.write(base + offset + 0, &fcw, 2)) return detail::memory_fault(ctx, base + offset + 0);
+  if (!ctx.memory.write(base + offset + 2, &fsw, 2)) return detail::memory_fault(ctx, base + offset + 2);
+  if (!ctx.memory.write(base + offset + 4, &ftw, 1)) return detail::memory_fault(ctx, base + offset + 4);
+  if (!ctx.memory.write(base + offset + 5, &zero64, 1)) return detail::memory_fault(ctx, base + offset + 5);
+  if (!ctx.memory.write(base + offset + 6, &zero64, 2)) return detail::memory_fault(ctx, base + offset + 6);
+  if (!ctx.memory.write(base + offset + 8, &zero64, 8)) return detail::memory_fault(ctx, base + offset + 8);
+  if (!ctx.memory.write(base + offset + 16, &zero64, 8)) return detail::memory_fault(ctx, base + offset + 16);
+  return {};
 }
 
 ExecutionResult fsave(ExecutionContext& ctx, std::size_t env_size) {
@@ -221,9 +225,13 @@ ExecutionResult fsave(ExecutionContext& ctx, std::size_t env_size) {
   if ((base & 0x7) != 0) {
     return detail::memory_fault(ctx, base);
   }
-  write_fpu_state(ctx, base, 0);
+  // Validate the whole 160-byte footprint (env + the 8 ST slots) before touching anything, the same
+  // way fxsave does. Real hardware faults before any of the store happens, and the x87_reset() below
+  // must not wipe guest FPU state for a save that never landed.
+  if (const auto span = validate_memory_span(ctx, base, 160, seven::MemoryAccessKind::data_write); !span.ok()) return span;
+  if (const auto r = write_fpu_state(ctx, base, 0); !r.ok()) return r;
   for (std::size_t i = 0; i < 8; ++i) {
-    write_fxsave_st(ctx, base, i, ctx.state.x87_get(i));
+    if (const auto r = write_fxsave_st(ctx, base, i, ctx.state.x87_get(i)); !r.ok()) return r;
   }
   ctx.state.x87_reset();
   return {};
@@ -235,6 +243,7 @@ ExecutionResult frstor(ExecutionContext& ctx, std::size_t env_size) {
   if ((base & 0x7) != 0) {
     return detail::memory_fault(ctx, base);
   }
+  if (const auto span = validate_memory_span(ctx, base, 160, seven::MemoryAccessKind::data_read); !span.ok()) return span;
   std::uint16_t fcw = 0;
   std::uint16_t fsw = 0;
   std::uint8_t ftw = 0;
@@ -245,7 +254,9 @@ ExecutionResult frstor(ExecutionContext& ctx, std::size_t env_size) {
   ctx.state.set_x87_status_word(fsw);
   for (std::size_t i = 0; i < 8; ++i) {
     if ((ftw >> i) & 1u) {
-      ctx.state.x87_set(i, read_fxsave_st(ctx, base, i));
+      X87Scalar loaded{};
+      if (const auto r = read_fxsave_st(ctx, base, i, loaded); !r.ok()) return r;
+      ctx.state.x87_set(i, loaded);
     } else {
       ctx.state.x87_mark_empty(i);
     }
@@ -275,7 +286,7 @@ ExecutionResult fxsave(ExecutionContext& ctx, bool /*is64*/) {
   if (!ctx.memory.write(base + 28, &mxcsr_mask, 4)) return detail::memory_fault(ctx, base + 28);
 
   for (std::size_t phys = 0; phys < 8; ++phys) {
-    write_fxsave_st(ctx, base, phys, ctx.state.x87_stack[phys]);
+    if (const auto r = write_fxsave_st(ctx, base, phys, ctx.state.x87_stack[phys]); !r.ok()) return r;
   }
   for (std::size_t i = 0; i < 16; ++i) {
     const auto value = ctx.state.vectors[i].value;
@@ -315,8 +326,10 @@ ExecutionResult fxrstor(ExecutionContext& ctx, bool /*is64*/) {
   ctx.state.mxcsr = mxcsr;
   for (std::size_t phys = 0; phys < 8; ++phys) {
     if ((ftw >> phys) & 1u) {
-      ctx.state.x87_stack[phys] = read_fxsave_st(ctx, base, phys);
-      ctx.state.x87_tags[phys] = (ctx.state.x87_stack[phys] == 0) ? 0x1 : 0x0;
+      X87Scalar loaded{};
+      if (const auto r = read_fxsave_st(ctx, base, phys, loaded); !r.ok()) return r;
+      ctx.state.x87_stack[phys] = loaded;
+      ctx.state.x87_tags[phys] = (loaded == 0) ? 0x1 : 0x0;
     } else {
       ctx.state.x87_tags[phys] = 0x3;
     }
@@ -622,8 +635,7 @@ ExecutionResult handle_code_FLD_STI(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_FNSTENV_M14BYTE(ExecutionContext& ctx) {
-  store_x87_env(ctx, detail::memory_address(ctx));
-  return {};
+  return store_x87_env(ctx, detail::memory_address(ctx));
 }
 
 ExecutionResult handle_code_FSTENV_M14BYTE(ExecutionContext& ctx) {
@@ -631,8 +643,7 @@ ExecutionResult handle_code_FSTENV_M14BYTE(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_FNSTENV_M28BYTE(ExecutionContext& ctx) {
-  store_x87_env(ctx, detail::memory_address(ctx));
-  return {};
+  return store_x87_env(ctx, detail::memory_address(ctx));
 }
 
 ExecutionResult handle_code_FSTENV_M28BYTE(ExecutionContext& ctx) {
@@ -711,6 +722,15 @@ ExecutionResult handle_code_FSAVE_M94BYTE(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_FSAVE_M108BYTE(ExecutionContext& ctx) {
+  return fsave(ctx, 108);
+}
+
+// DD /6 decodes to these, not to the FSAVE_* codes above -- see handled_codes.def.
+ExecutionResult handle_code_FNSAVE_M94BYTE(ExecutionContext& ctx) {
+  return fsave(ctx, 94);
+}
+
+ExecutionResult handle_code_FNSAVE_M108BYTE(ExecutionContext& ctx) {
   return fsave(ctx, 108);
 }
 

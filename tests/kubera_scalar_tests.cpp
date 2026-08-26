@@ -303,6 +303,66 @@ TEST(KuberaScalar, BtsWithSmallBitIndexStillWorksAfterCanonicalCheck) {
   EXPECT_EQ(byte0, 0x20);
 }
 
+TEST(KuberaScalar, FnstenvToUnmappedMemoryFaultsInsteadOfReportingSuccess) {
+  // store_x87_env() returned void and threw away all seven of its ctx.memory.write() results, and
+  // both FNSTENV handlers ignored it and returned {} unconditionally -- so an FNSTENV aimed at
+  // unmapped memory silently "succeeded" with nothing written. The ~400-site memory_fault() sweep
+  // missed this family because the helpers return void, so there was no `if (!...read/write)` shape
+  // to match on.
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("D9 33"));  // fnstenv [rbx]
+  state.gpr[3] = 0x50000;                                        // rbx: canonical but never mapped
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::page_fault);
+}
+
+TEST(KuberaScalar, FnsaveToUnmappedMemoryFaultsAndLeavesFpuStateIntact) {
+  // Same void-helper gap as above, plus a second-order bug: fsave() ran x87_reset() unconditionally
+  // after the (silently failed) stores, so a save that never landed still wiped the guest's FPU
+  // stack. Validating the whole 160-byte footprint up front -- the way fxsave already did -- makes
+  // the fault happen before any state is touched, which is also what real hardware does.
+  // Doubles as the regression test for the orphaned-handler half of this fix: DD /6 decodes to
+  // FNSAVE_M108BYTE, which was never registered, so this instruction previously stopped as
+  // unsupported_instruction and fsave() was unreachable dead code.
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("DD 33"));  // fnsave [rbx]
+  state.gpr[3] = 0x50000;                                        // rbx: canonical but never mapped
+  ASSERT_TRUE(state.x87_push(seven::X87Scalar(1)));
+  const auto top_before = state.get_x87_top();
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::page_fault);
+  EXPECT_EQ(state.get_x87_top(), top_before);
+  EXPECT_FALSE(state.x87_is_empty(0));
+}
+
+TEST(KuberaScalar, FnstenvToNonCanonicalAddressFaultsGeneralProtection) {
+  // Once the writes are actually checked, the canonical-address check every other handler gets via
+  // detail::memory_fault() applies here too -- a non-canonical destination is #GP, not #PF.
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("D9 33"));  // fnstenv [rbx]
+  state.gpr[3] = 0x8000'1234'5678'9AB0ull;                       // rbx: non-canonical
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::general_protection);
+}
+
 TEST(KuberaScalar, NonCanonicalAddressFaultsGeneralProtectionNotPageFault) {
   // mov rax, [rbx] with rbx pointing at a non-canonical address. Every handler's memory-fault
   // path now funnels through detail::memory_fault(), which checks canonicality before treating

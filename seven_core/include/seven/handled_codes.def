@@ -1787,3 +1787,11 @@ KUBERA_CODE(VEX_VPSRLD_YMM_YMM_XMMM128)
 KUBERA_CODE(VEX_VPSRLQ_YMM_YMM_XMMM128)
 KUBERA_CODE(VEX_VPSRAW_YMM_YMM_XMMM128)
 KUBERA_CODE(VEX_VPSRAD_YMM_YMM_XMMM128)
+
+// Same orphaned-handler shape, found 2026-08-26 while testing the x87 save/restore
+// fault paths. fsave() was only reachable through FSAVE_M94BYTE/FSAVE_M108BYTE, but
+// the decoder tables (iced_x86 data_legacy.hpp) only ever emit the no-wait FNSAVE_*
+// codes for DD /6 -- the FSAVE_* values exist in the Code enum but are never decoded.
+// So every real FNSAVE stopped as unsupported_instruction while fsave() sat dead.
+KUBERA_CODE(FNSAVE_M94BYTE)
+KUBERA_CODE(FNSAVE_M108BYTE)
