@@ -491,16 +491,30 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
           }
         }
       }
+      bool truncated_to_page = false;
       if (!fetched) {
         if (!memory.read(state.rip, bytes.data(), bytes.size(), MemoryAccessKind::instruction_fetch)) {
-          const ExecutionResult fault{StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, state.rip, 0}, std::nullopt};
-          if (try_recover_fault(fault, fault_address_of(fault, state.rip))) {
-            continue;
+          // A fetch only faults on the bytes the instruction actually needs. Asking for a full
+          // 15 bytes unconditionally means a one-byte instruction in the last stretch of a page
+          // faults whenever the next page happens to be unmapped or non-executable, which real
+          // code hits constantly (the last instruction before a guard page) and which also hands
+          // the guest a way to probe the host's mapping layout without touching it. Retry with
+          // just what this page holds and let the decoder say whether the rest was ever needed.
+          const auto in_page =
+              static_cast<std::size_t>(Memory::kPageSize - (state.rip % Memory::kPageSize));
+          truncated_to_page = in_page < bytes.size() &&
+                              memory.read(state.rip, bytes.data(), in_page, MemoryAccessKind::instruction_fetch);
+          if (!truncated_to_page) {
+            const ExecutionResult fault{StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, state.rip, 0}, std::nullopt};
+            if (try_recover_fault(fault, fault_address_of(fault, state.rip))) {
+              continue;
+            }
+            record_violation(fault, fault_address_of(fault, state.rip));
+            ++stop_reason_counts_[stop_reason_to_index(fault.reason)];
+            notify_stop_hooks(state, memory, fault, state.rip);
+            return fault;
           }
-          record_violation(fault, fault_address_of(fault, state.rip));
-          ++stop_reason_counts_[stop_reason_to_index(fault.reason)];
-          notify_stop_hooks(state, memory, fault, state.rip);
-          return fault;
+          decode_size = in_page;
         }
       }
 
@@ -510,6 +524,20 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
           state.rip,
           iced_x86::DecoderOptions::NO_INVALID_CHECK);
       const auto decoded = decoder.decode();
+      if (!decoded.has_value() && truncated_to_page &&
+          decoded.error().error == iced_x86::DecoderError::NO_MORE_BYTES) {
+        // The instruction really does run into the next page, so the fetch fault the truncated
+        // retry above suppressed was the right answer after all.
+        const auto fault_rip = (state.rip | (Memory::kPageSize - 1)) + 1;
+        const ExecutionResult fault{StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, fault_rip, 0}, std::nullopt};
+        if (try_recover_fault(fault, fault_address_of(fault, fault_rip))) {
+          continue;
+        }
+        record_violation(fault, fault_address_of(fault, fault_rip));
+        ++stop_reason_counts_[stop_reason_to_index(fault.reason)];
+        notify_stop_hooks(state, memory, fault, state.rip);
+        return fault;
+      }
       if (!decoded.has_value()) {
         if (trace_semantics_) {
           if (decode_bytes != bytes.data()) {

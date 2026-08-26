@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 
+#include "seven/executor.hpp"
 #include "seven/memory.hpp"
 
 // Regression test for a real integer-overflow bug in Memory::find_mmio_region: address + size can
@@ -289,4 +290,60 @@ TEST(KuberaMemory, NestedAccessHookDispatchDoesNotInvalidateTheOuterLoop) {
   EXPECT_FALSE(memory.remove_access_hook(to_remove)) << "hook should already be gone";
   EXPECT_TRUE(memory.remove_access_hook(reentrant));
   EXPECT_TRUE(memory.remove_access_hook(remover));
+}
+
+// An instruction fetch is only allowed to fault on bytes the instruction actually needs. seven used
+// to ask for a full 15 bytes every time, so a one-byte instruction in the last stretch of a page
+// faulted whenever the following page was unmapped or non-executable -- the ordinary layout of the
+// last instruction before a guard page. It also gave the guest a way to map out what the host had
+// placed around it without ever issuing an access to those addresses.
+
+TEST(KuberaMemory, ShortInstructionAtAPageBoundaryDoesNotFetchIntoTheNextPage) {
+  seven::CpuState state{};
+  seven::Memory memory{};
+  seven::Executor executor{};
+  state.mode = seven::ExecutionMode::long64;
+  memory.map(0x1000, 0x1000);
+  const std::uint8_t nop = 0x90;
+  ASSERT_TRUE(memory.write(0x1FFF, &nop, 1));
+
+  state.rip = 0x1FFF;
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::none);
+  EXPECT_EQ(state.rip, 0x2000u);
+}
+
+TEST(KuberaMemory, ShortInstructionAtAPageBoundaryIgnoresTheNextPagesPermissions) {
+  seven::CpuState state{};
+  seven::Memory memory{};
+  seven::Executor executor{};
+  state.mode = seven::ExecutionMode::long64;
+  memory.map(0x1000, 0x1000);
+  memory.map(0x2000, 0x1000, static_cast<seven::MemoryPermissionMask>(seven::MemoryPermission::read) |
+                                 static_cast<seven::MemoryPermissionMask>(seven::MemoryPermission::write));
+  const std::uint8_t nop = 0x90;
+  ASSERT_TRUE(memory.write(0x1FFF, &nop, 1));
+
+  state.rip = 0x1FFF;
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::none);
+  EXPECT_EQ(state.rip, 0x2000u);
+}
+
+TEST(KuberaMemory, InstructionThatGenuinelyStraddlesAnUnmappedPageStillFaults) {
+  seven::CpuState state{};
+  seven::Memory memory{};
+  seven::Executor executor{};
+  state.mode = seven::ExecutionMode::long64;
+  memory.map(0x1000, 0x1000);
+  // mov eax, imm32 is five bytes; only three of them fit before the boundary.
+  const std::uint8_t head[] = {0xB8, 0x00, 0x00};
+  ASSERT_TRUE(memory.write(0x1FFD, head, sizeof(head)));
+
+  state.rip = 0x1FFD;
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::page_fault);
+  EXPECT_EQ(state.rip, 0x1FFDu);
+  ASSERT_TRUE(result.exception.has_value());
+  EXPECT_EQ(result.exception->address, 0x2000u) << "the fault belongs to the page it ran into";
 }
