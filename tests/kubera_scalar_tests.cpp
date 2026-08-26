@@ -870,3 +870,35 @@ TEST(KuberaScalar, NearIndirectCallThroughARegisterUsesTheFullSixtyFourBits) {
                EXPECT_EQ(pushed, kBase + 2) << "return address is the next instruction";
              });
 }
+
+TEST(KuberaScalar, XaddWithTheSameRegisterTwiceDoublesItRatherThanCancelling) {
+  // 4D 0F C1 FF -- xadd r15, r15. Intel's order is TEMP := SRC + DEST; SRC := DEST; DEST := TEMP,
+  // so the destination write lands last and the register ends up doubled. Writing the source
+  // afterwards instead put the original value straight back and the instruction did nothing at
+  // all. Hardware and Unicorn both double it; seven was the odd one out.
+  run_single(seven::parse_hex_bytes("4D 0F C1 FF"),
+             [](seven::CpuState& state, seven::Memory&) { state.gpr[15] = 0xE8C842B14C7FFB7Aull; },
+             [](const seven::ExecutionResult&, const seven::CpuState& state, const seven::Memory&) {
+               EXPECT_EQ(state.gpr[15], 0xD190856298FFF6F4ull);
+             });
+
+  // 0F C0 C0 -- xadd al, al, the 8-bit form of the same aliasing.
+  run_single(seven::parse_hex_bytes("0F C0 C0"),
+             [](seven::CpuState& state, seven::Memory&) { state.gpr[0] = 0xFFFFFFFFFFFFFF25ull; },
+             [](const seven::ExecutionResult&, const seven::CpuState& state, const seven::Memory&) {
+               EXPECT_EQ(state.gpr[0] & 0xFFull, 0x4Aull) << "0x25 + 0x25";
+               EXPECT_EQ(state.gpr[0] >> 8, 0x00FFFFFFFFFFFFFFull) << "the rest of rax is untouched";
+             });
+
+  // Distinct registers still exchange as usual. ModRM C1 makes rcx the r/m destination and rax
+  // the reg source.
+  run_single(seven::parse_hex_bytes("48 0F C1 C1"),
+             [](seven::CpuState& state, seven::Memory&) {
+               state.gpr[0] = 0x1111;
+               state.gpr[1] = 0x2222;
+             },
+             [](const seven::ExecutionResult&, const seven::CpuState& state, const seven::Memory&) {
+               EXPECT_EQ(state.gpr[1], 0x3333ull) << "destination gets the sum";
+               EXPECT_EQ(state.gpr[0], 0x2222ull) << "source gets the old destination";
+             });
+}
