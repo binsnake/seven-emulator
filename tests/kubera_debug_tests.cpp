@@ -654,3 +654,71 @@ TEST(KuberaDebug, DataBreakpointStillFiresOnWraparoundAccess) {
                                                                     /*is_read=*/false, /*is_write=*/true);
   EXPECT_NE(hit_bits & 0x1ull, 0u) << "DR0's watchpoint must fire for a wrapping access that genuinely touches it";
 }
+
+TEST(KuberaDebug, StackPushAndPopTriggerDataBreakpoints) {
+  // The stack slot a PUSH writes and a POP reads is an implicit operand, so it never shows up in
+  // the instruction's iced operand list. Watchpoints still have to see it, otherwise a guest can
+  // park RSP on a watched address and write through it without ever tripping DR0-DR3.
+  {
+    constexpr std::uint64_t kWatched = 0x3400;
+    seven::CpuState state{};
+    seven::Memory memory{};
+    seven::Executor executor{};
+    state.mode = seven::ExecutionMode::long64;
+    state.rip = kBase;
+    state.gpr[0] = 0xDEADBEEFull;
+    state.gpr[4] = kWatched + 8;
+    state.sreg[1] = 0x33;
+    state.idtr.base = kIdtBase;
+    state.idtr.limit = 0x1000 - 1;
+    state.rflags = 0x202;
+    memory.map(kIdtBase, 0x1000);
+    memory.map(kDbHandler, 0x1000);
+    memory.map(kWatched, 0x1000);
+    write_bytes(memory, kBase, {0x50});  // push rax
+    const std::uint8_t iretq[] = {0x48, 0xCF};
+    (void)memory.write(kDbHandler, iretq, sizeof(iretq));
+    write_idt_gate64(memory, kIdtBase, 1, 0x33, kDbHandler);
+    // DR0 watches [kWatched, kWatched+8) for writes, LEN0 = 8 bytes.
+    state.dr[0] = kWatched;
+    state.dr[7] = 0x1 | (0x1ull << 16) | (0x2ull << 18);
+
+    ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+    EXPECT_EQ(state.rip, kDbHandler) << "push onto a watched stack slot must raise #DB";
+    EXPECT_NE(state.dr[6] & 0x1ull, 0u);
+    std::uint64_t stored = 0;
+    (void)memory.read(kWatched, &stored, sizeof(stored));
+    EXPECT_EQ(stored, 0xDEADBEEFull);
+  }
+
+  {
+    constexpr std::uint64_t kWatched = 0x3400;
+    seven::CpuState state{};
+    seven::Memory memory{};
+    seven::Executor executor{};
+    state.mode = seven::ExecutionMode::long64;
+    state.rip = kBase;
+    state.gpr[4] = kWatched;
+    state.sreg[1] = 0x33;
+    state.idtr.base = kIdtBase;
+    state.idtr.limit = 0x1000 - 1;
+    state.rflags = 0x202;
+    memory.map(kIdtBase, 0x1000);
+    memory.map(kDbHandler, 0x1000);
+    memory.map(kWatched, 0x1000);
+    write_bytes(memory, kBase, {0x58});  // pop rax
+    const std::uint64_t secret = 0x1122334455667788ull;
+    (void)memory.write(kWatched, &secret, sizeof(secret));
+    const std::uint8_t iretq[] = {0x48, 0xCF};
+    (void)memory.write(kDbHandler, iretq, sizeof(iretq));
+    write_idt_gate64(memory, kIdtBase, 1, 0x33, kDbHandler);
+    // DR0 watches [kWatched, kWatched+8) for reads or writes, LEN0 = 8 bytes.
+    state.dr[0] = kWatched;
+    state.dr[7] = 0x1 | (0x3ull << 16) | (0x2ull << 18);
+
+    ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+    EXPECT_EQ(state.rip, kDbHandler) << "pop off a watched stack slot must raise #DB";
+    EXPECT_NE(state.dr[6] & 0x1ull, 0u);
+    EXPECT_EQ(state.gpr[0], secret);
+  }
+}

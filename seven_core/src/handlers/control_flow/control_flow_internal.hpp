@@ -54,29 +54,52 @@ ExecutionResult unsupported_instruction(ExecutionContext& ctx) {
   return {StopReason::unsupported_instruction, 0, ExceptionInfo{StopReason::unsupported_instruction, ctx.state.rip, 0}, ctx.instr.code()};
 }
 
+// The stack slot a push writes and a pop reads is implicit, so it never appears in the
+// instruction's operand list and the executor's generic watchpoint sweep cannot see it. Report it
+// from here instead, or a guest evades a data breakpoint just by pointing rsp at the watched
+// address and pushing.
+void note_stack_access(ExecutionContext& ctx, std::uint64_t slot, std::size_t width, bool is_write) {
+  if (ctx.state.dr[7] == 0) {
+    return;
+  }
+  ctx.debug_hit_bits |= detail::debug_data_breakpoint_hits(ctx.state, slot, width, !is_write, is_write);
+}
+
 ExecutionResult push_width(ExecutionContext& ctx, std::uint64_t value, std::size_t width) {
   ctx.state.gpr[4] = mask_stack_pointer(ctx.state, ctx.state.gpr[4] - width);
+  const auto slot = ctx.state.gpr[4];
+  ExecutionResult result{};
   switch (width) {
     case 1: {
       const auto v = static_cast<std::uint8_t>(value);
-      return detail::write_memory_checked(ctx, ctx.state.gpr[4], v);
+      result = detail::write_memory_checked(ctx, slot, v);
+      break;
     }
     case 2: {
       const auto v = static_cast<std::uint16_t>(value);
-      return detail::write_memory_checked(ctx, ctx.state.gpr[4], v);
+      result = detail::write_memory_checked(ctx, slot, v);
+      break;
     }
     case 4: {
       const auto v = static_cast<std::uint32_t>(value);
-      return detail::write_memory_checked(ctx, ctx.state.gpr[4], v);
+      result = detail::write_memory_checked(ctx, slot, v);
+      break;
     }
     case 8:
-      return detail::write_memory_checked(ctx, ctx.state.gpr[4], value);
+      result = detail::write_memory_checked(ctx, slot, value);
+      break;
     default:
       return unsupported_instruction(ctx);
   }
+  if (!result.ok()) {
+    return result;
+  }
+  note_stack_access(ctx, slot, width, true);
+  return {};
 }
 
 ExecutionResult pop_width(ExecutionContext& ctx, std::uint64_t& value, std::size_t width) {
+  const auto slot = ctx.state.gpr[4];
   switch (width) {
     case 1: {
       std::uint8_t v = 0;
@@ -106,6 +129,7 @@ ExecutionResult pop_width(ExecutionContext& ctx, std::uint64_t& value, std::size
       return unsupported_instruction(ctx);
   }
   ctx.state.gpr[4] = mask_stack_pointer(ctx.state, ctx.state.gpr[4] + width);
+  note_stack_access(ctx, slot, width, false);
   return {};
 }
 

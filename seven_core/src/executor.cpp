@@ -969,9 +969,10 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
           !state.pending_single_step && !tf_active) {
         return result;
       }
-      const auto current_data_hit_bits = ctx.debug_hit_bits != 0
-                                             ? ctx.debug_hit_bits
-                                             : collect_data_breakpoint_hits(state, debug_memory_accesses);
+      // A handler reporting its own hits (implicit stack slots, string-op source/destination) does
+      // not mean the instruction's explicit operands missed, so take both rather than either.
+      const auto current_data_hit_bits =
+          ctx.debug_hit_bits | collect_data_breakpoint_hits(state, debug_memory_accesses);
       if (current_instruction_set_shadow) {
         state.pending_debug_hit_bits |= current_data_hit_bits;
         return result;
