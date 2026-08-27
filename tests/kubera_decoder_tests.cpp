@@ -18,10 +18,14 @@
 
 namespace {
 
-[[nodiscard]] iced_x86::Instruction decode(const char* hex) {
+[[nodiscard]] auto try_decode(const char* hex) {
   const auto raw = seven::parse_hex_bytes(hex);
   iced_x86::Decoder decoder(64, std::span<const std::uint8_t>(raw.data(), raw.size()), 0x1000);
-  const auto decoded = decoder.decode();
+  return decoder.decode();
+}
+
+[[nodiscard]] iced_x86::Instruction decode(const char* hex) {
+  const auto decoded = try_decode(hex);
   EXPECT_TRUE(decoded.has_value()) << hex;
   return decoded.has_value() ? decoded.value() : iced_x86::Instruction{};
 }
@@ -125,6 +129,39 @@ TEST(KuberaDecoder, DefaultSixtyFourBitOperandsPickTheSixtyFourBitCode) {
   for (const auto& c : cases) {
     EXPECT_EQ(decode(c.bytes).code(), c.expected) << c.name << " (" << c.bytes << ")";
   }
+}
+
+// VEX.vvvv is four bits wide in long mode but the mask register file only has eight entries, so a
+// mask operand taken from it has to be narrowed. Most of the mask handlers here do that; the two
+// three-operand ones did not, and K0 + 15 lands on CR3. A decoded operand naming a register outside
+// its own class is how an index walks out of the array it is about to be used to subscript.
+TEST(KuberaDecoder, MaskOperandsStayInTheMaskRegisterFile) {
+  struct Case { const char* name; const char* bytes; std::uint32_t operand; };
+  const Case cases[] = {
+      // kandw k1, k?, k3 -- vvvv counts up past the end of the mask file
+      {"kandw vvvv=8", "C5 BC 41 CB", 1},
+      {"kandw vvvv=15", "C5 84 41 CB", 1},
+      // kortestw and the GPR-destination form reach vvvv the same way
+      {"kandnw vvvv=15", "C5 84 42 CB", 1},
+      {"kxorw vvvv=15", "C5 84 47 CB", 1},
+  };
+  // Rejecting the encoding outright and narrowing the index are both fine. Handing back a
+  // register from some other file is not.
+  for (const auto& c : cases) {
+    const auto instr = try_decode(c.bytes);
+    if (!instr.has_value() || instr->code() == iced_x86::Code::INVALID) {
+      continue;
+    }
+    const auto reg = instr->op_register(c.operand);
+    EXPECT_GE(reg, iced_x86::Register::K0) << c.name << " (" << c.bytes << ")";
+    EXPECT_LE(reg, iced_x86::Register::K7) << c.name << " (" << c.bytes << ")";
+  }
+
+  // The in-range encodings still name what they should.
+  const auto ok = decode("C5 EC 41 CB");  // kandw k1, k2, k3
+  EXPECT_EQ(ok.op0_register(), iced_x86::Register::K1);
+  EXPECT_EQ(ok.op1_register(), iced_x86::Register::K2);
+  EXPECT_EQ(ok.op2_register(), iced_x86::Register::K3);
 }
 
 // VEX.L is ignored by the scalar instructions (the LIG group), and the tables already dispatch the
