@@ -46,6 +46,14 @@ constexpr bool kEnableAvx = SEVEN_ENABLE_AVX != 0;
 constexpr bool kEnableAvx512 = SEVEN_ENABLE_AVX512 != 0;
 constexpr std::size_t kMaxFaultRetries = Executor::kMaxFaultRetries;
 
+// Bits 63:47 of a linear address must all equal bit 47 under the 48-bit space seven models. Kept
+// local the way handlers/misc/system.cpp keeps its own copy; handler_helpers.cpp's lives in an
+// anonymous namespace.
+[[nodiscard]] bool is_canonical_address(std::uint64_t address) noexcept {
+  constexpr int kShift = 16;  // 64 - 48
+  return (static_cast<std::int64_t>(address << kShift) >> kShift) == static_cast<std::int64_t>(address);
+}
+
 constexpr std::size_t kVectorRegisterCount = 32;
 constexpr std::size_t kXmmWidth = 16;
 constexpr std::size_t kYmmWidth = 32;
@@ -489,6 +497,21 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
       return false;
     };
 
+    // memory_fault() applies this to data references, but the fetch path builds its faults inline
+    // and never went through it, so a jump to a non-canonical address came back as a page fault at
+    // that address instead of #GP. Real hardware checks this ahead of any page walk.
+    if (!is_canonical_address(state.rip)) [[unlikely]] {
+      const ExecutionResult fault{StopReason::general_protection, 0,
+                                  ExceptionInfo{StopReason::general_protection, state.rip, 0}, std::nullopt};
+      if (try_recover_fault(fault, state.rip)) {
+        continue;
+      }
+      record_violation(fault, state.rip);
+      ++stop_reason_counts_[stop_reason_to_index(fault.reason)];
+      notify_stop_hooks(state, memory, fault, state.rip);
+      return fault;
+    }
+
     const auto rip_page = state.rip / Memory::kPageSize;
     const auto rip_page_epoch = memory.page_code_epoch(rip_page);
     // Epoch of the page holding an instruction's final byte. Only differs from rip's own page for
@@ -590,8 +613,12 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
           decoded.error().error == iced_x86::DecoderError::NO_MORE_BYTES) {
         // The instruction really does run into the next page, so the fetch fault the truncated
         // retry above suppressed was the right answer after all.
-        const auto fault_rip = (state.rip | (Memory::kPageSize - 1)) + 1;
-        const ExecutionResult fault{StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, fault_rip, 0}, std::nullopt};
+        // Wraps to zero for an instruction on the very last page, which is not a page it ran into
+        // but the end of the address space. That is a #GP against the instruction itself.
+        const auto next_page = (state.rip | (Memory::kPageSize - 1)) + 1;
+        const auto reason = next_page == 0 ? StopReason::general_protection : StopReason::page_fault;
+        const auto fault_rip = next_page == 0 ? state.rip : next_page;
+        const ExecutionResult fault{reason, 0, ExceptionInfo{reason, fault_rip, 0}, std::nullopt};
         if (try_recover_fault(fault, fault_address_of(fault, fault_rip))) {
           continue;
         }

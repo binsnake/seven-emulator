@@ -936,3 +936,35 @@ TEST(KuberaMemory, AReenteringFaultHookCannotMisclaimTheDecodeCache) {
   EXPECT_EQ(ran_b.reason, seven::StopReason::none);
   EXPECT_EQ(state_b.gpr[0], 9u) << "b ran the decode cached for a";
 }
+
+// Bits 63:47 of a linear address must all match bit 47. Data references get this check through
+// memory_fault(); the fetch path builds its faults inline and never did.
+TEST(KuberaMemory, FetchingFromANonCanonicalAddressIsAGeneralProtectionFault) {
+  seven::CpuState state{};
+  seven::Memory memory{};
+  seven::Executor executor{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = 0x0000'8000'0000'0000ull;  // one past the top of the low half
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::general_protection);
+  ASSERT_TRUE(result.exception.has_value());
+  EXPECT_EQ(result.exception->address, state.rip);
+}
+
+// The truncated-fetch retry reports the fault against the page the instruction ran into, which for
+// the last page in the address space is not a page at all.
+TEST(KuberaMemory, AnInstructionRunningOffTheTopOfTheAddressSpaceFaultsThere) {
+  seven::CpuState state{};
+  seven::Memory memory{};
+  seven::Executor executor{};
+  state.mode = seven::ExecutionMode::long64;
+  memory.map(0xFFFF'FFFF'FFFF'F000ull, 0x1000);
+  const std::uint8_t head[] = {0xB8};  // mov eax, imm32, with none of the immediate present
+  ASSERT_TRUE(memory.write(0xFFFF'FFFF'FFFF'FFFFull, head, sizeof(head)));
+
+  state.rip = 0xFFFF'FFFF'FFFF'FFFFull;
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::general_protection);
+  ASSERT_TRUE(result.exception.has_value());
+  EXPECT_EQ(result.exception->address, state.rip) << "the fault wrapped around to page zero";
+}
