@@ -126,3 +126,36 @@ TEST(KuberaDecoder, DefaultSixtyFourBitOperandsPickTheSixtyFourBitCode) {
     EXPECT_EQ(decode(c.bytes).code(), c.expected) << c.name << " (" << c.bytes << ")";
   }
 }
+
+// VEX.L is ignored by the scalar instructions (the LIG group), and the tables already dispatch the
+// length-sensitive ones to a separate handler per L before the operands are read. get_vec_reg threw
+// the handler's own register class away and re-derived it from the vector length, so vmovss with
+// L set came back naming YMM registers for an instruction that only ever touches the low 32 bits.
+// The length-dispatched cases are here too, since they are what the re-derivation was there for.
+TEST(KuberaDecoder, VectorLengthDoesNotPromoteScalarOperands) {
+  struct Case { const char* name; const char* bytes; iced_x86::Register op0; };
+  const Case cases[] = {
+      {"vmovups xmm", "C5 F8 10 C1", iced_x86::Register::XMM0},
+      {"vmovups ymm", "C5 FC 10 C1", iced_x86::Register::YMM0},
+      {"vaddps xmm", "C5 F0 58 C2", iced_x86::Register::XMM0},
+      {"vaddps ymm", "C5 F4 58 C2", iced_x86::Register::YMM0},
+      {"evex vmovups xmm", "62 F1 7C 08 10 C1", iced_x86::Register::XMM0},
+      {"evex vmovups ymm", "62 F1 7C 28 10 C1", iced_x86::Register::YMM0},
+      {"evex vmovups zmm", "62 F1 7C 48 10 C1", iced_x86::Register::ZMM0},
+      // A spread of handler shapes, since removing the re-derivation had to leave every
+      // length-dispatched form exactly where it was.
+      {"vmovups ymm store", "C5 FC 11 C1", iced_x86::Register::YMM1},
+      {"vmovups ymm load", "C5 FC 10 01", iced_x86::Register::YMM0},
+      {"vroundpd ymm", "C4 E3 7D 09 C1 05", iced_x86::Register::YMM0},
+      {"vblendps ymm", "C4 E3 75 0C C2 0F", iced_x86::Register::YMM0},
+      {"vpermilps ymm", "C4 E2 7D 0C C1", iced_x86::Register::YMM0},
+      {"evex vaddps zmm", "62 F1 74 48 58 C2", iced_x86::Register::ZMM0},
+      {"evex vmovups zmm store", "62 F1 7C 48 11 C1", iced_x86::Register::ZMM1},
+      // L is set on both of these and must be ignored: they are scalar.
+      {"vmovss, L set", "C5 86 10 C0", iced_x86::Register::XMM0},
+      {"vmovsd, L set", "C5 87 10 C0", iced_x86::Register::XMM0},
+  };
+  for (const auto& c : cases) {
+    EXPECT_EQ(decode(c.bytes).op0_register(), c.op0) << c.name << " (" << c.bytes << ")";
+  }
+}
