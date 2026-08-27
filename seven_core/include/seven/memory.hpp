@@ -163,6 +163,13 @@ class Memory {
     return (active_access_hook_kinds_ & bit(MemoryAccessKind::instruction_fetch)) != 0;
   }
   [[nodiscard]] std::uint64_t code_epoch() const noexcept { return code_epoch_; }
+  // Bumped every time an embedder callback runs underneath an access: an MMIO region's
+  // on_read/on_write, or either half of a passthrough. A JIT consumer compares it across a single
+  // access to learn that host code ran in the middle of its compiled block, which is the one moment
+  // anything it settled at block entry -- which hooks are installed, most of all -- can stop being
+  // true without the block ever returning. Counts dispatches, not devices: a configuration that
+  // merely has a device mapped is not interesting, a call that actually reached one is.
+  [[nodiscard]] std::uint64_t device_dispatch_count() const noexcept { return device_dispatch_count_; }
   // Per-page version of code_epoch() -- lets a cache invalidate just the pages it covers instead
   // of everything. Values share code_epoch_'s counter so a remapped page never reuses an old one's
   // epoch; an unmapped page reads back 0.
@@ -286,6 +293,8 @@ class Memory {
     std::uint64_t value_;
   };
   InstanceIdentity instance_id_{};
+  // Mutable because read() and read_code_page() are const and still dispatch to a device.
+  mutable std::uint64_t device_dispatch_count_ = 0;
 
   std::unordered_map<std::uint64_t, PageEntry> pages_;
   // Whichever Memory the two caches below were filled for. Copying a Memory deep-copies pages_ into

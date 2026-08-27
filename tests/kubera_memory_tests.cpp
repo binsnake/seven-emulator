@@ -774,3 +774,49 @@ TEST(KuberaMemory, AnMmioAddressIsDistinguishableFromOrdinaryMemory) {
   EXPECT_TRUE(memory.unmap_mmio(id));
   EXPECT_FALSE(memory.is_mmio_address(kBase)) << "the region is gone";
 }
+
+// device_dispatch_count exists so a JIT consumer can tell that an embedder callback ran underneath
+// one of its accesses. What matters is that it counts calls that actually reached a device and
+// stays put for accesses that did not, since a counter that moved on ordinary RAM would make a
+// compiled block stop after every memory operand for as long as any device was mapped.
+TEST(KuberaMemory, DeviceDispatchCountTracksCallbacksNotConfiguration) {
+  seven::Memory memory{};
+  constexpr std::uint64_t kRam = 0x10000;
+  constexpr std::uint64_t kDev = 0x20000;
+  memory.map(kRam, 0x1000);
+
+  std::uint64_t value = 0;
+  ASSERT_TRUE(memory.write(kRam, &value, sizeof(value)));
+  ASSERT_TRUE(memory.read(kRam, &value, sizeof(value)));
+  EXPECT_EQ(memory.device_dispatch_count(), 0u) << "plain ram must not look like a device";
+
+  int reads = 0;
+  int writes = 0;
+  const auto id = memory.map_mmio(
+      kDev, 0x1000,
+      [&](std::uint64_t, void* dst, std::size_t size) {
+        ++reads;
+        std::memset(dst, 0, size);
+        return true;
+      },
+      [&](std::uint64_t, const void*, std::size_t) {
+        ++writes;
+        return true;
+      });
+  ASSERT_NE(id, 0u);
+  EXPECT_EQ(memory.device_dispatch_count(), 0u)
+      << "mapping a device is not a dispatch, only calling one is";
+
+  ASSERT_TRUE(memory.read(kDev, &value, sizeof(value)));
+  EXPECT_EQ(memory.device_dispatch_count(), 1u);
+  ASSERT_TRUE(memory.write(kDev, &value, sizeof(value)));
+  EXPECT_EQ(memory.device_dispatch_count(), 2u);
+  EXPECT_EQ(reads, 1);
+  EXPECT_EQ(writes, 1);
+
+  // A ram access while a device is mapped still must not move it -- that is the whole point.
+  ASSERT_TRUE(memory.read(kRam, &value, sizeof(value)));
+  ASSERT_TRUE(memory.write(kRam, &value, sizeof(value)));
+  EXPECT_EQ(memory.device_dispatch_count(), 2u)
+      << "an access that never reached a device moved the counter anyway";
+}

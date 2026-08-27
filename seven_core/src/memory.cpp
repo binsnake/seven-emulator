@@ -230,6 +230,7 @@ bool Memory::read(std::uint64_t address, void* dst, std::size_t size, MemoryAcce
     if (!access_allowed(MemoryAccessEvent{kind, address, size, nullptr, 0})) {
       return false;
     }
+    ++device_dispatch_count_;
     return fn(address, dst, size);
   }
   // Fast path: most reads in real workloads are entirely within a single page
@@ -262,7 +263,9 @@ bool Memory::read(std::uint64_t address, void* dst, std::size_t size, MemoryAcce
     if (!access_allowed(MemoryAccessEvent{kind, address, size, nullptr, 0})) {
       return false;
     }
-    return on_read != nullptr ? on_read(address - region_base, dst, size) : false;
+    if (on_read == nullptr) return false;
+    ++device_dispatch_count_;
+    return on_read(address - region_base, dst, size);
   }
 
   const auto copy_from_pages = [&](std::byte* out) {
@@ -320,7 +323,9 @@ bool Memory::read_unchecked(std::uint64_t address, void* dst, std::size_t size) 
     // otherwise destroy or relocate the std::function while its own frame is still live.
     auto on_read = mmio->on_read;
     const auto region_base = mmio->base;
-    return on_read != nullptr ? on_read(address - region_base, dst, size) : false;
+    if (on_read == nullptr) return false;
+    ++device_dispatch_count_;
+    return on_read(address - region_base, dst, size);
   }
 
   auto* out = static_cast<std::byte*>(dst);
@@ -344,7 +349,10 @@ bool Memory::read_unchecked(std::uint64_t address, void* dst, std::size_t size) 
 }
 
 bool Memory::read_code_page(std::uint64_t page_base, void* dst) const {
-  if (auto fn = passthrough_read_) return fn(page_base, dst, kPageSize);
+  if (auto fn = passthrough_read_) {
+    ++device_dispatch_count_;
+    return fn(page_base, dst, kPageSize);
+  }
   if ((page_base % kPageSize) != 0) {
     return false;
   }
@@ -373,6 +381,7 @@ bool Memory::write(std::uint64_t address, const void* src, std::size_t size, Mem
     if (!access_allowed(MemoryAccessEvent{kind, address, size, src, size})) {
       return false;
     }
+    ++device_dispatch_count_;
     if (!fn(address, src, size)) {
       return false;
     }
@@ -420,7 +429,9 @@ bool Memory::write(std::uint64_t address, const void* src, std::size_t size, Mem
     // otherwise destroy or relocate the std::function while its own frame is still live.
     auto on_write = mmio->on_write;
     const auto region_base = mmio->base;
-    return on_write != nullptr ? on_write(address - region_base, src, size) : false;
+    if (on_write == nullptr) return false;
+    ++device_dispatch_count_;
+    return on_write(address - region_base, src, size);
   }
 
   const auto* in = static_cast<const std::byte*>(src);
@@ -455,7 +466,9 @@ bool Memory::write_unchecked(std::uint64_t address, const void* src, std::size_t
     // otherwise destroy or relocate the std::function while its own frame is still live.
     auto on_write = mmio->on_write;
     const auto region_base = mmio->base;
-    return on_write != nullptr ? on_write(address - region_base, src, size) : false;
+    if (on_write == nullptr) return false;
+    ++device_dispatch_count_;
+    return on_write(address - region_base, src, size);
   }
 
   const auto* in = static_cast<const std::byte*>(src);
