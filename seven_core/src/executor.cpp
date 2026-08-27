@@ -929,8 +929,12 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
     // is the same hazard as TF); (4) no hook got registered after this block was lifted (hooks are
     // checked once at lift time in block_liveness_eligible(), but a cached block's mask persists
     // across dispatches -- hooks added later must still disable it).
+    // The context-sync callbacks belong here for the same reason jit_bypass_eligible lists them:
+    // the write side hands the host a CpuState at every instruction boundary, so a flag write the
+    // span was going to cover later has already been observed missing by then.
     const bool masking_safe_now = allow_masking && (state.rflags & kFlagTF) == 0 &&
-                                   state.dr[7] == 0 && block_liveness_eligible(memory);
+                                   state.dr[7] == 0 && !context_read_cb_ && !context_write_cb_ &&
+                                   block_liveness_eligible(memory);
     // Saved and put back rather than plain assigned. A handler's memory access can land on an
     // MMIO device or a passthrough, and that host callback is free to re-enter run(); the nested
     // frame installs a mask for its own block and would otherwise leave it in place. Everything

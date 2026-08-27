@@ -487,3 +487,40 @@ TEST(KuberaLiveness, KeepsEveryFlagsTableEntryExecutable) {
          "preceding write that nothing restores: "
       << (unrunnable.empty() ? std::string{} : unrunnable[0]);
 }
+
+// The context-sync callbacks hand the host a CpuState at every instruction boundary, which is the
+// same "something external observes rflags mid-span" hazard the hook checks cover. The JIT's gate
+// accounts for them; the masking gate did not, so a covered flag write was elided out from under a
+// callback that was watching for it.
+TEST(KuberaLiveness, ContextSyncCallbacksSeeFlagsAtEveryBoundary) {
+  const auto flags_after_first = [&](const std::vector<std::uint8_t>& code) {
+    seven::Memory memory{};
+    memory.map(0x1000, 0x1000);
+    EXPECT_TRUE(memory.write(0x1000, code.data(), code.size()));
+    seven::Executor executor{};
+    std::vector<std::uint64_t> seen;
+    executor.set_context_write_callback([&](seven::CpuState& state) {
+      seen.push_back(state.rflags);
+      return true;
+    });
+    seven::CpuState state{};
+    state.mode = seven::ExecutionMode::long64;
+    state.rip = 0x1000;
+    state.rflags = 0x202;
+    state.gpr[0] = 7;   // rax
+    state.gpr[3] = 7;   // rbx
+    state.gpr[8] = 1;   // r8
+    state.gpr[4] = 0x1800;
+    (void)executor.run(state, memory, 1000);
+    EXPECT_FALSE(seen.empty());
+    return seen.empty() ? std::uint64_t{0} : seen.front();
+  };
+
+  // cmp rax,rbx ; hlt -- nothing covers the flag write, so nothing can be elided.
+  const std::uint64_t alone = flags_after_first({0x48, 0x39, 0xD8, 0xF4});
+  // cmp rax,rbx ; test r8,r8 ; hlt -- the test covers every status flag cmp wrote.
+  const std::uint64_t covered = flags_after_first({0x48, 0x39, 0xD8, 0x4D, 0x85, 0xC0, 0xF4});
+
+  EXPECT_EQ(covered & seven::kAluStatusFlagsMask, alone & seven::kAluStatusFlagsMask)
+      << "the callback was handed flags the covering instruction had not written yet";
+}
