@@ -524,3 +524,34 @@ TEST(KuberaLiveness, ContextSyncCallbacksSeeFlagsAtEveryBoundary) {
   EXPECT_EQ(covered & seven::kAluStatusFlagsMask, alone & seven::kAluStatusFlagsMask)
       << "the callback was handed flags the covering instruction had not written yet";
 }
+
+// A rep-prefixed SCAS reads back the ZF its own compare just wrote to decide whether to keep going.
+// The flags table declares that read, but `read` is folded into the live set only after the current
+// instruction's mask is computed, so it protects the instruction before it and not itself. CMPS is
+// covered by the memory-destination test; SCAS writes AL, so nothing was covering it and the loop
+// exited on a stale ZF after one element.
+TEST(KuberaLiveness, RepneScasKeepsTheZeroFlagItLoopsOn) {
+  constexpr std::uint64_t kProg = 0x1000;
+  constexpr std::uint64_t kData = 0x2000;
+  seven::Memory memory{};
+  seven::Executor executor{};
+  memory.map(kProg, 0x1000);
+  memory.map(kData, 0x1000);
+  // repne scasb ; xor eax,eax ; hlt
+  const std::uint8_t code[] = {0xF2, 0xAE, 0x31, 0xC0, 0xF4};
+  ASSERT_TRUE(memory.write(kProg, code, sizeof(code)));
+
+  seven::CpuState state{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kProg;
+  state.rflags = 0x202 | seven::kFlagZF;  // DF clear, ZF set on entry
+  state.gpr[0] = 0x41;                    // AL, never present in the buffer
+  state.gpr[1] = 16;                      // RCX
+  state.gpr[7] = kData;                   // RDI
+  state.gpr[4] = kProg + 0x800;
+
+  const auto result = executor.run(state, memory, 256);
+  EXPECT_EQ(result.reason, seven::StopReason::halted);
+  EXPECT_EQ(state.gpr[1], 0u) << "the scan stopped early on a zero flag that was masked away";
+  EXPECT_EQ(state.gpr[7], kData + 16) << "rdi must have walked the whole buffer";
+}

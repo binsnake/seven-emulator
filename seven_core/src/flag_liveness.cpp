@@ -399,6 +399,24 @@ bool can_fault(const iced_x86::Instruction& instr) noexcept {
   return instr.op_count() > 0 && instr.op_kind(0) >= iced_x86::OpKind::MEMORY_SEG_SI;
 }
 
+// The other reason an instruction's own flag write has to stay live: a rep-prefixed CMPS or SCAS
+// tests the ZF its own compare just wrote to decide whether to run another iteration. The flags
+// table already declares that ZF read, but `read` is folded into the live set only after this
+// instruction's mask has been computed, so it protects the instruction BEFORE it and not itself.
+// CMPS happens to be covered by the memory-destination test above; SCAS writes AL, so it was not.
+[[nodiscard]] bool rereads_own_flag_write(iced_x86::Code code) noexcept {
+  using Code = iced_x86::Code;
+  switch (code) {
+    case Code::CMPSB_M8_M8: case Code::CMPSW_M16_M16:
+    case Code::CMPSD_M32_M32: case Code::CMPSQ_M64_M64:
+    case Code::SCASB_AL_M8: case Code::SCASW_AX_M16:
+    case Code::SCASD_EAX_M32: case Code::SCASQ_RAX_M64:
+      return true;
+    default:
+      return false;
+  }
+}
+
 void compute_flag_liveness(std::span<FlagLivenessInstr> insts) noexcept {
   // Live-out of the block is conservatively "every ALU status flag" -- Phase 1 does no
   // cross-block liveness, so whatever comes after this block
@@ -416,7 +434,10 @@ void compute_flag_liveness(std::span<FlagLivenessInstr> insts) noexcept {
     // covers the faulting instruction's own write, which needs the same protection and was not
     // getting it: the boost went into `live` for the next iteration only, after the current
     // instruction's mask had already been computed.
-    const auto own = faults_after_writing_flags(*it->instr) ? kAluStatusFlagsMask : 0;
+    const auto own = (faults_after_writing_flags(*it->instr) ||
+                      rereads_own_flag_write(it->instr->code()))
+                         ? kAluStatusFlagsMask
+                         : 0;
     it->dead_flags_mask = written & ~(live | own);
     live = (live & ~written) | read;
   }
