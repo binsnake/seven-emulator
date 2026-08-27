@@ -112,6 +112,35 @@ TEST(KuberaMemory, WraparoundWriteStillInvokesRangeScopedAccessHook) {
   EXPECT_TRUE(hook_invoked);
 }
 
+// The other half of that comparison. The test above covers a wrapping ACCESS against a sane range;
+// this covers a sane access against a range whose own base + size runs off the top. The registered
+// end folded back down to a small number, so `event.address >= range_end` was true for every
+// address in the range the host actually asked to watch, and the hook was skipped for all of them.
+// Same consequence as above: for a write hook, skipped means the veto never runs.
+TEST(KuberaMemory, HookRangeRunningOffTheTopStillCoversItsOwnAddresses) {
+  seven::Memory memory{};
+  memory.map(0xFFFF'FFFF'FFFF'F000ull, 0x1000, seven::kMemoryPermissionAll);
+
+  int hook_calls = 0;
+  const auto id = memory.add_access_hook(
+      [&](const seven::MemoryAccessEvent&) {
+        ++hook_calls;
+        return false;  // veto, so a skipped hook shows up as a write that went through
+      },
+      // Ends exactly one byte past the top of the address space.
+      seven::MemoryHookRange{.base = 0xFFFF'FFFF'FFFF'F000ull, .size = 0x1001},
+      seven::bit(seven::MemoryAccessKind::data_write));
+  ASSERT_NE(id, 0u);
+
+  const std::uint32_t value = 0xDEADBEEFu;
+  EXPECT_FALSE(memory.write(0xFFFF'FFFF'FFFF'F100ull, &value, sizeof(value)));
+  EXPECT_EQ(hook_calls, 1);
+
+  std::uint32_t read_back = 0xFFFFFFFFu;
+  ASSERT_TRUE(memory.read(0xFFFF'FFFF'FFFF'F100ull, &read_back, sizeof(read_back)));
+  EXPECT_EQ(read_back, 0u) << "the vetoed write reached the page anyway";
+}
+
 // map()/unmap()/reprotect() all derived their exclusive end page as
 // `(base + size + kPageSize - 1) / kPageSize`. For any range reaching the very top of the address
 // space that addition wraps, the end page comes out as 0, and the `page < last_page` loop body

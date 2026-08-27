@@ -34,6 +34,18 @@ bool access_wraps(std::uint64_t base, std::size_t size) noexcept {
   return base + (static_cast<std::uint64_t>(size) - 1) < base;
 }
 
+// The exclusive end of a registered range, held at the top of the address space rather than
+// wrapping past it. Every range test below is a plain non-wrapping interval comparison, so an end
+// that folded back down to a small number would quietly stop matching: an mmio region would lose
+// its own addresses to the raw page path, and an access hook registered over that range would be
+// skipped entirely. For a write hook that is a bypass of whatever the hook enforces, since
+// access_allowed() runs before the page write. The guest-controlled side of these comparisons is
+// already guarded; this is the host-registered side.
+std::uint64_t range_end_saturating(std::uint64_t base, std::size_t size) noexcept {
+  const auto end = base + size;
+  return end < base ? ~std::uint64_t{0} : end;
+}
+
 }  // namespace
 
 std::uint64_t Memory::InstanceIdentity::allocate() noexcept {
@@ -518,10 +530,10 @@ Memory::HookId Memory::map_mmio(std::uint64_t base, std::size_t size, MmioReadCa
   mmio_regions_.push_back(MmioRegion{id, base, size, std::move(on_read), std::move(on_write)});
   if (mmio_regions_.size() == 1) {
     mmio_min_base_ = base;
-    mmio_max_end_ = base + size;
+    mmio_max_end_ = range_end_saturating(base, size);
   } else {
     mmio_min_base_ = std::min(mmio_min_base_, base);
-    mmio_max_end_ = std::max(mmio_max_end_, base + size);
+    mmio_max_end_ = std::max(mmio_max_end_, range_end_saturating(base, size));
   }
   refresh_jit_fast_path_blocked();
   return id;
@@ -536,10 +548,10 @@ bool Memory::unmap_mmio(HookId id) {
         mmio_max_end_ = 0;
       } else {
         mmio_min_base_ = mmio_regions_.front().base;
-        mmio_max_end_ = mmio_regions_.front().base + mmio_regions_.front().size;
+        mmio_max_end_ = range_end_saturating(mmio_regions_.front().base, mmio_regions_.front().size);
         for (const auto& region : mmio_regions_) {
           mmio_min_base_ = std::min(mmio_min_base_, region.base);
-          mmio_max_end_ = std::max(mmio_max_end_, region.base + region.size);
+          mmio_max_end_ = std::max(mmio_max_end_, range_end_saturating(region.base, region.size));
         }
       }
       refresh_jit_fast_path_blocked();
@@ -613,10 +625,10 @@ void Memory::restore_mmio_regions(const std::vector<MmioRegionSnapshot>& regions
     next_hook_id_ = std::max(next_hook_id_, region.id + 1);
     if (mmio_regions_.size() == 1) {
       mmio_min_base_ = region.base;
-      mmio_max_end_ = region.base + region.size;
+      mmio_max_end_ = range_end_saturating(region.base, region.size);
     } else {
       mmio_min_base_ = std::min(mmio_min_base_, region.base);
-      mmio_max_end_ = std::max(mmio_max_end_, region.base + region.size);
+      mmio_max_end_ = std::max(mmio_max_end_, range_end_saturating(region.base, region.size));
     }
   }
   // Every other mmio mutator refreshes this. Without it a restore that brings regions back into an
@@ -665,7 +677,7 @@ const Memory::MmioRegion* Memory::find_mmio_region(std::uint64_t address, std::s
     return nullptr;
   }
   for (const auto& region : mmio_regions_) {
-    if (address >= region.base && end <= (region.base + region.size)) {
+    if (address >= region.base && end <= range_end_saturating(region.base, region.size)) {
       return &region;
     }
   }
@@ -713,7 +725,7 @@ bool Memory::access_allowed(const MemoryAccessEvent& event) const {
     }
     if (hook.range.has_value()) {
       const auto range_base = hook.range->base;
-      const auto range_end = range_base + hook.range->size;
+      const auto range_end = range_end_saturating(range_base, hook.range->size);
       const auto access_end = event.address + event.size;
       // event.address is guest-controlled (unlike range_base/size, which the host set up when
       // registering the hook) -- a guest picking an address near ~0ull can make access_end wrap
