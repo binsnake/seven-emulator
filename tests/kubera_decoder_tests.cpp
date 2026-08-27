@@ -6,6 +6,8 @@
 
 #include <iced_x86/decoder.hpp>
 #include <iced_x86/instruction.hpp>
+#include <iced_x86/op_code_info.hpp>
+#include <iced_x86/op_code_operand_kind.hpp>
 
 #include "seven/handler_helpers.hpp"
 
@@ -194,5 +196,95 @@ TEST(KuberaDecoder, VectorLengthDoesNotPromoteScalarOperands) {
   };
   for (const auto& c : cases) {
     EXPECT_EQ(decode(c.bytes).op0_register(), c.op0) << c.name << " (" << c.bytes << ")";
+  }
+}
+
+// iced carries a per-Code operand table describing how each Code is encoded, and the decoder is
+// supposed to agree with it. Where a Code's table says an operand is register-only -- either a
+// register field outright, or the r/m field restricted to mod == 3 -- that operand must never come
+// back as memory. When it does, the decoder handed out the wrong Code for the encoding, and the
+// handler that Code dispatches to reads a register slot the decoder never filled in.
+//
+// Two ways that happened here. The serialized tables store one Code per group and count the rest
+// off from it, which lands on an unrelated instruction wherever the enum is not contiguous; and a
+// register-only handler read a memory operand instead of rejecting mod != 3.
+namespace {
+
+[[nodiscard]] bool operand_kind_is_register_only(iced_x86::OpCodeOperandKind kind) {
+  using K = iced_x86::OpCodeOperandKind;
+  switch (kind) {
+    case K::R8_REG: case K::R16_REG: case K::R32_REG: case K::R64_REG:
+    case K::R16_RM: case K::R32_RM: case K::R64_RM:
+    case K::SEG_REG: case K::K_REG: case K::KP1_REG: case K::K_RM:
+    case K::MM_REG: case K::MM_RM:
+    case K::XMM_REG: case K::XMM_RM:
+    case K::YMM_REG: case K::YMM_RM:
+    case K::ZMM_REG: case K::ZMM_RM:
+    case K::CR_REG: case K::DR_REG: case K::TR_REG: case K::BND_REG:
+    case K::TMM_REG: case K::TMM_RM:
+      return true;
+    default:
+      return false;
+  }
+}
+
+[[nodiscard]] bool operand_is_memory(iced_x86::OpKind kind) {
+  // The memory OpKind family is contiguous, MEMORY_SEG_SI through MEMORY.
+  return kind >= iced_x86::OpKind::MEMORY_SEG_SI && kind <= iced_x86::OpKind::MEMORY;
+}
+
+void expect_operands_match_table(const std::vector<std::uint8_t>& bytes) {
+  iced_x86::Decoder decoder(64, std::span<const std::uint8_t>(bytes.data(), bytes.size()), 0x1000);
+  const auto decoded = decoder.decode();
+  if (!decoded.has_value() || decoded->code() == iced_x86::Code::INVALID) {
+    return;
+  }
+  const auto& info = iced_x86::OpCodeInfo::get(decoded->code());
+  const auto count = decoded->op_count();
+  for (std::uint32_t i = 0; i < count && i < 5; ++i) {
+    if (!operand_is_memory(decoded->op_kind(i))) continue;
+    ASSERT_FALSE(operand_kind_is_register_only(info.op_kind(i)))
+        << "code " << static_cast<unsigned>(decoded->code()) << " operand " << i
+        << " decoded as memory but its own table says register-only";
+  }
+}
+
+}  // namespace
+
+TEST(KuberaDecoder, DerivedCodesAgreeWithTheirOwnOperandTables) {
+  // The two encodings that were getting it wrong, pinned by name.
+  // vmovhps xmm1, xmm3, [rbx] -- was landing on the EVEX register-only form
+  EXPECT_EQ(decode("C5 E0 16 0B").code(), iced_x86::Code::VEX_VMOVHPS_XMM_XMM_M64);
+  // and the register form it sits next to must not have moved
+  EXPECT_EQ(decode("C5 E0 16 CB").code(), iced_x86::Code::VEX_VMOVLHPS_XMM_XMM_XMM);
+  // vpbroadcastb takes its source from a GPR; there is no memory form at this opcode
+  EXPECT_FALSE(try_decode("62 F2 7D 08 7A 00").has_value());
+  EXPECT_EQ(decode("62 F2 7D 08 7A C0").code(), iced_x86::Code::EVEX_VPBROADCASTB_XMM_K1Z_R32);
+
+  const std::vector<std::vector<std::uint8_t>> prefixes = {
+      {}, {0x0F}, {0x0F, 0x38}, {0x0F, 0x3A},
+      {0x66, 0x0F}, {0x66, 0x0F, 0x38}, {0x66, 0x0F, 0x3A},
+      {0xF2, 0x0F}, {0xF3, 0x0F},
+      {0x48, 0x0F}, {0x66, 0x48, 0x0F}, {0x4C, 0x0F},
+      {0xC5, 0xF8}, {0xC5, 0xFC}, {0xC5, 0xE0}, {0xC5, 0xE1}, {0xC5, 0xE4},
+      {0xC4, 0xE1, 0x78}, {0xC4, 0xE1, 0xF8}, {0xC4, 0xE2, 0x79}, {0xC4, 0xE3, 0x79},
+      {0xC4, 0xE2, 0x7D}, {0xC4, 0xE3, 0x7D}, {0xC4, 0xE2, 0xF9}, {0xC4, 0xE3, 0xF9},
+      {0x62, 0xF1, 0x7C, 0x08}, {0x62, 0xF1, 0x7C, 0x48}, {0x62, 0xF1, 0xFD, 0x08},
+      {0x62, 0xF2, 0x7D, 0x08}, {0x62, 0xF2, 0xFD, 0x48}, {0x62, 0xF3, 0x7D, 0x08},
+      {0x62, 0xF2, 0x7D, 0x48}, {0x62, 0xF3, 0xFD, 0x08},
+  };
+  // Both mod forms of every opcode on each map, across enough r/m values to reach the SIB and
+  // displacement paths.
+  for (const auto& prefix : prefixes) {
+    for (unsigned opcode = 0; opcode < 256; ++opcode) {
+      for (unsigned modrm : {0x00u, 0x04u, 0x05u, 0x0Bu, 0x48u, 0x8Bu, 0xC0u, 0xCBu}) {
+        std::vector<std::uint8_t> bytes = prefix;
+        bytes.push_back(static_cast<std::uint8_t>(opcode));
+        bytes.push_back(static_cast<std::uint8_t>(modrm));
+        for (int i = 0; i < 8; ++i) bytes.push_back(0x11);
+        expect_operands_match_table(bytes);
+        if (::testing::Test::HasFatalFailure()) return;
+      }
+    }
   }
 }

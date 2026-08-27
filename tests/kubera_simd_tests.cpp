@@ -696,24 +696,46 @@ TEST(KuberaSimd, VmovlpsLoadsTheLowHalf) {
   EXPECT_EQ(xmm_u64(state, 1, 1), 0x3333'3333'3333'3333ull) << "high half from the merge source";
 }
 
-// VMOVLHPS and VMOVHLPS are register-only, but this decoder produces one of their Codes for a
-// mod != 3 encoding while still marking operand 2 as memory. The handlers used to read that slot
-// as a register regardless, which resolves to XMM0.
-TEST(KuberaSimd, RegisterOnlyHalfMovesRejectAMemoryOperand) {
+// This encoding is a three-operand VMOVHPS: high half from memory, low half from the merge
+// source. The decoder used to hand it the EVEX VMOVLHPS Code -- a register-only form -- because
+// the table derives the memory-form Code by counting one on from the register form and the two
+// are not adjacent in this enum. The handler then read a register out of a slot the decoder had
+// marked as memory, which resolves to XMM0, and the memory operand went untouched.
+TEST(KuberaSimd, VmovhpsWithAMemorySourceIsNotTheRegisterOnlyForm) {
   seven::Executor executor{};
   seven::CpuState state{};
   seven::Memory memory{};
   state.mode = seven::ExecutionMode::long64;
   state.rip = kBase;
   memory.map(kBase, 0x1000);
-  write_bytes(memory, kBase, seven::parse_hex_bytes("C5 E0 16 0B"));
+  write_bytes(memory, kBase, seven::parse_hex_bytes("C5 E0 16 0B"));  // vmovhps xmm1, xmm3, [rbx]
 
-  state.gpr[3] = kBase + 0x200;
+  state.gpr[3] = kBase + 0x200;  // rbx
   set_xmm_u64(state, 0, 0x9999'9999'9999'9999ull, 0x9999'9999'9999'9999ull);
   set_xmm_u64(state, 1, 0, 0);
+  set_xmm_u64(state, 3, 0x4444'4444'4444'4444ull, 0x5555'5555'5555'5555ull);
+  const std::uint64_t loaded = 0xDEAD'BEEF'CAFE'BABEull;
+  ASSERT_TRUE(memory.write(kBase + 0x200, &loaded, sizeof(loaded)));
 
-  const auto result = executor.step(state, memory);
-  EXPECT_NE(result.reason, seven::StopReason::none);
-  EXPECT_EQ(xmm_u64(state, 1, 0), 0u) << "destination written from XMM0";
-  EXPECT_EQ(xmm_u64(state, 1, 1), 0u) << "destination written from XMM0";
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+  EXPECT_EQ(xmm_u64(state, 1, 0), 0x4444'4444'4444'4444ull) << "low half from the merge source";
+  EXPECT_EQ(xmm_u64(state, 1, 1), loaded) << "high half from memory";
+}
+
+// The register-only form at the same opcode still decodes and runs as itself.
+TEST(KuberaSimd, VmovlhpsStillMovesTheLowHalvesUp) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("C5 E0 16 CB"));  // vmovlhps xmm1, xmm3, xmm3
+
+  set_xmm_u64(state, 1, 0, 0);
+  set_xmm_u64(state, 3, 0x4444'4444'4444'4444ull, 0x5555'5555'5555'5555ull);
+
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+  EXPECT_EQ(xmm_u64(state, 1, 0), 0x4444'4444'4444'4444ull);
+  EXPECT_EQ(xmm_u64(state, 1, 1), 0x4444'4444'4444'4444ull);
 }
