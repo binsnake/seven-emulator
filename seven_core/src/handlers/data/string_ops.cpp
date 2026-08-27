@@ -28,14 +28,15 @@ constexpr std::uint64_t kMaxRepIterationsPerCall = 4096;
 ExecutionResult cmps_impl(ExecutionContext& ctx, std::size_t width) {
   const bool rep = ctx.instr.has_rep_prefix() || ctx.instr.has_repne_prefix();
   const bool repne = ctx.instr.has_repne_prefix();
-  std::uint64_t remaining = rep ? ctx.state.gpr[1] : 1ull;
+  const auto addr_mask = detail::string_address_mask(ctx.instr);
+  std::uint64_t remaining = rep ? (ctx.state.gpr[1] & addr_mask) : 1ull;
   if (remaining == 0) {
     return {};
   }
 
   const bool df = (ctx.state.rflags & kFlagDF) != 0;
-  std::uint64_t rsi = ctx.state.gpr[6];
-  std::uint64_t rdi = ctx.state.gpr[7];
+  std::uint64_t rsi = ctx.state.gpr[6] & addr_mask;
+  std::uint64_t rdi = ctx.state.gpr[7] & addr_mask;
   std::uint64_t iterations_done = 0;
 
   while (remaining > 0) {
@@ -69,6 +70,8 @@ ExecutionResult cmps_impl(ExecutionContext& ctx, std::size_t width) {
       rsi += width;
       rdi += width;
     }
+    rsi &= addr_mask;
+    rdi &= addr_mask;
     --remaining;
 
     bool continue_loop = false;
@@ -108,13 +111,14 @@ ExecutionResult cmps_impl(ExecutionContext& ctx, std::size_t width) {
 ExecutionResult scas_impl(ExecutionContext& ctx, std::size_t width) {
   const bool rep = ctx.instr.has_rep_prefix() || ctx.instr.has_repne_prefix();
   const bool repne = ctx.instr.has_repne_prefix();
-  std::uint64_t remaining = rep ? ctx.state.gpr[1] : 1ull;
+  const auto addr_mask = detail::string_address_mask(ctx.instr);
+  std::uint64_t remaining = rep ? (ctx.state.gpr[1] & addr_mask) : 1ull;
   if (remaining == 0) {
     return {};
   }
 
   const bool df = (ctx.state.rflags & kFlagDF) != 0;
-  std::uint64_t rdi = ctx.state.gpr[7];
+  std::uint64_t rdi = ctx.state.gpr[7] & addr_mask;
   const auto lhs = detail::read_register(ctx.state, iced_x86::Register::RAX) & width_mask(width);
   std::uint64_t iterations_done = 0;
 
@@ -136,6 +140,7 @@ ExecutionResult scas_impl(ExecutionContext& ctx, std::size_t width) {
     } else {
       rdi += width;
     }
+    rdi &= addr_mask;
     --remaining;
 
     bool continue_loop = false;
@@ -171,13 +176,14 @@ ExecutionResult scas_impl(ExecutionContext& ctx, std::size_t width) {
 
 ExecutionResult stos_impl(ExecutionContext& ctx, std::size_t width) {
   const bool rep = ctx.instr.has_rep_prefix() || ctx.instr.has_repne_prefix();
-  std::uint64_t remaining = rep ? ctx.state.gpr[1] : 1ull;
+  const auto addr_mask = detail::string_address_mask(ctx.instr);
+  std::uint64_t remaining = rep ? (ctx.state.gpr[1] & addr_mask) : 1ull;
   if (remaining == 0) {
     return {};
   }
 
   const bool df = (ctx.state.rflags & kFlagDF) != 0;
-  std::uint64_t rdi = ctx.state.gpr[7];
+  std::uint64_t rdi = ctx.state.gpr[7] & addr_mask;
   const auto value = detail::read_register(ctx.state, iced_x86::Register::RAX) & width_mask(width);
   std::uint64_t iterations_done = 0;
 
@@ -194,6 +200,7 @@ ExecutionResult stos_impl(ExecutionContext& ctx, std::size_t width) {
     } else {
       rdi += width;
     }
+    rdi &= addr_mask;
     --remaining;
 
     if (detail::note_debug_break(ctx, hit_bits, rep && remaining > 0)) {
@@ -223,13 +230,14 @@ ExecutionResult stos_impl(ExecutionContext& ctx, std::size_t width) {
 
 ExecutionResult lods_impl(ExecutionContext& ctx, std::size_t width) {
   const bool rep = ctx.instr.has_rep_prefix() || ctx.instr.has_repne_prefix();
-  std::uint64_t remaining = rep ? ctx.state.gpr[1] : 1ull;
+  const auto addr_mask = detail::string_address_mask(ctx.instr);
+  std::uint64_t remaining = rep ? (ctx.state.gpr[1] & addr_mask) : 1ull;
   if (remaining == 0) {
     return {};
   }
 
   const bool df = (ctx.state.rflags & kFlagDF) != 0;
-  std::uint64_t rsi = ctx.state.gpr[6];
+  std::uint64_t rsi = ctx.state.gpr[6] & addr_mask;
   std::uint64_t iterations_done = 0;
 
   while (remaining > 0) {
@@ -247,6 +255,7 @@ ExecutionResult lods_impl(ExecutionContext& ctx, std::size_t width) {
     } else {
       rsi += width;
     }
+    rsi &= addr_mask;
     --remaining;
 
     if (detail::note_debug_break(ctx, hit_bits, rep && remaining > 0)) {

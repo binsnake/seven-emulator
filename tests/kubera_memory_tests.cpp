@@ -1046,3 +1046,48 @@ TEST(KuberaMemory, AZeroSizeAccessNeverReachesADeviceCallback) {
   EXPECT_TRUE(memory.write(0x8100, &scratch, 0));
   EXPECT_EQ(hits, 0);
 }
+
+// A 0x67 prefix makes a string instruction use ECX/ESI/EDI. iced records that only in the operand
+// kind, never in the Code, so a handler reading the 64-bit registers executes an entirely different
+// instruction: an RCX whose low half is zero looks like four billion iterations rather than none.
+TEST(KuberaMemory, StringOperationsHonourTheAddressSizePrefix) {
+  seven::Memory memory{};
+  seven::Executor executor{};
+  memory.map(0x1000, 0x1000);
+  memory.map(0x4000, 0x1000, seven::kMemoryPermissionReadWrite);
+
+  const auto run_one = [&](const std::vector<std::uint8_t>& code, seven::CpuState& state) {
+    EXPECT_TRUE(memory.write(0x1000, code.data(), code.size()));
+    state.mode = seven::ExecutionMode::long64;
+    state.rip = 0x1000;
+    state.rflags = 0x202;
+    return executor.step(state, memory);
+  };
+
+  {
+    // 67 F3 AA -- rep stosb with ECX == 0. Hardware stores nothing.
+    seven::CpuState state{};
+    state.gpr[0] = 0xFF;                  // AL
+    state.gpr[1] = 0x0000'0001'0000'0000; // RCX: ECX is zero
+    state.gpr[7] = 0x4000;                // RDI
+    ASSERT_EQ(run_one({0x67, 0xF3, 0xAA}, state).reason, seven::StopReason::none);
+    std::uint8_t first = 0xAB;
+    ASSERT_TRUE(memory.read(0x4000, &first, 1));
+    EXPECT_EQ(first, 0u) << "ECX was zero, so nothing should have been stored";
+    EXPECT_EQ(state.gpr[1], 0x0000'0001'0000'0000ull) << "no iterations, so rcx is untouched";
+  }
+  {
+    // The count itself must come from ECX, not RCX.
+    seven::CpuState state{};
+    state.gpr[0] = 0x5A;
+    state.gpr[1] = 0xFFFF'FFFF'0000'0004;  // ECX == 4
+    state.gpr[7] = 0x4100;
+    ASSERT_EQ(run_one({0x67, 0xF3, 0xAA}, state).reason, seven::StopReason::none);
+    std::array<std::uint8_t, 5> seen{};
+    ASSERT_TRUE(memory.read(0x4100, seen.data(), seen.size()));
+    const std::array<std::uint8_t, 5> expected = {0x5A, 0x5A, 0x5A, 0x5A, 0x00};
+    EXPECT_EQ(seen, expected);
+    EXPECT_EQ(state.gpr[1], 0u) << "writing ecx zero-extends";
+    EXPECT_EQ(state.gpr[7], 0x4104u);
+  }
+}

@@ -129,6 +129,27 @@ ExecutionResult divide_fault(ExecutionContext& ctx);
   return {};
 }
 
+// How wide the index and count registers are for a string instruction. An address-size prefix is
+// the only thing that changes it, and iced records that nowhere in the Code -- STOSB is one code
+// for all three sizes -- only in the operand kind, so this is the one place it can be read from.
+// Masking the pointers and the count on the way in and after every step is all it takes: writing a
+// masked value back to a 64-bit register zero-extends it, which is what a 32-bit register write
+// does anyway.
+[[nodiscard]] inline std::uint64_t string_address_mask(const iced_x86::Instruction& instr) noexcept {
+  for (std::uint32_t i = 0; i < instr.op_count(); ++i) {
+    switch (instr.op_kind(i)) {
+      case iced_x86::OpKind::MEMORY_SEG_SI:
+      case iced_x86::OpKind::MEMORY_ESDI:
+        return 0xFFFFull;
+      case iced_x86::OpKind::MEMORY_SEG_ESI:
+      case iced_x86::OpKind::MEMORY_ESEDI:
+        return 0xFFFFFFFFull;
+      default:
+        break;
+    }
+  }
+  return ~0ull;
+}
 
 }  // namespace detail
 }  // namespace seven

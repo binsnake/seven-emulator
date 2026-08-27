@@ -204,6 +204,11 @@ ExecutionResult store_x87_env(ExecutionContext& ctx, std::uint64_t base, std::si
   put_le16(image.data() + layout.ftw, x87_full_tag_word(ctx.state));
   // FIP/FCS/FDP/FDS stay zero; this emulator does not track the x87 instruction or data pointers.
   if (!ctx.memory.write(base, image.data(), env_size)) return detail::memory_fault(ctx, base);
+  // Storing the environment masks every exception, so the handler about to walk it cannot be
+  // interrupted by one of its own. The image above was built first and keeps the old control word.
+  // FSAVE reaches the same state through the reset it does afterwards.
+  ctx.state.set_x87_control_word(
+      static_cast<std::uint16_t>(ctx.state.get_x87_control_word() | 0x3Fu));
   return {};
 }
 

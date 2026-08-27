@@ -29,14 +29,15 @@ constexpr std::uint64_t kMaxRepIterationsPerCall = 4096;
 
 ExecutionResult movs_impl(ExecutionContext& ctx, const std::size_t width) {
   const bool rep = ctx.instr.has_rep_prefix() || ctx.instr.has_repne_prefix();
-  std::uint64_t count = rep ? ctx.state.gpr[1] : 1u;  // RCX
+  const auto addr_mask = detail::string_address_mask(ctx.instr);
+  std::uint64_t count = rep ? (ctx.state.gpr[1] & addr_mask) : 1u;  // RCX
   if (count == 0) {
     return {};
   }
 
   const bool df = (ctx.state.rflags & kFlagDF) != 0;
-  std::uint64_t rsi = ctx.state.gpr[6];
-  std::uint64_t rdi = ctx.state.gpr[7];
+  std::uint64_t rsi = ctx.state.gpr[6] & addr_mask;
+  std::uint64_t rdi = ctx.state.gpr[7] & addr_mask;
 
   for (std::uint64_t i = 0; i < count; ++i) {
     const auto read_addr = rsi;
@@ -70,6 +71,8 @@ ExecutionResult movs_impl(ExecutionContext& ctx, const std::size_t width) {
       rsi += width;
       rdi += width;
     }
+    rsi &= addr_mask;
+    rdi &= addr_mask;
 
     const auto remaining = count - i - 1;
     if (detail::note_debug_break(ctx, hit_bits, rep && remaining > 0)) {
