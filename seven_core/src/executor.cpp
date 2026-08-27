@@ -222,6 +222,13 @@ struct DebugMemoryAccess {
   return accesses;
 }
 
+// DR7[0:7] are the four slots' local/global enable pairs; nothing else in the register can arm a
+// breakpoint. Testing the whole register instead treats a DR7 of 0x400 -- bit 10 reads as 1 on real
+// hardware, so that is what an OS writes to mean "none armed" -- as though a breakpoint were live.
+[[nodiscard]] bool has_enabled_breakpoints(const CpuState& state) noexcept {
+  return (state.dr[7] & 0xFFu) != 0;
+}
+
 [[nodiscard]] bool has_enabled_execute_breakpoints(const CpuState& state) noexcept {
   const std::uint64_t dr7 = state.dr[7];
   for (std::uint32_t i = 0; i < 4; ++i) {
@@ -407,7 +414,7 @@ bool Executor::jit_bypass_eligible(const CpuState& state, const Memory& memory) 
   // span ran against a CpuState nobody had refreshed and discarded every register write it made --
   // the whole bridge quietly did nothing for as long as the span lasted. Same reasoning as the hook
   // check above; they were simply missed because they are not stored as hooks.
-  return (state.rflags & kFlagTF) == 0 && state.dr[7] == 0 && !context_read_cb_ && !context_write_cb_ &&
+  return (state.rflags & kFlagTF) == 0 && !has_enabled_breakpoints(state) && !context_read_cb_ && !context_write_cb_ &&
          block_liveness_eligible(memory);
 }
 
@@ -933,7 +940,7 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
     // the write side hands the host a CpuState at every instruction boundary, so a flag write the
     // span was going to cover later has already been observed missing by then.
     const bool masking_safe_now = allow_masking && (state.rflags & kFlagTF) == 0 &&
-                                   state.dr[7] == 0 && !context_read_cb_ && !context_write_cb_ &&
+                                   !has_enabled_breakpoints(state) && !context_read_cb_ && !context_write_cb_ &&
                                    block_liveness_eligible(memory);
     // Saved and put back rather than plain assigned. A handler's memory access can land on an
     // MMIO device or a passthrough, and that host callback is free to re-enter run(); the nested
