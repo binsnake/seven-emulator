@@ -34,11 +34,10 @@ ExecutionResult handle_code_WRMSRNS(ExecutionContext& ctx) {
   if (!cpl_is_zero(ctx.state)) {
     return gp_fault(ctx);
   }
-  bool msr_ok = false;
-  const auto msr_index = static_cast<std::uint32_t>(detail::read_operand(ctx, 0, 4, &msr_ok));
-  if (!msr_ok) {
-    return detail::memory_fault(ctx, detail::memory_address(ctx));
-  }
+  // WRMSRNS encodes no operands at all -- it takes the index from ECX exactly like WRMSR. Reading
+  // operand slot 0 got back the value-initialised (REGISTER, NONE) slot, which resolves to a
+  // register index of zero, so the index came from EAX and every write landed on the wrong MSR.
+  const auto msr_index = static_cast<std::uint32_t>(detail::read_register(ctx.state, iced_x86::Register::ECX));
   const std::uint64_t eax = detail::read_register(ctx.state, iced_x86::Register::EAX);
   const std::uint64_t edx = detail::read_register(ctx.state, iced_x86::Register::EDX);
   if (!detail::write_msr(ctx.state, msr_index, (edx << 32) | (eax & 0xFFFFFFFFull))) {

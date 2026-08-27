@@ -255,7 +255,25 @@ ExecutionResult movhlps_legacy(ExecutionContext& ctx) {
   return {};
 }
 
+// Both of these are register-only forms, but this decoder hands back an
+// EVEX_VMOVLHPS_XMM_XMM_XMM for a VEX 0F 16 encoding with mod != 3, with op2 still marked
+// MEMORY. op_register on that slot is Register::NONE, which resolves to a vector index of zero,
+// so the handler would quietly operate on XMM0 and never touch the memory operand. Refuse the
+// shape here rather than depend on the decoder tables to never produce it.
+[[nodiscard]] ExecutionResult unsupported_shape(ExecutionContext& ctx) {
+  return {StopReason::unsupported_instruction, 0,
+          ExceptionInfo{StopReason::unsupported_instruction, ctx.state.rip, 0}, ctx.instr.code()};
+}
+
+[[nodiscard]] bool three_register_operands(const ExecutionContext& ctx) {
+  return ctx.instr.op_count() >= 3 &&
+         ctx.instr.op_kind(0) == iced_x86::OpKind::REGISTER &&
+         ctx.instr.op_kind(1) == iced_x86::OpKind::REGISTER &&
+         ctx.instr.op_kind(2) == iced_x86::OpKind::REGISTER;
+}
+
 ExecutionResult vmovlhps(ExecutionContext& ctx) {
+  if (!three_register_operands(ctx)) return unsupported_shape(ctx);
   const auto dst_reg = ctx.instr.op_register(0);
   const auto src1_reg = ctx.instr.op_register(1);
   const auto src2_reg = ctx.instr.op_register(2);
@@ -267,6 +285,7 @@ ExecutionResult vmovlhps(ExecutionContext& ctx) {
 }
 
 ExecutionResult vmovhlps(ExecutionContext& ctx) {
+  if (!three_register_operands(ctx)) return unsupported_shape(ctx);
   const auto dst_reg = ctx.instr.op_register(0);
   const auto src1_reg = ctx.instr.op_register(1);
   const auto src2_reg = ctx.instr.op_register(2);
@@ -308,8 +327,10 @@ ExecutionResult handle_code_MOVDQA_XMMM128_XMM(ExecutionContext& ctx) { return f
 KUBERA_FULL_MOVE(MOVDQU_XMMM128_XMM, false)
 KUBERA_LOW_MOVE(MOVLPS_XMM_M64, 8, false)
 KUBERA_LOW_MOVE(MOVLPD_XMM_M64, 8, false)
-KUBERA_MERGE_HIGH_MOVE(MOVHPS_XMM_M64, 8, false)
-KUBERA_MERGE_HIGH_MOVE(MOVHPD_XMM_M64, 8, false)
+// Two operands, not three: the low half is preserved from the destination itself and the source
+// is slot 1. The macro's (0, 1, 2) shape belongs to the VEX forms further down.
+ExecutionResult handle_code_MOVHPS_XMM_M64(ExecutionContext& ctx) { return merge_high_move(ctx, 0, 0, 1, 8, false); }
+ExecutionResult handle_code_MOVHPD_XMM_M64(ExecutionContext& ctx) { return merge_high_move(ctx, 0, 0, 1, 8, false); }
 ExecutionResult handle_code_MOVLHPS_XMM_XMM(ExecutionContext& ctx) { return movlhps_legacy(ctx); }
 ExecutionResult handle_code_MOVHLPS_XMM_XMM(ExecutionContext& ctx) { return movhlps_legacy(ctx); }
 KUBERA_XMM_TO_GPR(MOVLPS_M64_XMM, 8)
@@ -372,9 +393,9 @@ KUBERA_XMM_TO_GPR(VEX_VMOVD_RM32_XMM, 4)
 KUBERA_XMM_TO_GPR(VEX_VMOVQ_RM64_XMM, 8)
 KUBERA_LOW_MOVE(VEX_VMOVQ_XMM_XMMM64, 8, true)
 KUBERA_LOW_MOVE(VEX_VMOVQ_XMMM64_XMM, 8, true)
-KUBERA_MERGE_HIGH_MOVE(VEX_VMOVLPS_XMM_XMM_M64, 8, true)
+KUBERA_MERGE_LOW_MOVE(VEX_VMOVLPS_XMM_XMM_M64, 8, true)
 KUBERA_XMM_TO_GPR(VEX_VMOVLPS_M64_XMM, 8)
-KUBERA_MERGE_HIGH_MOVE(VEX_VMOVLPD_XMM_XMM_M64, 8, true)
+KUBERA_MERGE_LOW_MOVE(VEX_VMOVLPD_XMM_XMM_M64, 8, true)
 KUBERA_XMM_TO_GPR(VEX_VMOVLPD_M64_XMM, 8)
 KUBERA_MERGE_HIGH_MOVE(VEX_VMOVHPS_XMM_XMM_M64, 8, true)
 ExecutionResult handle_code_VEX_VMOVLHPS_XMM_XMM_XMM(ExecutionContext& ctx) { return vmovlhps(ctx); }
@@ -465,9 +486,9 @@ KUBERA_XMM_TO_GPR(EVEX_VMOVD_RM32_XMM, 4)
 KUBERA_XMM_TO_GPR(EVEX_VMOVQ_RM64_XMM, 8)
 KUBERA_LOW_MOVE(EVEX_VMOVQ_XMM_XMMM64, 8, true)
 KUBERA_LOW_MOVE(EVEX_VMOVQ_XMMM64_XMM, 8, true)
-KUBERA_MERGE_HIGH_MOVE(EVEX_VMOVLPS_XMM_XMM_M64, 8, true)
+KUBERA_MERGE_LOW_MOVE(EVEX_VMOVLPS_XMM_XMM_M64, 8, true)
 KUBERA_XMM_TO_GPR(EVEX_VMOVLPS_M64_XMM, 8)
-KUBERA_MERGE_HIGH_MOVE(EVEX_VMOVLPD_XMM_XMM_M64, 8, true)
+KUBERA_MERGE_LOW_MOVE(EVEX_VMOVLPD_XMM_XMM_M64, 8, true)
 KUBERA_XMM_TO_GPR(EVEX_VMOVLPD_M64_XMM, 8)
 KUBERA_MERGE_HIGH_MOVE(EVEX_VMOVHPS_XMM_XMM_M64, 8, true)
 ExecutionResult handle_code_EVEX_VMOVLHPS_XMM_XMM_XMM(ExecutionContext& ctx) { return vmovlhps(ctx); }

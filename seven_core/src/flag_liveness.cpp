@@ -371,6 +371,11 @@ bool can_fault(const iced_x86::Instruction& instr) noexcept {
     case iced_x86::Code::XSETBV:
     case iced_x86::Code::CLI: case iced_x86::Code::STI:
     case iced_x86::Code::WRFSBASE_R64: case iced_x86::Code::WRGSBASE_R64:
+    // The kernel's return-to-user forms, now CPL0-only for the same reason. SYSRET is the sharp
+    // one of the group: it writes the whole of rflags, so liveness would happily treat a flag
+    // write before it as covered, and a #GP at CPL>0 means that cover never happens.
+    case iced_x86::Code::SYSRETD: case iced_x86::Code::SYSRETQ:
+    case iced_x86::Code::SYSEXITD: case iced_x86::Code::SYSEXITQ:
       return true;
     default:
       return false;

@@ -557,6 +557,90 @@ TEST(KuberaScalar, CliAllowedWhenCplWithinIopl) {
   EXPECT_EQ(state.rflags & seven::kFlagIF, 0u);
 }
 
+// WRMSRNS encodes no operands. Reading operand slot 0 anyway got back the value-initialised
+// (REGISTER, NONE) slot, which resolves to register index zero, so the MSR index came from EAX
+// instead of ECX and every write landed somewhere the guest did not name.
+TEST(KuberaScalar, WrmsrnsTakesItsIndexFromEcx) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.gpr[0] = 0x11112222;  // rax: the index the bug would have used
+  state.gpr[1] = 0x00000174;  // rcx: IA32_SYSENTER_CS, the index the instruction names
+  state.gpr[2] = 0x33334444;  // rdx: high half of the value
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("0F 01 C6"));  // wrmsrns
+
+  const auto result = executor.step(state, memory);
+  ASSERT_EQ(result.reason, seven::StopReason::none);
+  ASSERT_TRUE(state.msr.contains(0x174u));
+  EXPECT_EQ(state.msr.at(0x174u), 0x3333444411112222ull);
+  EXPECT_FALSE(state.msr.contains(0x11112222u)) << "index came from eax";
+}
+
+// SYSRET and SYSEXIT are the kernel's way back out to user code and are CPL0-only on hardware.
+// None of the four forms checked, and SYSRETQ additionally loaded rflags wholesale out of R11 --
+// so a ring 3 guest could pick its own IOPL and hand itself back everything the CLI/STI gate two
+// tests up exists to deny, in two instructions.
+TEST(KuberaScalar, SysretDoesNotLetRingThreeRaiseItsOwnIopl) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.sreg[1] = 0x2B;  // CPL 3, IOPL 0
+  state.gpr[11] = 0x3202;  // what the guest would like rflags to become: IOPL 3, IF set
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("48 0F 07"));  // sysretq
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::general_protection);
+  EXPECT_EQ((state.rflags >> 12) & 0x3u, 0u) << "ring 3 picked its own IOPL";
+}
+
+TEST(KuberaScalar, EveryReturnToUserFormIsCplZeroOnly) {
+  struct Case { const char* name; const char* bytes; };
+  const Case cases[] = {
+      {"sysretd", "0F 07"},
+      {"sysretq", "48 0F 07"},
+      {"sysexitd", "0F 35"},
+      {"sysexitq", "48 0F 35"},
+  };
+  for (const auto& c : cases) {
+    seven::Executor executor{};
+    seven::CpuState state{};
+    seven::Memory memory{};
+    state.mode = seven::ExecutionMode::long64;
+    state.rip = kBase;
+    state.sreg[1] = 0x2B;  // CPL 3
+    memory.map(kBase, 0x1000);
+    write_bytes(memory, kBase, seven::parse_hex_bytes(c.bytes));
+
+    const auto result = executor.step(state, memory);
+    EXPECT_EQ(result.reason, seven::StopReason::general_protection) << c.name;
+    EXPECT_EQ(state.mode, seven::ExecutionMode::long64) << c.name << " changed mode from ring 3";
+  }
+}
+
+// The same instruction at CPL0 is a legitimate kernel return and must still work.
+TEST(KuberaScalar, SysretqStillReturnsAtCplZero) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.sreg[1] = 0x08;  // CPL 0
+  state.gpr[1] = kBase + 0x100;  // rcx: the address to return to
+  state.gpr[11] = 0x202;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("48 0F 07"));  // sysretq
+
+  const auto result = executor.step(state, memory);
+  ASSERT_EQ(result.reason, seven::StopReason::none);
+  EXPECT_EQ(state.rip, kBase + 0x100);
+}
+
 TEST(KuberaScalar, WrfsbaseRejectsNonCanonicalAddress) {
   // WRFSBASE/WRGSBASE never route through the ordinary memory-operand fault path (they write
   // FS.base/GS.base directly, not memory), so they need their own canonical-address check --

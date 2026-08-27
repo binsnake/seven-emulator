@@ -634,3 +634,86 @@ TEST(KuberaSimd, TheSameEvexMoveWithNoMaskStillWorks) {
   ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
   EXPECT_EQ(state.vectors[0].value, seven::SimdUint(0x1234567890ABCDEFull));
 }
+
+// The half-register moves come in a two-operand legacy form and a three-operand VEX form, and the
+// handler table gave the legacy ones the VEX shape. MOVHPS xmm1, [rbx] then read operand slot 2,
+// which the instruction does not have -- an unwritten slot reads back as (REGISTER, NONE), which
+// resolves to register index zero -- so it merged RAX into the high half and never touched the
+// memory operand at all. Not even a page fault for an unmapped address.
+TEST(KuberaSimd, LegacyMovhpsMergesTheMemoryOperandIntoTheHighHalf) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("0F 16 0B"));  // movhps xmm1, [rbx]
+
+  state.gpr[0] = 0xAAAA'AAAA'AAAA'AAAAull;  // rax, which the wrong slot resolved to
+  state.gpr[3] = kBase + 0x200;             // rbx
+  set_xmm_u64(state, 0, 0x1111'1111'1111'1111ull, 0x1111'1111'1111'1111ull);
+  set_xmm_u64(state, 1, 0x2222'2222'2222'2222ull, 0x3333'3333'3333'3333ull);
+  const std::uint64_t loaded = 0xDEAD'BEEF'CAFE'BABEull;
+  ASSERT_TRUE(memory.write(kBase + 0x200, &loaded, sizeof(loaded)));
+
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+  EXPECT_EQ(xmm_u64(state, 1, 0), 0x2222'2222'2222'2222ull) << "low half must be preserved";
+  EXPECT_EQ(xmm_u64(state, 1, 1), loaded) << "high half must come from memory";
+}
+
+// Same shape, and it must still fault when the memory operand is unreachable.
+TEST(KuberaSimd, LegacyMovhpsFaultsOnAnUnmappedSource) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("0F 16 0B"));  // movhps xmm1, [rbx]
+  state.gpr[3] = 0x9000'0000ull;  // nothing mapped there
+
+  EXPECT_NE(executor.step(state, memory).reason, seven::StopReason::none);
+}
+
+// VMOVLPS loads the LOW half from memory and keeps the merge source's high half. The table had it
+// on the high-merge helper, so it wrote the m64 into the wrong half of the destination.
+TEST(KuberaSimd, VmovlpsLoadsTheLowHalf) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("C5 E0 12 0B"));  // vmovlps xmm1, xmm3, [rbx]
+
+  state.gpr[3] = kBase + 0x200;  // rbx
+  set_xmm_u64(state, 3, 0x4444'4444'4444'4444ull, 0x3333'3333'3333'3333ull);
+  const std::uint64_t loaded = 0xDEAD'BEEF'CAFE'BABEull;
+  ASSERT_TRUE(memory.write(kBase + 0x200, &loaded, sizeof(loaded)));
+
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+  EXPECT_EQ(xmm_u64(state, 1, 0), loaded) << "low half must come from memory";
+  EXPECT_EQ(xmm_u64(state, 1, 1), 0x3333'3333'3333'3333ull) << "high half from the merge source";
+}
+
+// VMOVLHPS and VMOVHLPS are register-only, but this decoder produces one of their Codes for a
+// mod != 3 encoding while still marking operand 2 as memory. The handlers used to read that slot
+// as a register regardless, which resolves to XMM0.
+TEST(KuberaSimd, RegisterOnlyHalfMovesRejectAMemoryOperand) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("C5 E0 16 0B"));
+
+  state.gpr[3] = kBase + 0x200;
+  set_xmm_u64(state, 0, 0x9999'9999'9999'9999ull, 0x9999'9999'9999'9999ull);
+  set_xmm_u64(state, 1, 0, 0);
+
+  const auto result = executor.step(state, memory);
+  EXPECT_NE(result.reason, seven::StopReason::none);
+  EXPECT_EQ(xmm_u64(state, 1, 0), 0u) << "destination written from XMM0";
+  EXPECT_EQ(xmm_u64(state, 1, 1), 0u) << "destination written from XMM0";
+}
