@@ -17,7 +17,6 @@ ExecutionResult xadd_width(ExecutionContext& ctx, std::size_t width) {
   }
   const auto rhs = detail::read_register(ctx.state, ctx.instr.op_register(1));
   const auto result = lhs + rhs;
-  detail::set_add_flags(ctx.state, lhs, rhs, result, width);
   if (!detail::write_operand(ctx, 0, result, width)) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
@@ -26,6 +25,9 @@ ExecutionResult xadd_width(ExecutionContext& ctx, std::size_t width) {
   if (!same_register && !detail::write_operand(ctx, 1, lhs, width)) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
+  // Last, so a store that faults on a read-only destination leaves rflags alone. CMPXCHG and
+  // BTS/BTR/BTC in this same family already order it this way.
+  detail::set_add_flags(ctx.state, lhs, rhs, result, width);
   return {};
 }
 

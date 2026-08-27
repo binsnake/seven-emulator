@@ -16,16 +16,23 @@ ExecutionMode mode_for_far_width(std::size_t width) {
 }
 
 ExecutionResult retf_width(ExecutionContext& ctx, std::size_t offset_width, std::uint16_t imm16) {
+  const auto entry_sp = ctx.state.gpr[4];
   std::uint64_t target = 0;
   if (auto result = pop_width(ctx, target, offset_width); !result.ok()) {
     return result;
   }
   std::uint64_t selector = 0;
   if (auto result = pop_width(ctx, selector, 2); !result.ok()) {
+    ctx.state.gpr[4] = entry_sp;
     return result;
   }
   if (!far_transfer_allowed(ctx.state, selector)) {
+    ctx.state.gpr[4] = entry_sp;
     return far_transfer_fault(ctx);
+  }
+  if (offset_width == 8 && !is_canonical_address(target)) {
+    ctx.state.gpr[4] = entry_sp;
+    return branch_target_fault(ctx, target);
   }
   ctx.state.mode = mode_for_far_width(offset_width);
   ctx.state.sreg[1] = static_cast<std::uint16_t>(selector);
@@ -36,21 +43,29 @@ ExecutionResult retf_width(ExecutionContext& ctx, std::size_t offset_width, std:
 }
 
 ExecutionResult iret_width(ExecutionContext& ctx, std::size_t offset_width, std::size_t flags_width) {
+  const auto entry_sp = ctx.state.gpr[4];
   std::uint64_t target = 0;
   if (auto result = pop_width(ctx, target, offset_width); !result.ok()) {
     return result;
   }
   std::uint64_t selector = 0;
   if (auto result = pop_width(ctx, selector, 2); !result.ok()) {
+    ctx.state.gpr[4] = entry_sp;
     return result;
   }
   std::uint64_t flags = 0;
   if (auto result = pop_width(ctx, flags, flags_width); !result.ok()) {
+    ctx.state.gpr[4] = entry_sp;
     return result;
   }
 
   if (!far_transfer_allowed(ctx.state, selector)) {
+    ctx.state.gpr[4] = entry_sp;
     return far_transfer_fault(ctx);
+  }
+  if (offset_width == 8 && !is_canonical_address(target)) {
+    ctx.state.gpr[4] = entry_sp;
+    return branch_target_fault(ctx, target);
   }
   const auto cpl = ctx.state.sreg[1] & 0x3u;
   const auto iopl = (ctx.state.rflags >> 12) & 0x3u;
@@ -77,7 +92,11 @@ ExecutionResult iret_width(ExecutionContext& ctx, std::size_t offset_width, std:
   } else {
     merged = (ctx.state.rflags & ~0xFFFFull) | (flags & 0xFFFFull);
   }
-  ctx.state.rflags = (merged & ~protected_bits) | (ctx.state.rflags & protected_bits);
+  // Same reserved-bit scrub POPFQ does. IRET is the other instruction that loads rflags straight out
+  // of guest memory, and without this a guest could park values in bits 3/5/15 and 63:22, which read
+  // back as fixed on hardware and cannot hold anything.
+  merged &= kRflagsWritableMask;
+  ctx.state.rflags = (merged & ~protected_bits) | (ctx.state.rflags & protected_bits) | kRflagsReservedOnes;
   ctx.control_flow_taken = true;
   return {};
 }

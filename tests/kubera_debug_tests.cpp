@@ -819,3 +819,61 @@ TEST(KuberaDebug, DebugRegisterReservedBitsAndCanonicalChecks) {
     EXPECT_EQ(run_one({0x0F, 0x23, 0xC0}, state).reason, seven::StopReason::general_protection);
   }
 }
+
+// The interrupt frame is three separate stores and any of them can fault. Committing rsp store by
+// store left the emulator half a frame in when one did: rsp lowered by the slots that landed, the
+// rest unwritten, and nothing in the returned fault to say how far it got. An embedder that maps
+// the page and restarts then builds a second frame underneath the first.
+TEST(KuberaDebug, AnInterruptFrameThatFaultsPartwayLeavesRspWhereItStarted) {
+  seven::CpuState state{};
+  seven::Memory memory{};
+  seven::Executor executor{};
+  constexpr std::uint64_t kFramePage = 0x40000;
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.sreg[1] = 0x33;
+  state.idtr.base = kIdtBase;
+  state.idtr.limit = 0x1000 - 1;
+  memory.map(kIdtBase, 0x1000);
+  memory.map(kDbHandler, 0x1000);
+  memory.map(kFramePage, 0x1000);
+  write_bytes(memory, kBase, {0xCC});  // int3
+  write_idt_gate64(memory, kIdtBase, 3, 0x33, kDbHandler, 0xEF);  // DPL 3, reachable from ring 3
+
+  // rflags (8) lands at 0x40002 and cs (2) at 0x40000; rip (8) would land below the page.
+  const std::uint64_t entry_sp = kFramePage + 10;
+  state.gpr[4] = entry_sp;
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::page_fault);
+  EXPECT_EQ(state.gpr[4], entry_sp);
+  EXPECT_EQ(state.rip, kBase) << "the interrupt never took";
+}
+
+// The stack slot a pushfq writes and a popfq reads is implicit: it is not an operand, so the
+// executor's own watchpoint sweep over the operand list cannot see it. push/pop report theirs from
+// the handler for exactly this reason and these two did not, so a guest evaded a write watchpoint
+// just by pointing rsp at the watched address and pushing the flags onto it.
+TEST(KuberaDebug, PushfqCannotStepPastADataWatchpointOnItsOwnStackSlot) {
+  seven::CpuState state{};
+  seven::Memory memory{};
+  seven::Executor executor{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.sreg[1] = 0x33;
+  state.idtr.base = kIdtBase;
+  state.idtr.limit = 0x1000 - 1;
+  memory.map(kIdtBase, 0x1000);
+  memory.map(kDbHandler, 0x1000);
+  memory.map(0x4000, 0x2000);
+  write_bytes(memory, kBase, {0x9C});  // pushfq
+  write_idt_gate64(memory, kIdtBase, 1, 0x33, kDbHandler);
+  state.gpr[4] = kStackTop;
+  state.dr[0] = kStackTop - 8;      // the slot pushfq is about to write
+  state.dr[7] = 0x1 | (0x1 << 16) | (0x2 << 18);  // DR0 enabled, write, 8 bytes
+
+  const auto result = executor.step(state, memory);
+  ASSERT_EQ(result.reason, seven::StopReason::none);
+  EXPECT_NE(state.dr[6] & 0x1u, 0u) << "the push slipped past the watchpoint";
+  EXPECT_EQ(state.rip, kDbHandler);
+}

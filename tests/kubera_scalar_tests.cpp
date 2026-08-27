@@ -1616,3 +1616,404 @@ TEST(KuberaScalar, OverflowingTheStackWithFldReportsAStackFault) {
   EXPECT_EQ(from_register.first, seven::StopReason::none) << "fld st(0) has no memory operand";
   EXPECT_EQ(from_register.second & (kIe | kSf | kC1), kIe | kSf | kC1) << "fld st(i) overflow";
 }
+
+namespace {
+
+struct AdjustResult {
+  seven::StopReason reason;
+  std::uint64_t rax;
+  std::uint64_t rflags;
+};
+
+// AAA/AAS/AAD/AAM/DAA/DAS are all #UD in 64-bit mode, so the whole family only decodes in compat32.
+AdjustResult run_adjust(std::string_view hex, std::uint64_t rax, std::uint64_t rflags) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::compat32;
+  state.rip = kBase;
+  state.rflags = rflags;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes(hex));
+  state.gpr[0] = rax;
+  const auto result = executor.step(state, memory);
+  return {result.reason, state.gpr[0], state.rflags};
+}
+
+}  // namespace
+
+// Intel spells the AAA adjust as AX := AX + 106H, not as two independent byte adds, so the carry
+// out of AL + 6 reaches AH. seven did AL += 6 and AH += 1 separately and dropped that carry.
+TEST(KuberaScalar, AaaCarriesOutOfAlIntoAh) {
+  const auto r = run_adjust("37", 0x00FF, 0x202);  // aaa with AH:AL = 00:FF
+  ASSERT_EQ(r.reason, seven::StopReason::none);
+  EXPECT_EQ(r.rax & 0xFFFFu, 0x0205u) << "AL+6 overflows the byte, so AH ends at 2, not 1";
+  EXPECT_NE(r.rflags & seven::kFlagCF, 0u);
+  EXPECT_NE(r.rflags & seven::kFlagAF, 0u);
+}
+
+// Same shape on the subtract side: AX := AX - 6 followed by AH := AH - 1, so a borrow out of
+// AL - 6 costs AH two decrements in total.
+TEST(KuberaScalar, AasBorrowsOutOfAlIntoAh) {
+  const auto r = run_adjust("3F", 0x0200, 0x202 | seven::kFlagAF);  // aas with AH:AL = 02:00
+  ASSERT_EQ(r.reason, seven::StopReason::none);
+  EXPECT_EQ(r.rax & 0xFFFFu, 0x000Au) << "AL-6 borrows, so AH drops from 2 to 0";
+  EXPECT_NE(r.rflags & seven::kFlagCF, 0u);
+  EXPECT_NE(r.rflags & seven::kFlagAF, 0u);
+}
+
+// DAA's second half ends in an else that forces CF to 0; DAS's does not, so a borrow raised by the
+// low-nibble correction survives to the end of the instruction. seven had copied DAA's else into
+// DAS and was clearing CF that hardware leaves set.
+TEST(KuberaScalar, DasKeepsTheCarryRaisedByTheLowNibbleBorrow) {
+  const auto das = run_adjust("2F", 0x0000, 0x202 | seven::kFlagAF);
+  ASSERT_EQ(das.reason, seven::StopReason::none);
+  EXPECT_EQ(das.rax & 0xFFu, 0xFAu);
+  EXPECT_NE(das.rflags & seven::kFlagCF, 0u) << "AL - 6 borrowed out of the byte";
+  EXPECT_NE(das.rflags & seven::kFlagAF, 0u);
+
+  const auto daa = run_adjust("27", 0x0000, 0x202 | seven::kFlagAF);
+  ASSERT_EQ(daa.reason, seven::StopReason::none);
+  EXPECT_EQ(daa.rax & 0xFFu, 0x06u);
+  EXPECT_EQ(daa.rflags & seven::kFlagCF, 0u) << "DAA really does clear CF here, DAS does not";
+}
+
+// AAD multiplies by its immediate, so every value is legal including zero. seven raised #GP for
+// `aad 0`, which is a perfectly ordinary instruction that just clears AH.
+TEST(KuberaScalar, AadWithAZeroImmediateIsNotAFault) {
+  const auto zero = run_adjust("D5 00", 0x0507, 0x202);
+  ASSERT_EQ(zero.reason, seven::StopReason::none);
+  EXPECT_EQ(zero.rax & 0xFFFFu, 0x0007u);
+
+  const auto base10 = run_adjust("D5 0A", 0x0203, 0x202);
+  ASSERT_EQ(base10.reason, seven::StopReason::none);
+  EXPECT_EQ(base10.rax & 0xFFFFu, 0x0017u);
+}
+
+// AAM divides by its immediate, and Intel lists #DE (not #GP) for a zero one.
+TEST(KuberaScalar, AamWithAZeroImmediateRaisesDivideError) {
+  const auto zero = run_adjust("D4 00", 0x0007, 0x202);
+  EXPECT_EQ(zero.reason, seven::StopReason::divide_error);
+
+  const auto base10 = run_adjust("D4 0A", 0x001D, 0x202);
+  ASSERT_EQ(base10.reason, seven::StopReason::none);
+  EXPECT_EQ(base10.rax & 0xFFFFu, 0x0209u);
+}
+
+// Only CMPXCHG16B carries the alignment requirement; CMPXCHG8B has none and an unaligned
+// destination is a normal locked access. seven was raising #GP for both.
+TEST(KuberaScalar, Cmpxchg8bAcceptsAnUnalignedDestinationButCmpxchg16bDoesNot) {
+  constexpr std::uint64_t kData = 0x4000;
+  constexpr std::uint64_t kUnaligned = kData + 1;
+
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.rflags = 0x202;
+  memory.map(kBase, 0x1000);
+  memory.map(kData, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("0F C7 0E"));  // cmpxchg8b [rsi]
+  const std::uint64_t seed = 0x1122334455667788ull;
+  ASSERT_TRUE(memory.write(kUnaligned, &seed, sizeof(seed)));
+  state.gpr[6] = kUnaligned;    // rsi
+  state.gpr[2] = 0x11223344;    // edx
+  state.gpr[0] = 0x55667788;    // eax
+  state.gpr[1] = 0x0A0B0C0D;    // ecx
+  state.gpr[3] = 0x0E0F1011;    // ebx
+
+  const auto result = executor.step(state, memory);
+  ASSERT_EQ(result.reason, seven::StopReason::none);
+  EXPECT_NE(state.rflags & seven::kFlagZF, 0u);
+  std::uint64_t stored = 0;
+  ASSERT_TRUE(memory.read(kUnaligned, &stored, sizeof(stored)));
+  EXPECT_EQ(stored, 0x0A0B0C0D0E0F1011ull);
+
+  seven::Executor wide_executor{};
+  seven::CpuState wide_state{};
+  seven::Memory wide_memory{};
+  wide_state.mode = seven::ExecutionMode::long64;
+  wide_state.rip = kBase;
+  wide_state.rflags = 0x202;
+  wide_memory.map(kBase, 0x1000);
+  wide_memory.map(kData, 0x1000);
+  write_bytes(wide_memory, kBase, seven::parse_hex_bytes("48 0F C7 0E"));  // cmpxchg16b [rsi]
+  wide_state.gpr[6] = kUnaligned;
+
+  const auto wide_result = wide_executor.step(wide_state, wide_memory);
+  EXPECT_EQ(wide_result.reason, seven::StopReason::general_protection)
+      << "the 16-byte form does require alignment";
+}
+
+// XADD computed its flags before attempting the store, so a destination the guest can read but not
+// write returned a fault with rflags already rewritten. CMPXCHG and BTS/BTR/BTC in the same
+// read-modify-write family already commit flags only after the store lands.
+TEST(KuberaScalar, XaddLeavesFlagsAloneWhenTheStoreFaults) {
+  constexpr std::uint64_t kData = 0x4000;
+  constexpr auto kReadOnly = static_cast<seven::MemoryPermissionMask>(seven::MemoryPermission::read);
+
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.rflags = 0x202;
+  memory.map(kBase, 0x1000);
+  memory.map(kData, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("0F C1 06"));  // xadd [rsi], eax
+  const std::uint32_t seed = 0xFFFFFFFFu;
+  ASSERT_TRUE(memory.write(kData, &seed, sizeof(seed)));
+  memory.reprotect(kData, 0x1000, kReadOnly);
+  state.gpr[6] = kData;  // rsi
+  state.gpr[0] = 1;      // eax -- would carry out and leave a zero result
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::page_fault);
+  EXPECT_EQ(state.rflags & seven::kAluStatusFlagsMask, 0u)
+      << "a store that never landed must not have published CF/ZF/PF/AF";
+}
+
+// A push is a fault, not a trap: hardware aborts it and leaves rsp exactly where it was, which is
+// the only reason a guard page can grow a stack -- the handler maps the page and the same push runs
+// again. Decrementing rsp before the store meant every retry started one slot lower, so a stack that
+// faulted twice ended up 16 bytes down with nothing written.
+TEST(KuberaScalar, APushThatFaultsDoesNotMoveTheStackPointer) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  constexpr std::uint64_t kStack = 0x8000;
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  memory.map(kStack, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("50"));  // push rax
+  state.gpr[0] = 0xDEADBEEF;
+  state.gpr[4] = kStack;  // the slot below is not mapped
+
+  const auto first = executor.step(state, memory);
+  EXPECT_EQ(first.reason, seven::StopReason::page_fault);
+  EXPECT_EQ(state.gpr[4], kStack);
+  EXPECT_EQ(state.rip, kBase) << "the push never retired";
+
+  const auto second = executor.step(state, memory);
+  EXPECT_EQ(second.reason, seven::StopReason::page_fault);
+  EXPECT_EQ(state.gpr[4], kStack) << "rsp walked down on the retry";
+}
+
+// pushfq has its own hand-written copy of the push sequence and had the same ordering.
+TEST(KuberaScalar, APushfqThatFaultsDoesNotMoveTheStackPointer) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  constexpr std::uint64_t kStack = 0x8000;
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  memory.map(kStack, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("9C"));  // pushfq
+  state.gpr[4] = kStack;
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::page_fault);
+  EXPECT_EQ(state.gpr[4], kStack);
+}
+
+// POP m64 addresses its destination through the already-incremented rsp -- that part is
+// architectural. Keeping the increment when the store then faults is not.
+TEST(KuberaScalar, APopWhoseDestinationFaultsDoesNotMoveTheStackPointer) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  constexpr std::uint64_t kStack = 0x8000;
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  memory.map(kStack, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("8F 03"));  // pop qword [rbx]
+  state.gpr[3] = 0x7000'0000;  // unmapped
+  state.gpr[4] = kStack + 0x100;
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::page_fault);
+  EXPECT_EQ(state.gpr[4], kStack + 0x100);
+}
+
+// Bits 3, 5, 15 and everything from 22 up do not exist in rflags: they read back as zero whatever
+// is written. POPFQ and IRET are the only two instructions that load rflags wholesale out of guest
+// memory, so they are the only two that can put a value there at all.
+TEST(KuberaScalar, PopfqDropsTheBitsRflagsDoesNotHave) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  constexpr std::uint64_t kStack = 0x8000;
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.rflags = 0x202;
+  memory.map(kBase, 0x1000);
+  memory.map(kStack, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("9D"));  // popfq
+  state.gpr[4] = kStack + 0x100;
+  const std::uint64_t all_ones = ~0ull;
+  ASSERT_TRUE(memory.write(kStack + 0x100, &all_ones, sizeof(all_ones)));
+
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+  EXPECT_EQ(state.rflags & ~seven::kRflagsWritableMask, seven::kRflagsReservedOnes)
+      << "reserved rflags bits took a guest-supplied value";
+  EXPECT_NE(state.rflags & seven::kFlagCF, 0u) << "the bits that do exist still load";
+}
+
+TEST(KuberaScalar, IretqDropsTheBitsRflagsDoesNotHave) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  constexpr std::uint64_t kStack = 0x8000;
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.rflags = 0x202;
+  memory.map(kBase, 0x1000);
+  memory.map(kStack, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("48 CF"));  // iretq
+
+  // The frame this emulator's iret_width expects: 8-byte target, 2-byte selector, 8-byte flags.
+  const std::uint64_t target = kBase + 0x100;
+  const std::uint16_t selector = 0x08;
+  const std::uint64_t all_ones = ~0ull;
+  state.gpr[4] = kStack + 0x100;
+  ASSERT_TRUE(memory.write(kStack + 0x100, &target, sizeof(target)));
+  ASSERT_TRUE(memory.write(kStack + 0x108, &selector, sizeof(selector)));
+  ASSERT_TRUE(memory.write(kStack + 0x10A, &all_ones, sizeof(all_ones)));
+
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+  EXPECT_EQ(state.rip, target);
+  EXPECT_EQ(state.rflags & ~seven::kRflagsWritableMask, seven::kRflagsReservedOnes)
+      << "reserved rflags bits took a guest-supplied value";
+}
+
+// A branch target out of the non-canonical hole is a #GP against the branch itself. Committing it
+// to rip and letting the executor's fetch check catch it on the next step reports the fault against
+// the bad address instead of the instruction that produced it, and retires the branch on the way.
+TEST(KuberaScalar, AReturnToANonCanonicalAddressFaultsAtTheReturn) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  constexpr std::uint64_t kStack = 0x8000;
+  constexpr std::uint64_t kNonCanonical = 0x0000'8000'0000'0000ull;
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  memory.map(kStack, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("C3"));  // ret
+  state.gpr[4] = kStack + 0x100;
+  ASSERT_TRUE(memory.write(kStack + 0x100, &kNonCanonical, sizeof(kNonCanonical)));
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::general_protection);
+  EXPECT_EQ(state.rip, kBase) << "rip took the non-canonical value";
+  EXPECT_EQ(state.gpr[4], kStack + 0x100) << "a fault commits nothing, the pop included";
+  ASSERT_TRUE(result.exception.has_value());
+  EXPECT_EQ(result.exception->address, kNonCanonical);
+}
+
+TEST(KuberaScalar, AnIndirectJumpToANonCanonicalTargetFaultsAtTheJump) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  constexpr std::uint64_t kNonCanonical = 0x0000'8000'0000'0000ull;
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("FF E0"));  // jmp rax
+  state.gpr[0] = kNonCanonical;
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::general_protection);
+  EXPECT_EQ(state.rip, kBase);
+}
+
+TEST(KuberaScalar, AnIndirectCallToANonCanonicalTargetPushesNothing) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  constexpr std::uint64_t kStack = 0x8000;
+  constexpr std::uint64_t kNonCanonical = 0x0000'8000'0000'0000ull;
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  memory.map(kStack, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("FF D0"));  // call rax
+  state.gpr[0] = kNonCanonical;
+  state.gpr[4] = kStack + 0x100;
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::general_protection);
+  EXPECT_EQ(state.rip, kBase);
+  EXPECT_EQ(state.gpr[4], kStack + 0x100);
+  std::uint64_t slot = 0xAAAA'AAAA'AAAA'AAAAull;
+  ASSERT_TRUE(memory.read(kStack + 0xF8, &slot, sizeof(slot)));
+  EXPECT_EQ(slot, 0u) << "the return address was written before the target was checked";
+}
+
+// ENTER's nesting level used to be discarded outright, so a level-3 frame came out with the display
+// pointers missing and rsp three slots too high -- silently the wrong frame rather than a refused
+// one. Level counts the frame pointer itself, so level 3 copies two enclosing pointers and then
+// pushes the new frame pointer on top.
+TEST(KuberaScalar, EnterBuildsTheDisplayForANonZeroNestingLevel) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  constexpr std::uint64_t kStack = 0x8000;
+  constexpr std::uint64_t kOuterBp = kStack + 0x800;
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  memory.map(kStack, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("C8 00 00 03"));  // enter 0, 3
+
+  const std::uint64_t outer_display[2] = {0x1111'1111'1111'1111ull, 0x2222'2222'2222'2222ull};
+  ASSERT_TRUE(memory.write(kOuterBp - 8, &outer_display[0], sizeof(outer_display[0])));
+  ASSERT_TRUE(memory.write(kOuterBp - 16, &outer_display[1], sizeof(outer_display[1])));
+
+  const std::uint64_t entry_sp = kStack + 0x400;
+  state.gpr[4] = entry_sp;
+  state.gpr[5] = kOuterBp;
+
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+
+  const std::uint64_t frame_temp = entry_sp - 8;
+  EXPECT_EQ(state.gpr[5], frame_temp) << "rbp is the frame pointer the display ends with";
+  EXPECT_EQ(state.gpr[4], frame_temp - 24) << "three more slots below it hold the display";
+
+  const auto slot = [&](std::uint64_t address) {
+    std::uint64_t value = 0;
+    EXPECT_TRUE(memory.read(address, &value, sizeof(value)));
+    return value;
+  };
+  EXPECT_EQ(slot(entry_sp - 8), kOuterBp);
+  EXPECT_EQ(slot(entry_sp - 16), outer_display[0]);
+  EXPECT_EQ(slot(entry_sp - 24), outer_display[1]);
+  EXPECT_EQ(slot(entry_sp - 32), frame_temp);
+}
+
+// Each display copy reads through the enclosing frame chain, and the chain is guest data, so any
+// one of them can fault. Nothing may be committed when one does.
+TEST(KuberaScalar, AnEnterWhoseDisplayCopyFaultsLeavesTheFrameRegistersAlone) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  constexpr std::uint64_t kStack = 0x8000;
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  memory.map(kStack, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("C8 00 00 02"));  // enter 0, 2
+
+  const std::uint64_t entry_sp = kStack + 0x400;
+  state.gpr[4] = entry_sp;
+  state.gpr[5] = 0x7000'0000;  // unmapped, so reading the enclosing display pointer faults
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::page_fault);
+  EXPECT_EQ(state.gpr[4], entry_sp);
+  EXPECT_EQ(state.gpr[5], 0x7000'0000ull);
+}

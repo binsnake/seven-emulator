@@ -11,6 +11,7 @@ ExecutionResult handle_code_LEAVEW(ExecutionContext& ctx) {
   }
   detail::write_register(ctx.state, iced_x86::Register::SP, sp + 2, 2);
   detail::write_register(ctx.state, iced_x86::Register::BP, popped_bp, 2);
+  detail::note_stack_access(ctx, sp, 2, false);
   return {};
 }
 
@@ -23,6 +24,7 @@ ExecutionResult handle_code_LEAVED(ExecutionContext& ctx) {
   }
   detail::write_register(ctx.state, iced_x86::Register::ESP, sp + 4, 4);
   detail::write_register(ctx.state, iced_x86::Register::EBP, popped_bp, 4);
+  detail::note_stack_access(ctx, sp, 4, false);
   return {};
 }
 
@@ -35,9 +37,9 @@ ExecutionResult handle_code_LEAVEQ(ExecutionContext& ctx) {
   }
   detail::write_register(ctx.state, iced_x86::Register::RSP, sp + 8, 8);
   detail::write_register(ctx.state, iced_x86::Register::RBP, popped_bp, 8);
+  detail::note_stack_access(ctx, sp, 8, false);
   return {};
 }
 
 }  // namespace seven::handlers
-
 

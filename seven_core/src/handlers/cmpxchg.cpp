@@ -120,10 +120,9 @@ ExecutionResult handle_code_CMPXCHG_RM64_R64(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_CMPXCHG8B_M64(ExecutionContext& ctx) {
+  // No alignment requirement here, unlike CMPXCHG16B below: an unaligned m64 is legal and only
+  // ever raises #AC, which this model doesn't implement.
   const auto address = detail::memory_address(ctx);
-  if ((address & 0x7ull) != 0ull) {
-    return {StopReason::general_protection, 0, ExceptionInfo{StopReason::general_protection, address, 0}, ctx.instr.code()};
-  }
   bool lhs_ok = false;
   const auto lhs = detail::read_operand(ctx, 0, 8, &lhs_ok);
   if (!lhs_ok) {

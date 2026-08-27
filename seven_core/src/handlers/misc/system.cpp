@@ -19,15 +19,6 @@ namespace {
   return {StopReason::general_protection, 0, ExceptionInfo{StopReason::general_protection, ctx.state.rip, 0}, ctx.instr.code()};
 }
 
-// WRFSBASE/WRGSBASE require the value written to FS.base/GS.base to already be a canonical
-// 48-bit linear address, #GP(0) otherwise -- same 4-level-paging rule handler_helpers.cpp's
-// memory_fault() enforces for ordinary memory operands, duplicated here since these two
-// instructions never go through that path (they touch state directly, not memory).
-[[nodiscard]] bool is_canonical_address(std::uint64_t address) noexcept {
-  constexpr int kShift = 16;  // 64 - 48
-  return (static_cast<std::int64_t>(address << kShift) >> kShift) == static_cast<std::int64_t>(address);
-}
-
 }  // namespace
 
 ExecutionResult handle_code_CLC(ExecutionContext& ctx) {
@@ -72,27 +63,36 @@ ExecutionResult handle_code_STI(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_PUSHFQ(ExecutionContext& ctx) {
-  ctx.state.gpr[4] = mask_stack_pointer(ctx.state, ctx.state.gpr[4] - 8);
-  if (!ctx.memory.write(ctx.state.gpr[4], &ctx.state.rflags, 8)) {
-    return detail::memory_fault(ctx, ctx.state.gpr[4]);
+  // rsp only moves once the slot is written, same as push.cpp's push_width: a fault here aborts the
+  // instruction and leaves rsp where it was.
+  const auto slot = mask_stack_pointer(ctx.state, ctx.state.gpr[4] - 8);
+  if (!ctx.memory.write(slot, &ctx.state.rflags, 8)) {
+    return detail::memory_fault(ctx, slot);
   }
+  ctx.state.gpr[4] = slot;
+  detail::note_stack_access(ctx, slot, 8, true);
   return {};
 }
 
 ExecutionResult handle_code_POPFQ(ExecutionContext& ctx) {
+  const auto slot = ctx.state.gpr[4];
   std::uint64_t value = 0;
-  if (!ctx.memory.read(ctx.state.gpr[4], &value, 8)) {
-    return detail::memory_fault(ctx, ctx.state.gpr[4]);
+  if (!ctx.memory.read(slot, &value, 8)) {
+    return detail::memory_fault(ctx, slot);
   }
   // seven emulates ring 3 only. At CPL 3 (IOPL 0) POPFQ CANNOT modify IF/IOPL/VIF/VIP/VM and it
   // clears RF -- it never disables interrupts. Measured on an i9-11900K: user-mode POPF always
   // leaves IF=1 regardless of the popped value. Blindly loading IF (as before) let it go to 0,
   // which a naive flag check would then detect. Preserve the system bits, force IF=1, clear RF.
+  // kRflagsWritableMask drops the bits that do not exist: 3, 5, 15 and everything from 22 up read
+  // back as zero on hardware whatever was written, and this is one of only two instructions that
+  // can put a guest-chosen value into them.
   constexpr std::uint64_t kSysBits = kFlagIF | (3ull << 12) | (1ull << 17) | (1ull << 19) | (1ull << 20);
   constexpr std::uint64_t kRF = 1ull << 16;
-  ctx.state.rflags = (value & ~kSysBits & ~kRF) | (ctx.state.rflags & kSysBits);
-  ctx.state.rflags |= kFlagIF | 0x2ull;  // user-mode IF is always set; bit 1 is reserved-1
-  ctx.state.gpr[4] = mask_stack_pointer(ctx.state, ctx.state.gpr[4] + 8);
+  ctx.state.rflags = (value & kRflagsWritableMask & ~kSysBits & ~kRF) | (ctx.state.rflags & kSysBits);
+  ctx.state.rflags |= kFlagIF | kRflagsReservedOnes;  // user-mode IF is always set; bit 1 is reserved-1
+  ctx.state.gpr[4] = mask_stack_pointer(ctx.state, slot + 8);
+  detail::note_stack_access(ctx, slot, 8, false);
   return {};
 }
 
@@ -234,6 +234,9 @@ ExecutionResult handle_code_RDGSBASE_R64(ExecutionContext& ctx) {
   return {};
 }
 
+// WRFSBASE/WRGSBASE require the value written to FS.base/GS.base to already be a canonical 48-bit
+// linear address, #GP(0) otherwise -- the same rule memory operands get through memory_fault(),
+// checked here because these two touch state directly and never go through that path.
 ExecutionResult handle_code_WRFSBASE_R64(ExecutionContext& ctx) {
   const auto value = detail::read_register(ctx.state, ctx.instr.op_register(0));
   if (!is_canonical_address(value)) {

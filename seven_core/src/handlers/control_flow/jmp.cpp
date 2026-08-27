@@ -22,6 +22,9 @@ ExecutionResult handle_code_JMP_RM64(ExecutionContext& ctx) {
   if (auto result = read_near_target_width(ctx, 8, target); !result.ok()) {
     return result;
   }
+  if (!is_canonical_address(target)) {
+    return branch_target_fault(ctx, target);
+  }
   ctx.state.rip = target;
   ctx.control_flow_taken = true;
   return {};
@@ -44,6 +47,9 @@ ExecutionResult handle_code_JMP_RM32(ExecutionContext& ctx) {
   const auto width = (ctx.state.mode == ExecutionMode::long64) ? 8u : 4u;
   if (auto result = read_near_target_width(ctx, width, target); !result.ok()) {
     return result;
+  }
+  if (!is_canonical_address(target)) {
+    return branch_target_fault(ctx, target);
   }
   ctx.state.rip = target;
   ctx.control_flow_taken = true;

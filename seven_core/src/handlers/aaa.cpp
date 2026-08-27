@@ -8,8 +8,10 @@ ExecutionResult handle_code_AAA(ExecutionContext& ctx) {
   const bool carry = af || ((al & 0x0Fu) > 9u);
   auto ah = detail::read_register(ctx.state, iced_x86::Register::AH);
   if (carry) {
+    // Intel defines the adjust as AX := AX + 106H, so the carry out of AL + 6 lands in AH on top
+    // of the increment. Only reachable for AL >= 0xFA, which already satisfies the condition above.
+    ah += 1u + ((al + 6u) >> 8);
     al += 6u;
-    ah += 1u;
   }
   al &= 0x0Fu;
   detail::write_register(ctx.state, iced_x86::Register::AL, al, 1);

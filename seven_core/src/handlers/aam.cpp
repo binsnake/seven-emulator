@@ -5,7 +5,7 @@ namespace seven::handlers {
 ExecutionResult handle_code_AAM_IMM8(ExecutionContext& ctx) {
   const auto base = ctx.instr.immediate8();
   if (base == 0) {
-    return {StopReason::general_protection, 0, ExceptionInfo{StopReason::general_protection, ctx.state.rip, 0}, ctx.instr.code()};
+    return detail::divide_fault(ctx);
   }
   const auto al = detail::read_register(ctx.state, iced_x86::Register::AL);
   const auto quotient = static_cast<std::uint8_t>(al / base);
