@@ -133,6 +133,12 @@ class Memory {
   [[nodiscard]] HookId map_mmio(std::uint64_t base, std::size_t size, MmioReadCallback on_read, MmioWriteCallback on_write);
   [[nodiscard]] bool unmap_mmio(HookId id);
   void clear_mmio_regions();
+  // True when this address is served by an mmio region rather than by a real page. A block compiler
+  // needs this: it fetches far more bytes than the instruction it is about to run, and a device read
+  // is not something to perform speculatively. Reading 256 bytes of "instruction stream" out of a
+  // device to compile three instructions is a read the guest never asked for, and registers that
+  // change when read do not care that the fetch was speculative.
+  [[nodiscard]] bool is_mmio_address(std::uint64_t address) const;
   [[nodiscard]] std::vector<PageSnapshot> snapshot_pages() const;
   void restore_pages(const std::vector<PageSnapshot>& pages);
   [[nodiscard]] std::vector<MmioRegionSnapshot> snapshot_mmio_regions() const;

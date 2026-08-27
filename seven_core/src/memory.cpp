@@ -676,6 +676,10 @@ void Memory::apply_pending_access_hook_ops() {
   refresh_access_hook_state();
 }
 
+bool Memory::is_mmio_address(std::uint64_t address) const {
+  return find_mmio_region(address, 1) != nullptr;
+}
+
 const Memory::MmioRegion* Memory::find_mmio_region(std::uint64_t address, std::size_t size) const {
   if (mmio_regions_.empty()) {
     return nullptr;

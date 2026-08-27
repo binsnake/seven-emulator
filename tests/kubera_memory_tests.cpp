@@ -750,3 +750,27 @@ TEST(KuberaMemory, ContextSyncCallbacksBlockTheCodegenBypass) {
   executor.set_context_write_callback([](seven::CpuState&) { return true; });
   EXPECT_FALSE(executor.jit_bypass_eligible(state, memory)) << "so does a write callback";
 }
+
+// Asked by the block compiler before it fetches. It reads far more than the instruction it is
+// about to run needs, and doing that against a device is a read the guest never asked for.
+TEST(KuberaMemory, AnMmioAddressIsDistinguishableFromOrdinaryMemory) {
+  seven::Memory memory{};
+  constexpr std::uint64_t kBase = 0x50000;
+  memory.map(0x10000, 0x1000);
+  EXPECT_FALSE(memory.is_mmio_address(0x10000)) << "an ordinary mapped page is not mmio";
+  EXPECT_FALSE(memory.is_mmio_address(kBase)) << "nothing is registered here yet";
+
+  const auto id = memory.map_mmio(
+      kBase, 0x1000, [](std::uint64_t, void*, std::size_t) { return true; },
+      [](std::uint64_t, const void*, std::size_t) { return true; });
+  ASSERT_NE(id, 0u);
+
+  EXPECT_TRUE(memory.is_mmio_address(kBase));
+  EXPECT_TRUE(memory.is_mmio_address(kBase + 0xFFF)) << "the last byte is still inside the region";
+  EXPECT_FALSE(memory.is_mmio_address(kBase + 0x1000)) << "one past the end is outside it";
+  EXPECT_FALSE(memory.is_mmio_address(kBase - 1));
+  EXPECT_FALSE(memory.is_mmio_address(0x10000));
+
+  EXPECT_TRUE(memory.unmap_mmio(id));
+  EXPECT_FALSE(memory.is_mmio_address(kBase)) << "the region is gone";
+}
