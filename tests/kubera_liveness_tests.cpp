@@ -393,15 +393,9 @@ TEST(KuberaLiveness, AFaultCapableInstructionKeepsItsOwnFlagWrite) {
       << "a store that can fault must keep the flag write the fault would expose";
 }
 
-// A fault is not the only way execution leaves a lifted span early: an instruction seven has no
-// handler for stops the run with unsupported_instruction, and the lift's boundary test does not
-// look at handler coverage at all, so an unhandled opcode really does sit in the middle of a span.
-// What keeps that sound is FlagsInfo's default of read=all-flags: a code with no table entry is
-// treated as reading everything, which pins `live` and blocks any cover across it. That is the
-// property under test, and it is easy to lose -- adding a table entry for a code that has no
-// handler would silently undo it, which is what KeepsEveryFlagsTableEntryExecutable guards.
-// RDRAND stands in for the decodable codes absent from handled_codes.def: register only (so
-// can_fault() is false), no trap kind, and not control flow.
+// The lift's boundary test ignores handler coverage, so an unhandled opcode does sit mid-span. What
+// keeps that sound is FlagsInfo defaulting read to all flags, which pins `live` and blocks any cover
+// across it. RDRAND stands in: register only, no trap kind, not control flow.
 TEST(KuberaLiveness, MaskedWriteSurvivesAnUnsupportedInstructionMidBlock) {
   seven::CpuState state{};
   seven::Memory memory{};
@@ -426,17 +420,10 @@ TEST(KuberaLiveness, MaskedWriteSurvivesAnUnsupportedInstructionMidBlock) {
 }
 
 
-// The invariant the test above leans on, checked directly rather than assumed.
-//
-// An instruction is only allowed to "cover" an earlier flag write if it is guaranteed to run. The
-// flags table decides who can cover; handled_codes.def decides who can run. Nothing ties the two
-// together, so a table entry for a code with no handler would produce an instruction that liveness
-// treats as an unconditional all-flags writer and that never executes at all -- every flag write in
-// front of it dropped, and the run stopping right there with the caller reading the stale values.
-//
-// dead_flags_mask over [add eax,ebx ; C] is exactly the set liveness would drop from the preceding
-// writer, so a non-zero mask is the same thing as "C claims a cover", and stepping C says whether
-// it can actually run. No test-only accessor needed for either half.
+// The invariant the test above leans on. The flags table decides who may cover an earlier write;
+// handled_codes.def decides who can actually run. Nothing ties them together, so an entry for a code
+// with no handler would drop every flag write in front of it and then never execute. dead_flags_mask
+// over [add eax,ebx ; C] is exactly what liveness would drop, so a non-zero mask means C claims a cover.
 TEST(KuberaLiveness, KeepsEveryFlagsTableEntryExecutable) {
   const std::vector<std::vector<std::uint8_t>> prefixes = {
       {}, {0x0F}, {0x66}, {0x66, 0x0F}, {0xF2}, {0xF3}, {0xF3, 0x0F},

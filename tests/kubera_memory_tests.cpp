@@ -775,10 +775,9 @@ TEST(KuberaMemory, AnMmioAddressIsDistinguishableFromOrdinaryMemory) {
   EXPECT_FALSE(memory.is_mmio_address(kBase)) << "the region is gone";
 }
 
-// device_dispatch_count exists so a JIT consumer can tell that an embedder callback ran underneath
-// one of its accesses. What matters is that it counts calls that actually reached a device and
-// stays put for accesses that did not, since a counter that moved on ordinary RAM would make a
-// compiled block stop after every memory operand for as long as any device was mapped.
+// The counter has to move for calls that actually reached a device and stay put for ones that did
+// not: a counter that moved on ordinary RAM would stall a compiled block after every memory operand
+// for as long as any device stayed mapped.
 TEST(KuberaMemory, DeviceDispatchCountTracksCallbacksNotConfiguration) {
   seven::Memory memory{};
   constexpr std::uint64_t kRam = 0x10000;
