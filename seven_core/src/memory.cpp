@@ -322,6 +322,12 @@ bool Memory::read(std::uint64_t address, void* dst, std::size_t size, MemoryAcce
     ++device_dispatch_count_;
     return on_read(address - region_base, dst, size);
   }
+  // Not contained in one region, but still touching one: the bytes are partly the device's, and
+  // falling through would serve all of them out of whatever page sits underneath it without the
+  // device ever being asked. Refuse rather than answer on its behalf.
+  if (mmio_overlaps(address, size)) {
+    return false;
+  }
 
   const auto copy_from_pages = [&](std::byte* out) {
     std::size_t remaining = size;
@@ -494,6 +500,10 @@ bool Memory::write(std::uint64_t address, const void* src, std::size_t size, Mem
     if (on_write == nullptr) return false;
     ++device_dispatch_count_;
     return on_write(address - region_base, src, size);
+  }
+  // See read(): an access only partly landing on a device must not be served by the page under it.
+  if (mmio_overlaps(address, size)) {
+    return false;
   }
 
   // Every page first, then any bytes: see span_permits.
@@ -766,7 +776,10 @@ bool Memory::is_mmio_address(std::uint64_t address) const {
 }
 
 const Memory::MmioRegion* Memory::find_mmio_region(std::uint64_t address, std::size_t size) const {
-  if (mmio_regions_.empty()) {
+  // Zero bytes has no last byte, so containment below is satisfied by an address one past the end of
+  // a region and the callback would be handed an offset of exactly region.size -- outside the
+  // [0, size) range the framework contracts. mmio_overlaps already declines this shape.
+  if (mmio_regions_.empty() || size == 0) {
     return nullptr;
   }
   const auto end = address + static_cast<std::uint64_t>(size);

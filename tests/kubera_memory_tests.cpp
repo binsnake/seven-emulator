@@ -990,3 +990,59 @@ TEST(KuberaMemory, AWriteStraddlingOntoAnUnwritablePageCommitsNothing) {
   EXPECT_EQ(first_page_after(true), untouched) << "bytes landed on the first page before the fault";
   EXPECT_EQ(first_page_after(false), untouched) << "same, with the second page not mapped at all";
 }
+
+// find_mmio_region matches only when one region covers the whole access, so an access that merely
+// runs into a device matched nothing and fell through to the page underneath it -- writing straight
+// past the device with its callback never invoked.
+TEST(KuberaMemory, AnAccessStraddlingADeviceEdgeDoesNotSlipPastIt) {
+  seven::Memory memory{};
+  memory.map(0x1000, 0x2000, seven::kMemoryPermissionReadWrite);
+  int writes_seen = 0;
+  const auto id = memory.map_mmio(
+      0x2000, 0x1000,
+      [](std::uint64_t, void* dst, std::size_t size) {
+        std::memset(dst, 0xCD, size);
+        return true;
+      },
+      [&](std::uint64_t, const void*, std::size_t) {
+        ++writes_seen;
+        return true;
+      });
+  ASSERT_NE(id, 0u);
+
+  const std::array<std::uint8_t, 8> value = {1, 2, 3, 4, 5, 6, 7, 8};
+  EXPECT_FALSE(memory.write(0x1FFC, value.data(), value.size()))
+      << "half of this lands on the device, so it cannot quietly go to the page underneath";
+  EXPECT_EQ(writes_seen, 0);
+
+  std::array<std::uint8_t, 4> tail{};
+  ASSERT_TRUE(memory.read(0x1FFC, tail.data(), tail.size()));
+  const std::array<std::uint8_t, 4> untouched = {0, 0, 0, 0};
+  EXPECT_EQ(tail, untouched);
+
+  std::array<std::uint8_t, 8> readback{};
+  EXPECT_FALSE(memory.read(0x1FFC, readback.data(), readback.size()));
+}
+
+// The framework contracts an MMIO offset into [0, region.size). A zero-size access at the region's
+// end passed the containment test and handed the callback an offset of exactly region.size.
+TEST(KuberaMemory, AZeroSizeAccessNeverReachesADeviceCallback) {
+  seven::Memory memory{};
+  int hits = 0;
+  const auto id = memory.map_mmio(
+      0x8000, 0x100,
+      [&](std::uint64_t, void*, std::size_t) {
+        ++hits;
+        return true;
+      },
+      [&](std::uint64_t, const void*, std::size_t) {
+        ++hits;
+        return true;
+      });
+  ASSERT_NE(id, 0u);
+
+  std::uint8_t scratch = 0;
+  EXPECT_TRUE(memory.read(0x8100, &scratch, 0));
+  EXPECT_TRUE(memory.write(0x8100, &scratch, 0));
+  EXPECT_EQ(hits, 0);
+}
