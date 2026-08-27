@@ -671,7 +671,7 @@ ExecutionResult handle_code_FLD_STI(ExecutionContext& ctx) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!ctx.state.x87_push(ctx.state.x87_get(x87_st_index(ctx.instr.op_register(0))))) {
-    return detail::memory_fault(ctx, detail::memory_address(ctx));
+    return x87_stack_overflow(ctx);
   }
   return {};
 }

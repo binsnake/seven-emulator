@@ -1578,3 +1578,41 @@ TEST(KuberaScalar, FxsaveWritesTheStackTopRelative) {
   EXPECT_TRUE(std::equal(expected.begin(), expected.end(), slot0.begin()))
       << "slot 0 must hold ST(0), not physical register 0";
 }
+
+// Overflowing the x87 stack sets SF and C1 alongside IE, which is how a guest tells an overflow
+// from an underflow. FLD1/FLDZ/FLDPI, the integer loads and the BCD load all go through
+// x87_stack_overflow; the plain FLD forms did not -- the memory form raised a bare invalid
+// exception, and the register form reported a page fault on an instruction with no memory operand.
+TEST(KuberaScalar, OverflowingTheStackWithFldReportsAStackFault) {
+  constexpr std::uint64_t kData = 0x4000;
+  const auto fill_then = [&](const std::string& tail_hex) {
+    seven::Executor executor{};
+    seven::CpuState state{};
+    seven::Memory memory{};
+    state.mode = seven::ExecutionMode::long64;
+    state.rip = kBase;
+    memory.map(kBase, 0x1000);
+    memory.map(kData, 0x1000);
+    // fld1 x8 fills the stack, then the instruction under test overflows it.
+    write_bytes(memory, kBase,
+                seven::parse_hex_bytes("D9 E8 D9 E8 D9 E8 D9 E8 D9 E8 D9 E8 D9 E8 D9 E8 " + tail_hex));
+    state.gpr[3] = kData;
+    for (int i = 0; i < 8; ++i) {
+      EXPECT_EQ(executor.step(state, memory).reason, seven::StopReason::none) << "fill " << i;
+    }
+    const auto result = executor.step(state, memory);
+    return std::pair{result.reason, state.get_x87_status_word()};
+  };
+
+  constexpr std::uint16_t kIe = 0x0001;
+  constexpr std::uint16_t kSf = 0x0040;
+  constexpr std::uint16_t kC1 = 0x0200;
+
+  const auto from_memory = fill_then("D9 03");  // fld dword [rbx]
+  EXPECT_EQ(from_memory.first, seven::StopReason::none);
+  EXPECT_EQ(from_memory.second & (kIe | kSf | kC1), kIe | kSf | kC1) << "fld m32 overflow";
+
+  const auto from_register = fill_then("D9 C0");  // fld st(0)
+  EXPECT_EQ(from_register.first, seven::StopReason::none) << "fld st(0) has no memory operand";
+  EXPECT_EQ(from_register.second & (kIe | kSf | kC1), kIe | kSf | kC1) << "fld st(i) overflow";
+}

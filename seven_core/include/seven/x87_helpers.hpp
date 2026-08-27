@@ -285,7 +285,7 @@ inline ExecutionResult x87_push_from_memory(ExecutionContext& ctx, std::size_t w
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!ctx.state.x87_push(value)) {
-    return x87_exception(ctx, kX87ExceptionInvalid);
+    return x87_stack_overflow(ctx);
   }
   return {};
 }
