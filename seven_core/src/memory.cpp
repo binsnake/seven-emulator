@@ -223,7 +223,15 @@ bool Memory::read(std::uint64_t address, void* dst, std::size_t size, MemoryAcce
   // Copied out before the call, matching the MMIO dispatch below: a passthrough is the embedder's
   // whole memory backend, and one that reopens its handle by calling set_passthrough from inside a
   // read would otherwise free the functor it is still running out of.
-  if (auto fn = passthrough_read_) return fn(address, dst, size);
+  if (auto fn = passthrough_read_) {
+    // Hooks run against the passthrough too. They are a policy layer over every access, not a
+    // feature of the page-backed storage, and returning here without dispatching them meant an
+    // embedder that installed both got no hook calls at all and no indication of it.
+    if (!access_allowed(MemoryAccessEvent{kind, address, size, nullptr, 0})) {
+      return false;
+    }
+    return fn(address, dst, size);
+  }
   // Fast path: most reads in real workloads are entirely within a single page
   // and target a non-MMIO address with no access hooks installed. Inline that
   // case to skip every dynamic check besides the TLB lookup itself.
@@ -359,6 +367,12 @@ bool Memory::write(std::uint64_t address, const void* src, std::size_t size, Mem
       return false;
     }
     auto fn = passthrough_write_;
+    // Same as the read side, and it matters more here: a write hook's veto is what blocks the
+    // write, and on the page-backed path access_allowed() runs before the page is touched. Skipping
+    // it for a passthrough handed the write straight to the backend with the veto never consulted.
+    if (!access_allowed(MemoryAccessEvent{kind, address, size, src, size})) {
+      return false;
+    }
     if (!fn(address, src, size)) {
       return false;
     }

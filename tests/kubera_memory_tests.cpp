@@ -112,6 +112,60 @@ TEST(KuberaMemory, WraparoundWriteStillInvokesRangeScopedAccessHook) {
   EXPECT_TRUE(hook_invoked);
 }
 
+// A passthrough is the embedder's storage backend; an access hook is a policy layer over every
+// access. read()/write() used to return through the passthrough before dispatching hooks at all,
+// so an embedder that installed both got no hook calls and nothing to tell it so. For a write hook
+// that is the same shape as a skipped range check: the callback returning false is what blocks the
+// write, and it never ran.
+TEST(KuberaMemory, AccessHooksStillRunWhenAPassthroughBacksMemory) {
+  seven::Memory memory{};
+
+  std::vector<std::uint8_t> backing(0x1000, 0u);
+  memory.set_passthrough(
+      [&](std::uint64_t address, void* dst, std::size_t size) {
+        if (address + size > backing.size()) return false;
+        std::memcpy(dst, backing.data() + address, size);
+        return true;
+      },
+      [&](std::uint64_t address, const void* src, std::size_t size) {
+        if (address + size > backing.size()) return false;
+        std::memcpy(backing.data() + address, src, size);
+        return true;
+      });
+
+  int reads_seen = 0;
+  int writes_seen = 0;
+  const auto id = memory.add_access_hook([&](const seven::MemoryAccessEvent& event) {
+    if (event.kind == seven::MemoryAccessKind::data_write) {
+      ++writes_seen;
+      return false;  // veto
+    }
+    ++reads_seen;
+    return true;
+  });
+  ASSERT_NE(id, 0u);
+
+  const std::uint32_t value = 0xDEADBEEFu;
+  EXPECT_FALSE(memory.write(0x100, &value, sizeof(value)));
+  EXPECT_EQ(writes_seen, 1);
+
+  std::uint32_t read_back = 0xFFFFFFFFu;
+  EXPECT_TRUE(memory.read(0x100, &read_back, sizeof(read_back)));
+  EXPECT_EQ(reads_seen, 1);
+  EXPECT_EQ(read_back, 0u) << "the vetoed write reached the backing store anyway";
+}
+
+// set_passthrough takes its two halves independently, so a write-only passthrough is a legitimate
+// configuration and has_passthrough() has to report it.
+TEST(KuberaMemory, AWriteOnlyPassthroughStillCountsAsOne) {
+  seven::Memory memory{};
+  EXPECT_FALSE(memory.has_passthrough());
+  memory.set_passthrough(nullptr, [](std::uint64_t, const void*, std::size_t) { return true; });
+  EXPECT_TRUE(memory.has_passthrough());
+  memory.clear_passthrough();
+  EXPECT_FALSE(memory.has_passthrough());
+}
+
 // The other half of that comparison. The test above covers a wrapping ACCESS against a sane range;
 // this covers a sane access against a range whose own base + size runs off the top. The registered
 // end folded back down to a small number, so `event.address >= range_end` was true for every

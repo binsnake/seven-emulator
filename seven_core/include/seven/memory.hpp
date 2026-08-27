@@ -139,7 +139,12 @@ class Memory {
   void restore_mmio_regions(const std::vector<MmioRegionSnapshot>& regions, const MmioResolver& resolver);
   void set_passthrough(PassthroughReadFn read_fn, PassthroughWriteFn write_fn);
   void clear_passthrough();
-  [[nodiscard]] bool has_passthrough() const noexcept { return static_cast<bool>(passthrough_read_); }
+  // Either half counts. set_passthrough takes the two independently, and a caller asking this
+  // question wants to know whether page-backed storage is still authoritative -- a write-only
+  // passthrough answers that just as much as a read one does.
+  [[nodiscard]] bool has_passthrough() const noexcept {
+    return passthrough_read_ != nullptr || passthrough_write_ != nullptr;
+  }
 
   [[nodiscard]] bool has_access_hooks() const noexcept {
     return has_any_access_hooks_;
