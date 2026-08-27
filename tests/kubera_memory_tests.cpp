@@ -352,7 +352,9 @@ TEST(KuberaMemory, NestedAccessHookDispatchDoesNotInvalidateTheOuterLoop) {
   });
   ASSERT_NE(remover, 0u);
 
-  // Third hook is what the outer loop walks into after the erase. It has to still be callable.
+  // Third hook is the one being removed. It must stop firing immediately (see
+  // AHookRemovedMidDispatchStopsFiringForTheRestOfThatAccess), but its slot must stay in the vector
+  // until dispatch unwinds.
   to_remove = memory.add_access_hook([&](const seven::MemoryAccessEvent& event) {
     if (event.kind == seven::MemoryAccessKind::data_read) {
       return true;
@@ -362,17 +364,65 @@ TEST(KuberaMemory, NestedAccessHookDispatchDoesNotInvalidateTheOuterLoop) {
   });
   ASSERT_NE(to_remove, 0u);
 
+  // Fourth hook is what the outer loop walks into after the removed one, and is what actually
+  // distinguishes a deferred erase from an in-place one: erasing the third element while the
+  // range-for sits on the second shifts this one down into the slot the loop has already passed,
+  // so it never runs at all.
+  int after_removed_calls = 0;
+  const auto after_removed = memory.add_access_hook([&](const seven::MemoryAccessEvent& event) {
+    if (event.kind == seven::MemoryAccessKind::data_read) {
+      return true;
+    }
+    ++after_removed_calls;
+    return true;
+  });
+  ASSERT_NE(after_removed, 0u);
+
   const std::uint32_t value = 0xA5A5A5A5;
   EXPECT_TRUE(memory.write(0x1000, &value, sizeof(value)));
 
   EXPECT_EQ(reentrant_calls, 1);
   EXPECT_EQ(remover_calls, 1);
-  EXPECT_EQ(tail_calls, 1) << "the removal must be deferred until dispatch unwinds";
+  EXPECT_EQ(tail_calls, 0) << "a hook remove_access_hook already reported gone must not fire again";
+  EXPECT_EQ(after_removed_calls, 1) << "the erase must be deferred until dispatch unwinds";
 
   // The deferred removal must actually have landed once dispatch finished.
   EXPECT_FALSE(memory.remove_access_hook(to_remove)) << "hook should already be gone";
   EXPECT_TRUE(memory.remove_access_hook(reentrant));
   EXPECT_TRUE(memory.remove_access_hook(remover));
+  EXPECT_TRUE(memory.remove_access_hook(after_removed));
+}
+
+// remove_access_hook returns true from inside a dispatch -- it has removed the hook as far as its
+// caller is concerned, and that caller is free to immediately destroy whatever the hook captured.
+// The erase itself has to wait (access_allowed is walking access_hooks_), but the dispatch used to
+// carry on calling the removed hook for the rest of that same access, which is a call into an
+// object its owner was just told it could drop.
+TEST(KuberaMemory, AHookRemovedMidDispatchStopsFiringForTheRestOfThatAccess) {
+  seven::Memory memory{};
+  memory.map(0x1000, seven::Memory::kPageSize);
+
+  seven::Memory::HookId victim = 0;
+  int victim_calls = 0;
+  bool victim_state_alive = true;
+
+  const auto remover = memory.add_access_hook([&](const seven::MemoryAccessEvent&) {
+    EXPECT_TRUE(memory.remove_access_hook(victim));
+    victim_state_alive = false;  // stands in for the embedder tearing down what the hook captured
+    return true;
+  });
+  ASSERT_NE(remover, 0u);
+
+  victim = memory.add_access_hook([&](const seven::MemoryAccessEvent&) {
+    ++victim_calls;
+    EXPECT_TRUE(victim_state_alive) << "the removed hook ran against state its owner already dropped";
+    return true;
+  });
+  ASSERT_NE(victim, 0u);
+
+  const std::uint32_t value = 0x5A5A5A5A;
+  EXPECT_TRUE(memory.write(0x1000, &value, sizeof(value)));
+  EXPECT_EQ(victim_calls, 0) << "remove_access_hook said it was gone, so it must not be called again";
 }
 
 // An instruction fetch is only allowed to fault on bytes the instruction actually needs. seven used

@@ -326,7 +326,6 @@ class Memory {
   PassthroughReadFn  passthrough_read_{};
   PassthroughWriteFn passthrough_write_{};
   HookId next_hook_id_ = 1;
-  std::uint64_t page_epoch_ = 1;
   std::uint64_t code_epoch_ = 1;
   std::uint64_t mmio_min_base_ = ~0ull;
   std::uint64_t mmio_max_end_ = 0;

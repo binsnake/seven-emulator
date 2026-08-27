@@ -138,7 +138,6 @@ void Memory::map(std::uint64_t base, std::size_t size, MemoryPermissionMask perm
   if (size == 0) {
     return;
   }
-  ++page_epoch_;
   // map() may insert new entries; std::unordered_map insertion can rehash and
   // invalidate iterators, but does not invalidate references / pointers to
   // existing elements. However, we still need to invalidate the TLB so that
@@ -169,7 +168,6 @@ void Memory::unmap(std::uint64_t base, std::size_t size) {
   if (size == 0) {
     return;
   }
-  ++page_epoch_;
   ++code_epoch_;
   invalidate_tlb();  // erase invalidates references; flush TLB
   // jit_tlb may hold host_data pointers straight into PageEntry objects this unmap is about to
@@ -189,7 +187,6 @@ void Memory::reprotect(std::uint64_t base, std::size_t size, MemoryPermissionMas
   if (size == 0) {
     return;
   }
-  ++page_epoch_;
   // Reprotect does not erase entries, so cached PageEntry* pointers stay
   // valid. Permissions are read through the pointer, so we don't have to
   // invalidate the TLB.
@@ -692,7 +689,6 @@ std::vector<Memory::PageSnapshot> Memory::snapshot_pages() const {
 }
 
 void Memory::restore_pages(const std::vector<PageSnapshot>& pages) {
-  ++page_epoch_;
   invalidate_tlb();
   clear_jit_tlb();  // pages_.clear() below frees every PageEntry jit_tlb could be pointing at
   pages_.clear();
@@ -845,6 +841,15 @@ bool Memory::access_allowed(const MemoryAccessEvent& event) const {
   self.dispatching_access_hooks_ = true;
   for (const auto& hook : access_hooks_) {
     if ((hook.kinds & bit(event.kind)) == 0) {
+      continue;
+    }
+    // Only the ERASE is deferred (this loop is walking the vector it would erase from) -- the
+    // removal itself takes effect at once. remove_access_hook has already returned true to whoever
+    // asked, and that caller is entitled to have destroyed whatever the hook captured, so calling
+    // it again for the rest of this access is a call into storage its owner was told it could drop.
+    if (!pending_removed_access_hooks_.empty() &&
+        std::find(pending_removed_access_hooks_.begin(), pending_removed_access_hooks_.end(), hook.id) !=
+            pending_removed_access_hooks_.end()) {
       continue;
     }
     if (hook.range.has_value()) {
