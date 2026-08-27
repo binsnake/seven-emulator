@@ -593,3 +593,44 @@ TEST(KuberaSimd, EncodingKindIsReadFromTheTableNotAssumedLegacy) {
   EXPECT_EQ(encoding_of("C5 FC 58 C1"), iced_x86::EncodingKind::VEX) << "vaddps ymm0, ymm0, ymm1";
   EXPECT_EQ(encoding_of("62 F1 7C 48 58 C1"), iced_x86::EncodingKind::EVEX) << "vaddps zmm0, zmm0, zmm1";
 }
+
+// AVX-512 writemasking is implemented in exactly one file. The EVEX moves and the EVEX pack family
+// route through shared helpers that had no notion of it, so `vmovapd zmm0{k1}, zmm1` wrote every
+// lane no matter what k1 held. Stopping cleanly is what the EVEX forms with no handler at all
+// already do, and it is a great deal better than a silently wrong register.
+TEST(KuberaSimd, AnEvexMoveWithAMaskRegisterStopsInsteadOfIgnoringIt) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  // vmovapd zmm0{k1}, zmm1
+  write_bytes(memory, kBase, seven::parse_hex_bytes("62 F1 FD 49 28 C1"));
+
+  state.opmask[1] = 0x1;                      // only lane 0 active
+  state.vectors[0].value = 0;
+  state.vectors[1].value = seven::SimdUint(0xFFFFFFFFFFFFFFFFull);
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::unsupported_instruction);
+  EXPECT_EQ(state.vectors[0].value, seven::SimdUint(0))
+      << "the destination must not have been written at all";
+}
+
+TEST(KuberaSimd, TheSameEvexMoveWithNoMaskStillWorks) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  // vmovapd zmm0, zmm1  -- same instruction, no mask register named
+  write_bytes(memory, kBase, seven::parse_hex_bytes("62 F1 FD 48 28 C1"));
+
+  state.vectors[0].value = 0;
+  state.vectors[1].value = seven::SimdUint(0x1234567890ABCDEFull);
+
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+  EXPECT_EQ(state.vectors[0].value, seven::SimdUint(0x1234567890ABCDEFull));
+}

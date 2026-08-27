@@ -132,6 +132,7 @@ bool write_any(ExecutionContext& ctx, std::uint32_t operand_index, big_uint valu
 // callers opt in explicitly with 0xFULL rather than this function guessing from the Code enum.
 ExecutionResult full_move(ExecutionContext& ctx, std::uint32_t dst, std::uint32_t src, bool zero_upper,
                           std::uint64_t alignment_mask = 0) {
+  if (detail::has_active_opmask(ctx.instr)) return detail::unsupported_opmask(ctx);
   if (alignment_mask != 0) {
     if (auto fault = detail::require_aligned_memory_operand(ctx, dst, alignment_mask)) return *fault;
     if (auto fault = detail::require_aligned_memory_operand(ctx, src, alignment_mask)) return *fault;
@@ -145,6 +146,7 @@ ExecutionResult full_move(ExecutionContext& ctx, std::uint32_t dst, std::uint32_
 }
 
 ExecutionResult low_move(ExecutionContext& ctx, std::uint32_t dst, std::uint32_t src, std::size_t width, bool zero_upper) {
+  if (detail::has_active_opmask(ctx.instr)) return detail::unsupported_opmask(ctx);
   bool ok = false;
   const auto value = read_any(ctx, src, width, &ok);
   if (!ok) return detail::memory_fault(ctx, detail::memory_address(ctx));
@@ -153,6 +155,7 @@ ExecutionResult low_move(ExecutionContext& ctx, std::uint32_t dst, std::uint32_t
 }
 
 ExecutionResult low_move_legacy_scalar_load(ExecutionContext& ctx, std::uint32_t dst, std::uint32_t src, std::size_t width) {
+  if (detail::has_active_opmask(ctx.instr)) return detail::unsupported_opmask(ctx);
   bool ok = false;
   const auto value = read_any(ctx, src, width, &ok);
   if (!ok) return detail::memory_fault(ctx, detail::memory_address(ctx));
@@ -162,6 +165,7 @@ ExecutionResult low_move_legacy_scalar_load(ExecutionContext& ctx, std::uint32_t
 }
 
 ExecutionResult merge_low_move(ExecutionContext& ctx, std::uint32_t dst, std::uint32_t merge, std::uint32_t src, std::size_t width, bool zero_upper) {
+  if (detail::has_active_opmask(ctx.instr)) return detail::unsupported_opmask(ctx);
   bool ok = false;
   const auto value = read_any(ctx, src, width, &ok);
   if (!ok) return detail::memory_fault(ctx, detail::memory_address(ctx));
@@ -173,6 +177,7 @@ ExecutionResult merge_low_move(ExecutionContext& ctx, std::uint32_t dst, std::ui
 }
 
 ExecutionResult merge_high_move(ExecutionContext& ctx, std::uint32_t dst, std::uint32_t merge, std::uint32_t src, std::size_t width, bool zero_upper) {
+  if (detail::has_active_opmask(ctx.instr)) return detail::unsupported_opmask(ctx);
   bool ok = false;
   const auto value = read_any(ctx, src, width, &ok);
   if (!ok) return detail::memory_fault(ctx, detail::memory_address(ctx));
@@ -185,6 +190,7 @@ ExecutionResult merge_high_move(ExecutionContext& ctx, std::uint32_t dst, std::u
 }
 
 ExecutionResult gpr_to_xmm(ExecutionContext& ctx, std::uint32_t dst, std::uint32_t src, std::size_t width) {
+  if (detail::has_active_opmask(ctx.instr)) return detail::unsupported_opmask(ctx);
   bool ok = false;
   const auto value = read_any(ctx, src, width, &ok);
   if (!ok) return detail::memory_fault(ctx, detail::memory_address(ctx));
@@ -196,6 +202,7 @@ ExecutionResult gpr_to_xmm(ExecutionContext& ctx, std::uint32_t dst, std::uint32
 // alignment-free GPR<->XMM moves and the MOVNT* non-temporal stores, which DO require it.
 ExecutionResult xmm_to_gpr(ExecutionContext& ctx, std::uint32_t dst, std::uint32_t src, std::size_t width,
                            std::uint64_t alignment_mask = 0) {
+  if (detail::has_active_opmask(ctx.instr)) return detail::unsupported_opmask(ctx);
   if (alignment_mask != 0) {
     if (auto fault = detail::require_aligned_memory_operand(ctx, dst, alignment_mask)) return *fault;
   }

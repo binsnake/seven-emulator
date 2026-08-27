@@ -162,6 +162,7 @@ ExecutionResult legacy_pack(ExecutionContext& ctx, Fn&& fn) {
 
 template <typename Dst, typename Src, typename Fn>
 ExecutionResult vex_pack(ExecutionContext& ctx, Fn&& fn) {
+  if (detail::has_active_opmask(ctx.instr)) return detail::unsupported_opmask(ctx);
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }

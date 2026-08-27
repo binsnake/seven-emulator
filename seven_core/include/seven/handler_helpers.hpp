@@ -21,6 +21,22 @@ void set_flag(std::uint64_t& rflags, std::uint64_t bit, bool value);
 // (CF/PF/AF/ZF/SF/OF); every other rflags bit (IF/TF/DF/...) is never masked. Defaults to 0 (mask
 // nothing, i.e. identical to pre-liveness behavior) so every existing call site is unaffected
 // unless the block lifter explicitly opts in for the instruction currently dispatching.
+// AVX-512 writemasking is implemented in exactly one place, simd_int.cpp's apply_masked_lanes.
+// Everywhere else an EVEX form that names a mask register would write every lane regardless, which
+// is a silently wrong answer rather than a missing feature. Handlers that cannot honour a mask ask
+// this first and stop cleanly instead, the same way the EVEX forms with no handler at all already
+// do. K0 and NONE both mean no masking, and both are the common case for the shared helpers these
+// guards sit in, which also serve the legacy and VEX encodings.
+[[nodiscard]] inline bool has_active_opmask(const iced_x86::Instruction& instr) noexcept {
+  const auto opmask = instr.op_mask();
+  return opmask != iced_x86::Register::NONE && opmask != iced_x86::Register::K0;
+}
+
+[[nodiscard]] inline ExecutionResult unsupported_opmask(ExecutionContext& ctx) {
+  return {StopReason::unsupported_instruction, 0,
+          ExceptionInfo{StopReason::unsupported_instruction, ctx.state.rip, 0}, ctx.instr.code()};
+}
+
 void set_dead_flags_mask(std::uint64_t mask) noexcept;
 [[nodiscard]] std::uint64_t dead_flags_mask() noexcept;
 std::uint64_t read_msr(CpuState& state, std::uint32_t index);
