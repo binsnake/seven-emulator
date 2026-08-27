@@ -369,13 +369,13 @@ StopReason Executor::violation_reason() const noexcept {
 //      not just at lift time -- see step_impl's masking_safe_now.
 // One narrow, accepted residual: an async request_stop() landing exactly mid-span can still
 // surface a stale masked value on that abort path. Not fixed -- treated the same as any other
-// best-effort-soon abort semantics. See Flag Liveness Execution Model Problem.md.
+// best-effort-soon abort semantics.
 constexpr bool kFlagLivenessTablesTrustworthy = true;
 
 bool Executor::block_liveness_eligible(const Memory& memory) const noexcept {
   // Instruction/code hooks and memory-access hooks get full ExecutionContext (state.rflags)
   // access at points mid-block that iced's per-instruction rflags tables don't know about -- see
-  // flag_liveness.hpp and Hook and Instrumentation Model.md. Trap and execution hooks don't have
+  // flag_liveness.hpp. Trap and execution hooks don't have
   // that problem (execution hooks only ever get an address, not state; trap-kind instructions are
   // always block-terminal under the boundary rules below) and are deliberately not checked here.
   return !has_instruction_hooks_ && !has_code_hooks_ &&
@@ -641,7 +641,7 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
       // control-flow/trap/hooked-address boundary) so the backward flag liveness pass has more
       // than one instruction to work with. This only pre-populates decode_cache_ entries for
       // instructions step() would decode-cache anyway on its next few calls; it doesn't change
-      // what gets executed now or batch dispatch in any way. See IR and Flag Liveness.md.
+      // what gets executed now or batch dispatch in any way.
       if (fetched && cache_entry.valid && cache_entry.trap_kind == 0xFFu && cache_entry.simd_allowed &&
           !ends_lifted_block(cache_entry.instr)) {
         std::array<std::size_t, kMaxBlockLiftLength> lifted_indices{};
@@ -896,8 +896,7 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
     // unsound); (3) no debug registers are armed (conservatively -- an execute breakpoint mid-span
     // is the same hazard as TF); (4) no hook got registered after this block was lifted (hooks are
     // checked once at lift time in block_liveness_eligible(), but a cached block's mask persists
-    // across dispatches -- hooks added later must still disable it). See
-    // Flag Liveness Execution Model Problem.md.
+    // across dispatches -- hooks added later must still disable it).
     const bool masking_safe_now = allow_masking && (state.rflags & kFlagTF) == 0 &&
                                    state.dr[7] == 0 && block_liveness_eligible(memory);
     // Saved and put back rather than plain assigned. A handler's memory access can land on an
@@ -985,9 +984,8 @@ ExecutionResult Executor::run(CpuState& state, Memory& memory, std::size_t max_i
     }
     // Only allow masking when there's enough budget left that ANY lifted block started now
     // (bounded by kMaxBlockLiftLength) is guaranteed to finish inside this call, so run() never
-    // returns to its own caller mid-span -- see step_impl's masking_safe_now and
-    // Flag Liveness Execution Model Problem.md. Near the tail of the budget this falls back to
-    // the same always-safe unmasked dispatch a bare step() call gets.
+    // returns to its own caller mid-span -- see step_impl's masking_safe_now. Near the tail of
+    // the budget this falls back to the same always-safe unmasked dispatch a bare step() gets.
     const bool allow_masking = (max_instructions - i) >= kMaxBlockLiftLength;
     last = step_impl(state, memory, allow_masking);
     if (last.reason != StopReason::none) {

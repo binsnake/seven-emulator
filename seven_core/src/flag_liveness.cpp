@@ -11,9 +11,9 @@ namespace {
 
 // Per-instruction ALU status flag read/written sets, hand-verified against seven's own handler
 // source (not iced_x86's InstructionExtensions::rflags_read/rflags_written/rflags_modified --
-// those are stub placeholders in this vendored fork, see Flag Liveness Data Source Problem.md).
+// those are stub placeholders in this vendored fork).
 //
-// Methodology (see IR and Flag Liveness / Flag Liveness Data Source Problem notes for the full
+// Methodology (see below for the full
 // reasoning): `written` may only include a bit that is GUARANTEED written whenever the handler
 // completes normally -- never a bit that's conditionally written depending on runtime operand
 // values (e.g. shift/rotate-by-CL/IMM8 forms, which skip all flag writes when the masked count is
@@ -283,7 +283,7 @@ struct FlagsInfo {
 // caller inspecting state after a returned fault) can observe rflags before the cover happens.
 // This is not hypothetical: guard-page tricks and SEH-based control-flow obfuscation routinely
 // trigger page faults as a normal part of execution, and exception handlers commonly inspect the
-// full CONTEXT record, including EFlags. See Flag Liveness Execution Model Problem.md.
+// full CONTEXT record, including EFlags.
 //
 // Register-only forms cannot fault in this implementation -- read_register/write_register have no
 // fallible path (see handler_helpers.cpp) -- so this only needs to check for a memory operand plus
@@ -379,7 +379,7 @@ bool can_fault(const iced_x86::Instruction& instr) noexcept {
 
 void compute_flag_liveness(std::span<FlagLivenessInstr> insts) noexcept {
   // Live-out of the block is conservatively "every ALU status flag" -- Phase 1 does no
-  // cross-block liveness (see IR and Flag Liveness.md), so whatever comes after this block
+  // cross-block liveness, so whatever comes after this block
   // (another block, the plain interpreter, a hook) might read any of them.
   std::uint64_t live = kAluStatusFlagsMask;
   for (auto it = insts.rbegin(); it != insts.rend(); ++it) {

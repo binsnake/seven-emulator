@@ -25,8 +25,7 @@ struct FlagLivenessInstr {
 // this when it's sound to skip writes at all: instruction/code hooks and memory-access hooks can
 // observe rflags at points iced's per-instruction read/write tables don't know about (mid-block,
 // via ExecutionContext), so this must not be used while any of those are registered. Trap and
-// (address-)execution hooks don't have that problem -- see Hook and Instrumentation Model.md -- and
-// don't need to gate this.
+// (address-)execution hooks don't have that problem, and don't need to gate this.
 void compute_flag_liveness(std::span<FlagLivenessInstr> insts) noexcept;
 
 // Whether this decoded instruction can fault (memory operand, DIV/IDIV, or implicit stack access

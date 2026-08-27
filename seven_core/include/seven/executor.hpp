@@ -129,7 +129,7 @@ class Executor {
   static ExecutionResult unsupported(ExecutionContext& ctx);
   // The shared dispatch core behind both step() and run()'s internal loop. `allow_masking` gates
   // whether a cached block's precomputed dead_flags_mask may actually be applied -- see its call
-  // sites and Flag Liveness Execution Model Problem.md for why this can never just be "trust the
+  // sites for why this can never just be "trust the
   // cache": a bare step() call never guarantees the caller will keep advancing through the rest of
   // a lifted block, so the public step() always passes false. Only run()'s own internal loop,
   // which does guarantee that (given enough budget headroom), passes true.
