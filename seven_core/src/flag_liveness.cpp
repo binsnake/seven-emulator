@@ -281,8 +281,8 @@ struct FlagsInfo {
 // write is only safe if the instruction that "covers" it is guaranteed to actually run. A fault
 // partway through the covering span breaks that guarantee -- the fault path (a fault hook, or a
 // caller inspecting state after a returned fault) can observe rflags before the cover happens.
-// This is not hypothetical: guard-page tricks and SEH-based control-flow obfuscation routinely
-// trigger page faults as a normal part of execution, and exception handlers commonly inspect the
+// This is not hypothetical: guard pages and SEH-driven control flow routinely trigger page
+// faults as a normal part of execution, and exception handlers commonly inspect the
 // full CONTEXT record, including EFlags.
 //
 // Register-only forms cannot fault in this implementation -- read_register/write_register have no

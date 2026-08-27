@@ -183,8 +183,8 @@ namespace {
 //    rotation is that masked count modulo the operand size, but CF/OF depend on the masked count.
 //  * CF is written whenever the masked count is non-zero (CF = LSB of result for ROL, MSB for ROR).
 //  * OF is architecturally defined only for a masked count of 1, but real silicon writes it in more
-//    cases -- and the exact set is operand-form dependent (this is an undefined-flag quirk that
-//    obfuscated code commonly probes to detect emulation). Measured on the i9-11900K for masked count > 1:
+//    cases -- and the exact set is operand-form dependent (an undefined-flag quirk that software
+//    commonly probes to detect emulation). Measured on the i9-11900K for masked count > 1:
 //      - CL-count encodings           : always write OF (any non-zero masked count).
 //      - imm/1 encodings, REGISTER dst : leave OF unchanged (preserved).
 //      - imm/1 encodings, MEMORY   dst : write OF (the memory execution path differs from register!)

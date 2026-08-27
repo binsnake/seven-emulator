@@ -358,8 +358,8 @@ StopReason Executor::violation_reason() const noexcept {
 //      which really does keep advancing) may apply it.
 //   2. A FAULT partway through the covering span (page fault on a memory operand, a divide error)
 //      -- exposes state to a fault hook or the caller before the cover happens, and this is not
-//      hypothetical: guard-page tricks and SEH-based control-flow obfuscation routinely fault as
-//      normal operation, and exception handlers commonly read the full CONTEXT/EFlags. Fixed in
+//      hypothetical: guard pages and SEH-driven control flow routinely fault as normal
+//      operation, and exception handlers commonly read the full CONTEXT/EFlags. Fixed in
 //      flag_liveness.cpp: any fault-capable instruction (can_fault()) is treated as reading every
 //      flag, which forces liveness back to "everything live" at that point and makes masking
 //      across it impossible by construction.
