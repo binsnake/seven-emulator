@@ -149,6 +149,17 @@ ExecutionResult divide_fault(ExecutionContext& ctx);
 // Masking the pointers and the count on the way in and after every step is all it takes: writing a
 // masked value back to a 64-bit register zero-extends it, which is what a 32-bit register write
 // does anyway.
+// A string instruction's DS:rSI source accepts a segment override; its ES:rDI destination does not,
+// which is why only the source-reading handlers ask for this. FS and GS are the two with a live
+// base in 64-bit mode, same as memory_address(). The override applies to the linear address only,
+// so rSI itself still steps and wraps within the address size on its own.
+[[nodiscard]] inline std::uint64_t string_source_segment_base(const CpuState& state,
+                                                              const iced_x86::Instruction& instr) noexcept {
+  if (instr.segment_prefix() == iced_x86::Register::FS) return state.fs_base;
+  if (instr.segment_prefix() == iced_x86::Register::GS) return state.gs_base;
+  return 0;
+}
+
 [[nodiscard]] inline std::uint64_t string_address_mask(const iced_x86::Instruction& instr) noexcept {
   for (std::uint32_t i = 0; i < instr.op_count(); ++i) {
     switch (instr.op_kind(i)) {

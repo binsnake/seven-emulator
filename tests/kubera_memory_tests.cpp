@@ -1091,3 +1091,29 @@ TEST(KuberaMemory, StringOperationsHonourTheAddressSizePrefix) {
     EXPECT_EQ(state.gpr[7], 0x4104u);
   }
 }
+
+// The DS:rSI source of movs/lods/cmps takes a segment override; the ES:rDI destination does not.
+// The handlers read straight through rSI, so an fs-prefixed lods read the unbiased address.
+TEST(KuberaMemory, StringSourceOperandHonoursASegmentOverride) {
+  seven::CpuState state{};
+  seven::Memory memory{};
+  seven::Executor executor{};
+  state.mode = seven::ExecutionMode::long64;
+  memory.map(0x1000, 0x1000);
+  memory.map(0x51000, 0x1000);
+  state.fs_base = 0x50000;
+
+  const std::uint8_t code[] = {0x64, 0x48, 0xAD};  // fs lodsq
+  ASSERT_TRUE(memory.write(0x1000, code, sizeof(code)));
+  const std::uint64_t through_fs = 0xFEEDFACECAFEBEEFull;
+  ASSERT_TRUE(memory.write(0x51230, &through_fs, sizeof(through_fs)));
+  const std::uint64_t unbiased = 0x1111222233334444ull;
+  ASSERT_TRUE(memory.write(0x1230, &unbiased, sizeof(unbiased)));
+
+  state.rip = 0x1000;
+  state.gpr[6] = 0x1230;
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::none);
+  EXPECT_EQ(state.gpr[0], through_fs);
+  EXPECT_EQ(state.gpr[6], 0x1238u) << "rsi steps by the operand size, not the linear address";
+}

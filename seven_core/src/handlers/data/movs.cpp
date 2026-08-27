@@ -36,11 +36,12 @@ ExecutionResult movs_impl(ExecutionContext& ctx, const std::size_t width) {
   }
 
   const bool df = (ctx.state.rflags & kFlagDF) != 0;
+  const auto src_base = detail::string_source_segment_base(ctx.state, ctx.instr);
   std::uint64_t rsi = ctx.state.gpr[6] & addr_mask;
   std::uint64_t rdi = ctx.state.gpr[7] & addr_mask;
 
   for (std::uint64_t i = 0; i < count; ++i) {
-    const auto read_addr = rsi;
+    const auto read_addr = rsi + src_base;
     const auto write_addr = rdi;
     std::uint64_t value = 0;
     if (!ctx.memory.read(read_addr, &value, width)) {
