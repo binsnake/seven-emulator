@@ -79,6 +79,22 @@ Memory::PageEntry* Memory::lookup_page(std::uint64_t page_index) const noexcept 
   return slot.entry;
 }
 
+bool Memory::mmio_overlaps(std::uint64_t base, std::size_t size) const noexcept {
+  if (mmio_regions_.empty() || size == 0) {
+    return false;
+  }
+  const auto end = range_end_saturating(base, size);
+  if (base >= mmio_max_end_ || mmio_min_base_ >= end) {
+    return false;
+  }
+  for (const auto& region : mmio_regions_) {
+    if (base < range_end_saturating(region.base, region.size) && region.base < end) {
+      return true;
+    }
+  }
+  return false;
+}
+
 void Memory::invalidate_code_epochs(std::uint64_t base, std::size_t size) noexcept {
   ++code_epoch_;
   if (size == 0) {
@@ -382,13 +398,8 @@ bool Memory::read_code_page(std::uint64_t page_base, void* dst) const {
   }
   // A device anywhere in this page means the page bytes are not what a fetch here returns. Decline
   // and let the caller fetch per instruction through read(), which consults the region.
-  const auto page_end = range_end_saturating(page_base, kPageSize);
-  if (!mmio_regions_.empty() && page_base < mmio_max_end_ && mmio_min_base_ < page_end) {
-    for (const auto& region : mmio_regions_) {
-      if (page_base < range_end_saturating(region.base, region.size) && region.base < page_end) {
-        return false;
-      }
-    }
+  if (mmio_overlaps(page_base, kPageSize)) {
+    return false;
   }
   const auto* entry = lookup_page(page_base / kPageSize);
   if (entry == nullptr || !has_permission(entry->permissions, MemoryAccessKind::instruction_fetch)) {

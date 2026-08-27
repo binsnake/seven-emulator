@@ -139,6 +139,10 @@ class Memory {
   // device to compile three instructions is a read the guest never asked for, and registers that
   // change when read do not care that the fetch was speculative.
   [[nodiscard]] bool is_mmio_address(std::uint64_t address) const;
+  // True if any device region touches [base, base+size). find_mmio_region answers a different
+  // question -- whether one region covers the whole range -- and says no to a range that merely runs
+  // into a device, which is the wrong answer for a caller asking "are these bytes really mine".
+  [[nodiscard]] bool mmio_overlaps(std::uint64_t base, std::size_t size) const noexcept;
   [[nodiscard]] std::vector<PageSnapshot> snapshot_pages() const;
   void restore_pages(const std::vector<PageSnapshot>& pages);
   [[nodiscard]] std::vector<MmioRegionSnapshot> snapshot_mmio_regions() const;
