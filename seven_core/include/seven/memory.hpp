@@ -219,13 +219,22 @@ class Memory {
     MmioReadCallback on_read;
     MmioWriteCallback on_write;
   };
+  // data goes last on purpose. It is the one field a guest address indexes into, and the JIT's
+  // fast path writes into it through a raw pointer that no sanitizer instruments. With the
+  // metadata ahead of it, a store that runs off the end of the page leaves the allocation, where
+  // the allocator and a sanitizer can both see it. Behind it sat this page's own permission byte,
+  // so the same store would have quietly handed the guest whatever permissions it wrote -- which
+  // is exactly what a mismatch between the fast path's bounds check and its access width would
+  // have produced.
   struct PageEntry {
-    std::array<std::byte, kPageSize> data{};
     MemoryPermissionMask permissions = kMemoryPermissionAll;
     // Stamped from code_epoch_ (never independently incremented) whenever this page is (re)mapped
     // or written -- see page_code_epoch().
     std::uint64_t code_epoch = 0;
+    std::array<std::byte, kPageSize> data{};
   };
+  static_assert(offsetof(PageEntry, data) > offsetof(PageEntry, permissions),
+                "the page bytes must sit after the metadata they could otherwise overwrite");
   void apply_pending_access_hook_ops();
   void refresh_access_hook_state() noexcept;
   // Recomputes jit_fast_path_blocked from the same three conditions read()/write() already check

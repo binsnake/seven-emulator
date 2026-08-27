@@ -598,7 +598,10 @@ void Memory::restore_pages(const std::vector<PageSnapshot>& pages) {
   clear_jit_tlb();  // pages_.clear() below frees every PageEntry jit_tlb could be pointing at
   pages_.clear();
   for (const auto& snapshot : pages) {
-    pages_.emplace(snapshot.page_index, PageEntry{snapshot.data, snapshot.permissions, ++code_epoch_});
+    pages_.emplace(snapshot.page_index,
+                   PageEntry{.permissions = snapshot.permissions,
+                             .code_epoch = ++code_epoch_,
+                             .data = snapshot.data});
   }
 }
 
