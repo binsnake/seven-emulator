@@ -2,6 +2,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 #include "seven/handler_helpers.hpp"
 #include "seven/x87_helpers.hpp"
@@ -306,9 +307,8 @@ ExecutionResult frstor(ExecutionContext& ctx, std::size_t image_size) {
 
 ExecutionResult fxsave(ExecutionContext& ctx, bool /*is64*/) {
   const auto base = detail::memory_address(ctx);
-  if ((base & 0xF) != 0) {
-    return detail::memory_fault(ctx, base);
-  }
+  // A misaligned FXSAVE area is #GP(0), not a page fault, the same as the legacy SSE m128 forms.
+  if (auto fault = detail::require_aligned_memory_operand(ctx, 0, 0xFULL)) return *fault;
   if (const auto span = validate_memory_span(ctx, base, 0x200, seven::MemoryAccessKind::data_write); !span.ok()) return span;
   if (!ctx.memory.write(base + 0, &ctx.state.x87_control_word, 2)) return detail::memory_fault(ctx, base + 0);
   if (!ctx.memory.write(base + 2, &ctx.state.x87_status_word, 2)) return detail::memory_fault(ctx, base + 2);
@@ -350,9 +350,7 @@ ExecutionResult fxsave(ExecutionContext& ctx, bool /*is64*/) {
 
 ExecutionResult fxrstor(ExecutionContext& ctx, bool /*is64*/) {
   const auto base = detail::memory_address(ctx);
-  if ((base & 0xF) != 0) {
-    return detail::memory_fault(ctx, base);
-  }
+  if (auto fault = detail::require_aligned_memory_operand(ctx, 0, 0xFULL)) return *fault;
   if (const auto span = validate_memory_span(ctx, base, 0x200, seven::MemoryAccessKind::data_read); !span.ok()) return span;
   std::uint16_t fcw = 0;
   std::uint16_t fsw = 0;
@@ -426,7 +424,9 @@ ExecutionResult handle_code_FEMMS(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_FNCLEX(ExecutionContext& ctx) {
-  ctx.state.x87_status_word &= ~std::uint16_t(0xBFu);
+  // The stack fault bit and the busy bit are part of what FNCLEX clears. Leaving SF set meant a
+  // guest that cleared after a stack fault still read one back on the next FNSTSW.
+  ctx.state.x87_status_word &= ~std::uint16_t(0x80FFu);
   return {};
 }
 
@@ -474,7 +474,7 @@ ExecutionResult handle_code_FABS(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_FSQRT(ExecutionContext& ctx) {
-  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow(ctx);
+  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow_into(ctx, 0);
   const X87Scalar value = ctx.state.x87_get(0);
   if (value < 0) return x87_exception(ctx, kX87ExceptionInvalid);
   const X87Scalar result = seven::sqrt(value);
@@ -492,7 +492,7 @@ ExecutionResult handle_code_FSQRT(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_FRNDINT(ExecutionContext& ctx) {
-  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow(ctx);
+  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow_into(ctx, 0);
   const X87Scalar value = ctx.state.x87_get(0);
   const X87Scalar rounded = x87_round_to_control(ctx.state, value);
   if (rounded != value) {
@@ -504,8 +504,13 @@ ExecutionResult handle_code_FRNDINT(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_FSIN(ExecutionContext& ctx) {
-  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow(ctx);
+  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow_into(ctx, 0);
   const X87Scalar value = ctx.state.x87_get(0);
+  if (x87_trig_argument_out_of_range(value)) {
+    x87_set_c2(ctx, true);
+    return {};
+  }
+  x87_set_c2(ctx, false);
   const X87Scalar result = seven::sin(value);
   if (value != 0 && result == 0) {
     auto r = x87_exception(ctx, static_cast<std::uint16_t>(kX87ExceptionUnderflow | kX87ExceptionPrecision));
@@ -520,8 +525,13 @@ ExecutionResult handle_code_FSIN(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_FCOS(ExecutionContext& ctx) {
-  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow(ctx);
+  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow_into(ctx, 0);
   const X87Scalar value = ctx.state.x87_get(0);
+  if (x87_trig_argument_out_of_range(value)) {
+    x87_set_c2(ctx, true);
+    return {};
+  }
+  x87_set_c2(ctx, false);
   const X87Scalar result = seven::cos(value);
   if (value != 0 && result == 0) {
     auto r = x87_exception(ctx, static_cast<std::uint16_t>(kX87ExceptionUnderflow | kX87ExceptionPrecision));
@@ -536,8 +546,13 @@ ExecutionResult handle_code_FCOS(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_FSINCOS(ExecutionContext& ctx) {
-  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow(ctx);
+  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow_into(ctx, 0);
   const X87Scalar x = ctx.state.x87_get(0);
+  if (x87_trig_argument_out_of_range(x)) {
+    x87_set_c2(ctx, true);
+    return {};
+  }
+  x87_set_c2(ctx, false);
   const X87Scalar cosine = seven::cos(x);
   const X87Scalar sine = seven::sin(x);
   if (x != 0 && (cosine == 0 || sine == 0)) {
@@ -548,14 +563,21 @@ ExecutionResult handle_code_FSINCOS(ExecutionContext& ctx) {
     auto r = x87_exception(ctx, exceptions);
     if (!r.ok()) return r;
   }
-  ctx.state.x87_set(0, cosine);
-  if (!ctx.state.x87_push(sine)) return x87_stack_overflow(ctx);
+  // The sine replaces ST(0) and the cosine is what gets pushed, so the cosine ends up on top. This
+  // was the other way round, which every caller reading ST(0) as the cosine got wrong.
+  ctx.state.x87_set(0, sine);
+  if (!ctx.state.x87_push(cosine)) return x87_stack_overflow(ctx);
   return {};
 }
 
 ExecutionResult handle_code_FPTAN(ExecutionContext& ctx) {
-  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow(ctx);
+  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow_into(ctx, 0);
   const X87Scalar value = ctx.state.x87_get(0);
+  if (x87_trig_argument_out_of_range(value)) {
+    x87_set_c2(ctx, true);
+    return {};
+  }
+  x87_set_c2(ctx, false);
   const X87Scalar result = seven::tan(value);
   if (value != 0 && result == 0) {
     auto r = x87_exception(ctx, static_cast<std::uint16_t>(kX87ExceptionUnderflow | kX87ExceptionPrecision));
@@ -580,7 +602,7 @@ ExecutionResult handle_code_FPATAN(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_F2XM1(ExecutionContext& ctx) {
-  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow(ctx);
+  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow_into(ctx, 0);
   const X87Scalar value = ctx.state.x87_get(0);
   if (value < -1 || value > 1) return x87_exception(ctx, kX87ExceptionInvalid);
   const X87Scalar result = seven::pow(X87Scalar(2), value) - X87Scalar(1);
@@ -600,6 +622,16 @@ ExecutionResult handle_code_FYL2X(ExecutionContext& ctx) {
   if (ctx.state.x87_is_empty(0) || ctx.state.x87_is_empty(1)) return x87_stack_underflow(ctx);
   const X87Scalar y = ctx.state.x87_get(1);
   const X87Scalar x = ctx.state.x87_get(0);
+  // log2(0) is -infinity, which is a divide-by-zero on the x87, not an invalid operand. Only the
+  // 0 * infinity case that ST(1) = 0 produces is genuinely invalid.
+  if (x == 0 && y != 0) {
+    auto r = x87_exception(ctx, kX87ExceptionZeroDiv);
+    if (!r.ok()) return r;
+    const auto infinity = std::numeric_limits<X87Scalar>::infinity();
+    ctx.state.x87_set(1, seven::signbit(y) ? infinity : -infinity);
+    if (!ctx.state.x87_pop()) return x87_stack_underflow(ctx);
+    return {};
+  }
   if (x <= 0) return x87_exception(ctx, kX87ExceptionInvalid);
   const X87Scalar result = y * seven::log2(x);
   if (y != 0 && result == 0) {
@@ -635,10 +667,28 @@ ExecutionResult handle_code_FYL2XP1(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_FSCALE(ExecutionContext& ctx) {
-  if (ctx.state.x87_is_empty(0) || ctx.state.x87_is_empty(1)) return x87_stack_underflow(ctx);
+  if (ctx.state.x87_is_empty(0) || ctx.state.x87_is_empty(1)) return x87_stack_underflow_into(ctx, 0);
   const X87Scalar a = ctx.state.x87_get(0);
   const X87Scalar b = ctx.state.x87_get(1);
-  const X87Scalar result = seven::ldexp(a, static_cast<int>(seven::trunc(b)));
+  if (seven::isnan(b)) {
+    ctx.state.x87_set(0, b);
+    return {};
+  }
+  // ST(1) is whatever the guest left there, including an infinity or something past 64 bits, and the
+  // narrowing conversion below is only defined inside int's range. Clamping is not a fudge here:
+  // ldexp saturates to an infinity or a zero long before the clamp, so ST(1) = +inf and ST(1) = 2^70
+  // both give the answer hardware gives, where the raw cast was landing on 0 and returning ST(0).
+  const X87Scalar truncated = seven::trunc(b);
+  constexpr int kMaxShift = 0x7FFFFFFF;
+  int shift = 0;
+  if (truncated > X87Scalar(kMaxShift)) {
+    shift = kMaxShift;
+  } else if (truncated < X87Scalar(-kMaxShift)) {
+    shift = -kMaxShift;
+  } else {
+    shift = static_cast<int>(truncated);
+  }
+  const X87Scalar result = seven::ldexp(a, shift);
   if (a != 0 && result == 0) {
     auto r = x87_exception(ctx, static_cast<std::uint16_t>(kX87ExceptionUnderflow | kX87ExceptionPrecision));
     if (!r.ok()) return r;
@@ -648,6 +698,37 @@ ExecutionResult handle_code_FSCALE(ExecutionContext& ctx) {
     if (!r.ok()) return r;
   }
   ctx.state.x87_set(0, result);
+  return {};
+}
+
+// D9 F4. Splits ST(0) into its unbiased exponent and its significand, leaving the exponent in ST(1)
+// and pushing the significand. It had no handler at all, so every FXTRACT stopped the guest with
+// unsupported_instruction.
+ExecutionResult handle_code_FXTRACT(ExecutionContext& ctx) {
+  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow_into(ctx, 0);
+  const X87Scalar value = ctx.state.x87_get(0);
+  const auto infinity = std::numeric_limits<X87Scalar>::infinity();
+  if (value == 0) {
+    auto r = x87_exception(ctx, kX87ExceptionZeroDiv);
+    if (!r.ok()) return r;
+    ctx.state.x87_set(0, -infinity);
+    if (!ctx.state.x87_push(value)) return x87_stack_overflow(ctx);
+    return {};
+  }
+  if (seven::isnan(value)) {
+    if (!ctx.state.x87_push(value)) return x87_stack_overflow(ctx);
+    return {};
+  }
+  if (seven::isinf(value)) {
+    ctx.state.x87_set(0, infinity);
+    if (!ctx.state.x87_push(value)) return x87_stack_overflow(ctx);
+    return {};
+  }
+  int exponent = 0;
+  const X87Scalar mantissa = seven::frexp(value, &exponent);
+  // frexp normalizes to [0.5, 1); the x87 wants the significand in [1, 2), hence the shared step.
+  ctx.state.x87_set(0, X87Scalar(static_cast<std::int64_t>(exponent) - 1));
+  if (!ctx.state.x87_push(seven::ldexp(mantissa, 1))) return x87_stack_overflow(ctx);
   return {};
 }
 

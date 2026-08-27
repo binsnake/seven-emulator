@@ -102,7 +102,6 @@ struct DescriptorTableRegister {
 
 struct CpuState {
   std::array<std::uint64_t, 16> gpr{};
-  std::array<std::uint64_t, 8> mmx{};
   std::array<std::uint16_t, 6> sreg{};  // ES,CS,SS,DS,FS,GS selectors
   // cr[0]=CR0, cr[4]=CR4 — Windows 10/11 x64 typical values
   std::array<std::uint64_t, 16> cr{0x80050033u, 0, 0, 0, 0x370678u};
@@ -234,13 +233,19 @@ struct CpuState {
     std::swap(x87_tags[i0], x87_tags[iN]);
   }
 
+  // MM0-MM7 are not a register file of their own: they are the low 64 bits (the significand) of the
+  // PHYSICAL x87 registers R0-R7, which is why they are indexed without TOP. They used to live in a
+  // separate array, so FXSAVE/FNSAVE stored zeros for them and FXRSTOR/FRSTOR never brought them
+  // back. Writing one fills the aliased register's exponent and sign with ones, which is what makes
+  // the x87 side read the value back as a NaN.
   [[nodiscard]] std::uint64_t mmx_get(std::size_t mm_index) const noexcept {
-    return mmx[mmx_phys_index(mm_index)];
+    return x87_stack[mmx_phys_index(mm_index)].val.signif;
   }
 
   void mmx_set(std::size_t mm_index, std::uint64_t value) noexcept {
     const auto idx = mmx_phys_index(mm_index);
-    mmx[idx] = value;
+    x87_stack[idx].val.signif = value;
+    x87_stack[idx].val.signExp = 0xFFFFu;
     x87_tags[idx] = 0x0;
   }
 };

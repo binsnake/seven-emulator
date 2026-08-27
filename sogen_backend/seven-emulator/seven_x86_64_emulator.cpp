@@ -673,7 +673,7 @@ class seven_x86_64_emulator final : public x86_64_emulator {
 
     if (r >= x86_register::mm0 && r <= x86_register::mm7) {
       const auto idx = static_cast<size_t>(static_cast<int>(r) - static_cast<int>(x86_register::mm0));
-      state_.mmx[idx] = scalar;
+      state_.mmx_set(idx, scalar);
       return std::min(size, size_t(8));
     }
 
@@ -778,7 +778,7 @@ class seven_x86_64_emulator final : public x86_64_emulator {
         return 0;
       } else if (r >= x86_register::mm0 && r <= x86_register::mm7) {
         const auto idx = static_cast<size_t>(static_cast<int>(r) - static_cast<int>(x86_register::mm0));
-        scalar = state_.mmx[idx];
+        scalar = state_.mmx_get(idx);
         out_size = 8;
       } else {
         size_t vec_index{};
@@ -1129,7 +1129,7 @@ class seven_x86_64_emulator final : public x86_64_emulator {
     s.write(state_.idtr.base);
     s.write(state_.idtr.limit);
     for (const auto& v : state_.gpr) s.write(v);
-    for (const auto& v : state_.mmx) s.write(v);
+    // No separate MMX block: MM0-MM7 are the low halves of the x87 registers serialized below.
     for (const auto& v : state_.sreg) s.write(v);
     for (const auto& v : state_.cr) s.write(v);
     for (const auto& v : state_.dr) s.write(v);
@@ -1183,7 +1183,6 @@ class seven_x86_64_emulator final : public x86_64_emulator {
     d.read(state_.idtr.base);
     d.read(state_.idtr.limit);
     for (auto& v : state_.gpr) d.read(v);
-    for (auto& v : state_.mmx) d.read(v);
     for (auto& v : state_.sreg) d.read(v);
     for (auto& v : state_.cr) d.read(v);
     for (auto& v : state_.dr) d.read(v);

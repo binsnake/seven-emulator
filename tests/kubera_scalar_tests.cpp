@@ -1,3 +1,6 @@
+#include <cstring>
+#include <tuple>
+
 #include <gtest/gtest.h>
 
 #include "kubera_test_support.hpp"
@@ -2016,4 +2019,323 @@ TEST(KuberaScalar, AnEnterWhoseDisplayCopyFaultsLeavesTheFrameRegistersAlone) {
   EXPECT_EQ(result.reason, seven::StopReason::page_fault);
   EXPECT_EQ(state.gpr[4], entry_sp);
   EXPECT_EQ(state.gpr[5], 0x7000'0000ull);
+}
+
+namespace {
+
+constexpr std::uint16_t kX87Ie = 0x0001;
+constexpr std::uint16_t kX87Ze = 0x0004;
+constexpr std::uint16_t kX87Sf = 0x0040;
+constexpr std::uint16_t kX87C0 = 0x0100;
+constexpr std::uint16_t kX87C1 = 0x0200;
+constexpr std::uint16_t kX87C2 = 0x0400;
+constexpr std::uint16_t kX87C3 = 0x4000;
+
+bool is_x87_indefinite(const seven::X87Scalar& value) {
+  return value.val.signExp == 0xFFFFu && value.val.signif == 0xC000000000000000ull;
+}
+
+}  // namespace
+
+// A masked stack overflow is not a no-op on hardware: TOP still moves and the new top gets the QNaN
+// indefinite. seven raised the exception and left TOP alone, so from there on every ST(i) the guest
+// named resolved to a different physical register than the one hardware would have used -- the
+// whole register file was off by one for the rest of the program.
+TEST(KuberaScalar, MaskedStackOverflowStillMovesTheStackTop) {
+  const auto fill_then_overflow = [](std::uint16_t control_word) {
+    seven::Executor executor{};
+    seven::CpuState state{};
+    seven::Memory memory{};
+    state.mode = seven::ExecutionMode::long64;
+    state.rip = kBase;
+    state.set_x87_control_word(control_word);
+    memory.map(kBase, 0x1000);
+    // fld1 x8 fills the stack, the ninth overflows it.
+    write_bytes(memory, kBase, seven::parse_hex_bytes("D9 E8 D9 E8 D9 E8 D9 E8 D9 E8 D9 E8 D9 E8 D9 E8 D9 E8"));
+    for (int i = 0; i < 8; ++i) {
+      EXPECT_EQ(executor.step(state, memory).reason, seven::StopReason::none) << "fill " << i;
+    }
+    EXPECT_EQ(state.get_x87_top(), 0u) << "sanity: eight pushes wrap TOP back to 0";
+    const auto reason = executor.step(state, memory).reason;
+    return std::tuple{reason, state.get_x87_top(), state.x87_get(0), state.get_x87_status_word()};
+  };
+
+  const auto [masked_reason, masked_top, masked_st0, masked_sw] = fill_then_overflow(0x037F);
+  EXPECT_EQ(masked_reason, seven::StopReason::none);
+  EXPECT_EQ(masked_top, 7u) << "a masked overflow still decrements TOP";
+  EXPECT_TRUE(is_x87_indefinite(masked_st0)) << "and writes the indefinite into the new top";
+  EXPECT_EQ(masked_sw & (kX87Ie | kX87Sf | kX87C1), kX87Ie | kX87Sf | kX87C1);
+
+  // Unmasking the invalid-operation exception has to keep the old behaviour: fault, complete nothing.
+  const auto [raised_reason, raised_top, raised_st0, raised_sw] = fill_then_overflow(0x037E);
+  EXPECT_EQ(raised_reason, seven::StopReason::floating_point_exception);
+  EXPECT_EQ(raised_top, 0u) << "an unmasked overflow must not move TOP";
+  EXPECT_EQ(static_cast<double>(raised_st0), 1.0) << "nor overwrite the register that is still there";
+  EXPECT_NE(raised_sw & 0x0080u, 0u) << "ES is set when the exception is not masked";
+}
+
+// The other half of the same rule: a masked stack underflow returns the indefinite to the
+// destination rather than leaving the instruction unexecuted.
+TEST(KuberaScalar, MaskedStackUnderflowLeavesTheIndefiniteInTheDestination) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("D9 E0"));  // fchs, on an empty stack
+
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+  EXPECT_FALSE(state.x87_is_empty(0)) << "the destination is written, so it is no longer empty";
+  EXPECT_TRUE(is_x87_indefinite(state.x87_get(0)));
+  EXPECT_EQ(state.get_x87_status_word() & (kX87Ie | kX87Sf), kX87Ie | kX87Sf);
+}
+
+// MM0-MM7 are the low 64 bits of the physical x87 registers, so FXSAVE stores them and FXRSTOR
+// brings them back for free. They used to live in an array of their own that no save or restore
+// path ever looked at, which lost the whole MMX file across a context switch.
+TEST(KuberaScalar, MmxRegistersAliasTheX87RegisterFileAcrossFxsave) {
+  constexpr std::uint64_t kSave = 0x4000;
+  constexpr std::uint64_t kPattern = 0x0123456789ABCDEFull;
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  memory.map(kSave, 0x1000);
+  // movq mm0, rax ; fxsave [rbx] ; movq mm0, rcx ; fxrstor [rbx] ; movq rdx, mm0
+  write_bytes(memory, kBase, seven::parse_hex_bytes("48 0F 6E C0 0F AE 03 48 0F 6E C1 0F AE 0B 48 0F 7E C2"));
+  state.gpr[0] = kPattern;
+  state.gpr[1] = 0xFEDCBA9876543210ull;
+  state.gpr[3] = kSave;
+
+  for (int i = 0; i < 5; ++i) {
+    ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none) << "step " << i;
+  }
+
+  std::array<std::uint8_t, 10> slot0{};
+  ASSERT_TRUE(memory.read(kSave + 32, slot0.data(), slot0.size()));
+  std::uint64_t significand = 0;
+  std::uint16_t sign_exp = 0;
+  std::memcpy(&significand, slot0.data(), sizeof(significand));
+  std::memcpy(&sign_exp, slot0.data() + 8, sizeof(sign_exp));
+  EXPECT_EQ(significand, kPattern) << "fxsave stores MM0 as the significand of the aliased register";
+  EXPECT_EQ(sign_exp, 0xFFFFu) << "writing an MMX register fills the exponent and sign with ones";
+  EXPECT_EQ(state.gpr[2], kPattern) << "fxrstor has to bring MM0 back";
+}
+
+// The FXSAVE area must be 16-byte aligned and hardware raises #GP(0) when it is not, the same as
+// every other explicitly-aligned SSE operand. seven reported a page fault.
+TEST(KuberaScalar, MisalignedFxsaveAreaIsAGeneralProtectionFault) {
+  constexpr std::uint64_t kSave = 0x4000;
+  const auto run = [](const std::string& hex) {
+    seven::Executor executor{};
+    seven::CpuState state{};
+    seven::Memory memory{};
+    state.mode = seven::ExecutionMode::long64;
+    state.rip = kBase;
+    memory.map(kBase, 0x1000);
+    memory.map(kSave, 0x1000);
+    write_bytes(memory, kBase, seven::parse_hex_bytes(hex));
+    state.gpr[3] = kSave + 1;
+    return executor.step(state, memory).reason;
+  };
+
+  EXPECT_EQ(run("0F AE 03"), seven::StopReason::general_protection) << "fxsave [rbx]";
+  EXPECT_EQ(run("0F AE 0B"), seven::StopReason::general_protection) << "fxrstor [rbx]";
+}
+
+// FSINCOS replaces ST(0) with the sine and then pushes the cosine, so the cosine is what ends up on
+// top. seven had the two the other way round.
+TEST(KuberaScalar, FsincosLeavesTheCosineOnTop) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("D9 E8 D9 FB"));  // fld1 ; fsincos
+
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+
+  EXPECT_NEAR(static_cast<double>(state.x87_get(0)), 0.5403023058681398, 1e-12) << "cos(1) on top";
+  EXPECT_NEAR(static_cast<double>(state.x87_get(1)), 0.8414709848078965, 1e-12) << "sin(1) below it";
+}
+
+// The trig instructions only reduce arguments below 2^63. Past that hardware sets C2 and leaves both
+// the operand and the stack untouched; seven pushed whatever std::sin made of the narrowed value.
+TEST(KuberaScalar, TrigOnAnUnreducibleArgumentSetsC2AndLeavesTheStackAlone) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.gpr[3] = kX87Data;
+  memory.map(kX87Data, 0x1000);
+  write_extf80(memory, kX87Data, 0x8000000000000000ull, 0x403E);  // 2^63, the first rejected value
+  // fld tbyte [rbx] ; fsin ; fptan
+  write_bytes(memory, kBase, seven::parse_hex_bytes("DB 2B D9 FE D9 F2"));
+
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);  // fld
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);  // fsin
+  EXPECT_NE(state.get_x87_status_word() & kX87C2, 0u) << "fsin gave up and said so";
+  EXPECT_EQ(state.x87_get(0).val.signExp, 0x403Eu) << "and left the operand where it was";
+  EXPECT_EQ(state.get_x87_top(), 7u);
+
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);  // fptan
+  EXPECT_NE(state.get_x87_status_word() & kX87C2, 0u);
+  EXPECT_EQ(state.get_x87_top(), 7u) << "an out-of-range fptan must not push its 1.0 either";
+}
+
+// FPREM reports the low three bits of the quotient, and not in register order: Q2 lands in C0, Q1 in
+// C3 and Q0 in C1. seven left all four condition codes exactly as it found them.
+TEST(KuberaScalar, FpremReportsTheQuotientBitsAndClearsC2) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.gpr[3] = kX87Data;
+  memory.map(kX87Data, 0x1000);
+  write_extf80(memory, kX87Data, 0x8000000000000000ull, 0x3FFF);       // 1.0, the divisor
+  write_extf80(memory, kX87Data + 16, 0xA000000000000000ull, 0x4001);  // 5.0, the dividend
+  // fld tbyte [rbx] ; fld tbyte [rbx+16] ; fprem
+  write_bytes(memory, kBase, seven::parse_hex_bytes("DB 2B DB 6B 10 D9 F8"));
+
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none) << "step " << i;
+  }
+
+  EXPECT_EQ(static_cast<double>(state.x87_get(0)), 0.0);
+  const auto sw = state.get_x87_status_word();
+  EXPECT_EQ(sw & kX87C2, 0u) << "the reduction finished";
+  EXPECT_NE(sw & kX87C0, 0u) << "quotient 5 is 101b, so Q2 is set";
+  EXPECT_EQ(sw & kX87C3, 0u) << "Q1 is clear";
+  EXPECT_NE(sw & kX87C1, 0u) << "Q0 is set";
+}
+
+// One FPREM only makes guaranteed progress while the two exponents are within 64 of each other. Past
+// that it reduces part of the way and raises C2 to say so, and the guest is expected to run it again.
+// seven always computed the whole remainder, so a guest looping on C2 never saw it clear.
+TEST(KuberaScalar, FpremKeepsC2SetUntilTheReductionFinishes) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.gpr[3] = kX87Data;
+  memory.map(kX87Data, 0x1000);
+  write_extf80(memory, kX87Data, 0xC000000000000000ull, 0x4000);       // 3.0, the divisor
+  write_extf80(memory, kX87Data + 16, 0x8000000000000000ull, 0x4045);  // 2^70, the dividend
+  // fld tbyte [rbx] ; fld tbyte [rbx+16] ; fprem ; fprem
+  write_bytes(memory, kBase, seven::parse_hex_bytes("DB 2B DB 6B 10 D9 F8 D9 F8"));
+
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none) << "step " << i;
+  }
+  EXPECT_NE(state.get_x87_status_word() & kX87C2, 0u) << "70 bits apart, so one pass cannot finish";
+  EXPECT_EQ(static_cast<double>(state.x87_get(0)), 64.0) << "partially reduced, not finished";
+
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+  EXPECT_EQ(state.get_x87_status_word() & kX87C2, 0u) << "the second pass completes it";
+  EXPECT_EQ(static_cast<double>(state.x87_get(0)), 1.0) << "2^70 mod 3";
+}
+
+// FNCLEX clears the stack fault and busy bits along with the six exception flags and ES. seven's
+// mask skipped SF, so a guest that cleared after a stack fault still read one back.
+TEST(KuberaScalar, FnclexClearsTheStackFaultBit) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("D9 E0 DB E2"));  // fchs on an empty stack ; fnclex
+
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+  ASSERT_NE(state.get_x87_status_word() & kX87Sf, 0u) << "sanity: the underflow raised SF";
+
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+  EXPECT_EQ(state.get_x87_status_word() & (kX87Ie | kX87Sf | 0x0080u), 0u);
+}
+
+// log2(0) is minus infinity, which the x87 reports as a divide-by-zero. seven called it an invalid
+// operand and then left the stack untouched, so the guest neither got the result nor the pop.
+TEST(KuberaScalar, Fyl2xOnZeroIsADivideByZeroNotAnInvalidOperand) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.gpr[3] = kX87Data;
+  memory.map(kX87Data, 0x1000);
+  write_extf80(memory, kX87Data, 0x8000000000000000ull, 0x3FFF);  // 1.0, the multiplier
+  write_extf80(memory, kX87Data + 16, 0ull, 0x0000);              // +0.0, the argument
+  // fld tbyte [rbx] ; fld tbyte [rbx+16] ; fyl2x
+  write_bytes(memory, kBase, seven::parse_hex_bytes("DB 2B DB 6B 10 D9 F1"));
+
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none) << "step " << i;
+  }
+
+  const auto sw = state.get_x87_status_word();
+  EXPECT_NE(sw & kX87Ze, 0u) << "ST(0) of zero is a divide-by-zero";
+  EXPECT_EQ(sw & kX87Ie, 0u) << "and not an invalid operand";
+  EXPECT_TRUE(seven::isinf(state.x87_get(0)));
+  EXPECT_TRUE(seven::signbit(state.x87_get(0)));
+  EXPECT_EQ(state.get_x87_top(), 7u) << "fyl2x pops";
+}
+
+// FSCALE takes its shift count from ST(1), which is guest data, and the count was narrowed straight
+// to int. Anything past int64's range came back as softfloat's out-of-range default and truncated to
+// zero, so a scale by 2^70 or by infinity quietly returned ST(0) unchanged.
+TEST(KuberaScalar, FscaleClampsAShiftCountThatDoesNotFitInAnInt) {
+  const auto scale_by = [](std::uint64_t significand, std::uint16_t sign_exp) {
+    seven::Executor executor{};
+    seven::CpuState state{};
+    seven::Memory memory{};
+    state.mode = seven::ExecutionMode::long64;
+    state.rip = kBase;
+    state.gpr[3] = kX87Data;
+    memory.map(kX87Data, 0x1000);
+    write_extf80(memory, kX87Data, significand, sign_exp);
+    // fld tbyte [rbx] ; fld1 ; fscale
+    write_bytes(memory, kBase, seven::parse_hex_bytes("DB 2B D9 E8 D9 FD"));
+    for (int i = 0; i < 3; ++i) {
+      EXPECT_EQ(executor.step(state, memory).reason, seven::StopReason::none) << "step " << i;
+    }
+    return state.x87_get(0);
+  };
+
+  const auto scaled_up = scale_by(0x8000000000000000ull, 0x4045);  // 2^70
+  EXPECT_TRUE(seven::isinf(scaled_up)) << "1.0 scaled by 2^70 overflows";
+  EXPECT_FALSE(seven::signbit(scaled_up));
+
+  const auto scaled_down = scale_by(0x8000000000000000ull, 0xC045);  // -2^70
+  EXPECT_EQ(static_cast<double>(scaled_down), 0.0) << "and scaling down that far underflows to zero";
+
+  const auto scaled_by_infinity = scale_by(0x8000000000000000ull, 0x7FFF);  // +inf
+  EXPECT_TRUE(seven::isinf(scaled_by_infinity));
+}
+
+// FXTRACT had no handler at all, so it stopped the guest as an unsupported instruction.
+TEST(KuberaScalar, FxtractSplitsTheExponentFromTheSignificand) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.gpr[3] = kX87Data;
+  memory.map(kX87Data, 0x1000);
+  write_extf80(memory, kX87Data, 0xC000000000000000ull, 0x4002);  // 12.0 = 1.5 * 2^3
+  // fld tbyte [rbx] ; fxtract
+  write_bytes(memory, kBase, seven::parse_hex_bytes("DB 2B D9 F4"));
+
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+
+  EXPECT_EQ(static_cast<double>(state.x87_get(0)), 1.5) << "the significand is pushed";
+  EXPECT_EQ(static_cast<double>(state.x87_get(1)), 3.0) << "the unbiased exponent stays below it";
 }

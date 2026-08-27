@@ -26,11 +26,21 @@ constexpr std::uint16_t kX87ExceptionMask = 0x003Fu;
 inline bool x87_exceptions_masked(const CpuState& state, std::uint16_t exceptions);
 inline ExecutionResult x87_exception(ExecutionContext& ctx, std::uint16_t exceptions);
 inline ExecutionResult x87_stack_underflow(ExecutionContext& ctx);
+inline ExecutionResult x87_stack_underflow_into(ExecutionContext& ctx, std::size_t dst_index);
 inline ExecutionResult x87_stack_overflow(ExecutionContext& ctx);
 inline ExecutionResult x87_precision_if_changed(ExecutionContext& ctx, const X87Scalar& before, const X87Scalar& after);
 inline std::uint16_t x87_classify_result(const X87Scalar& result, const X87Scalar& lhs, const X87Scalar& rhs);
 inline std::uint16_t x87_precision_from_binary(const X87Scalar& lhs, const X87Scalar& rhs, const X87Scalar& result);
 inline X87Scalar x87_round_to_control(const CpuState& state, X87Scalar value);
+
+// The QNaN floating-point indefinite: sign 1, exponent all ones, significand 0xC000...0. This is
+// what hardware leaves behind whenever a masked exception has no meaningful answer to give.
+inline X87Scalar x87_indefinite() {
+  extFloat80_t v;
+  v.signExp = 0xFFFFu;
+  v.signif = 0xC000000000000000ULL;
+  return X87Scalar(v);
+}
 
 inline std::size_t x87_st_index(iced_x86::Register reg) {
   return static_cast<std::size_t>(static_cast<std::uint32_t>(reg) - static_cast<std::uint32_t>(iced_x86::Register::ST0));
@@ -38,7 +48,7 @@ inline std::size_t x87_st_index(iced_x86::Register reg) {
 
 template <typename Fn>
 inline ExecutionResult x87_unary_st0(ExecutionContext& ctx, Fn&& fn) {
-  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow(ctx);
+  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow_into(ctx, 0);
   const auto input = ctx.state.x87_get(0);
   const auto value = fn(input);
   const auto exceptions = x87_classify_result(value, input, 0);
@@ -80,7 +90,7 @@ inline ExecutionResult x87_binary_mem_st0(ExecutionContext& ctx, std::size_t wid
   } else {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
-  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow(ctx);
+  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow_into(ctx, 0);
   const auto lhs = ctx.state.x87_get(0);
   const auto value = fn(lhs, rhs);
   const auto exceptions = static_cast<std::uint16_t>(x87_classify_result(value, lhs, rhs) | x87_precision_from_binary(lhs, rhs, value));
@@ -106,7 +116,7 @@ inline ExecutionResult x87_binary_mem_st0_with_status(ExecutionContext& ctx, std
   } else {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
-  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow(ctx);
+  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow_into(ctx, 0);
   const auto [value, exceptions] = fn(ctx.state.x87_get(0), rhs);
   const auto lhs = ctx.state.x87_get(0);
   const auto classified = static_cast<std::uint16_t>(x87_classify_result(value, lhs, rhs) | x87_precision_from_binary(lhs, rhs, value));
@@ -136,7 +146,7 @@ inline ExecutionResult x87_binary_mem_int_st0(ExecutionContext& ctx, std::size_t
   } else {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
-  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow(ctx);
+  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow_into(ctx, 0);
   const auto lhs = ctx.state.x87_get(0);
   const auto value = fn(lhs, rhs);
   const auto exceptions = static_cast<std::uint16_t>(x87_classify_result(value, lhs, rhs) | x87_precision_from_binary(lhs, rhs, value));
@@ -166,7 +176,7 @@ inline ExecutionResult x87_binary_mem_int_st0_with_status(ExecutionContext& ctx,
   } else {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
-  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow(ctx);
+  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow_into(ctx, 0);
   const auto [value, exceptions] = fn(ctx.state.x87_get(0), rhs);
   const auto lhs = ctx.state.x87_get(0);
   const auto classified = static_cast<std::uint16_t>(x87_classify_result(value, lhs, rhs) | x87_precision_from_binary(lhs, rhs, value));
@@ -194,7 +204,7 @@ inline ExecutionResult x87_binary_mem_int_st0_with_status(ExecutionContext& ctx,
 
 template <typename Fn>
 inline ExecutionResult x87_binary_st_indices(ExecutionContext& ctx, std::size_t dst_idx, std::size_t src_idx, Fn&& fn) {
-  if (ctx.state.x87_is_empty(dst_idx) || ctx.state.x87_is_empty(src_idx)) return x87_stack_underflow(ctx);
+  if (ctx.state.x87_is_empty(dst_idx) || ctx.state.x87_is_empty(src_idx)) return x87_stack_underflow_into(ctx, dst_idx);
   const auto lhs = ctx.state.x87_get(dst_idx);
   const auto rhs = ctx.state.x87_get(src_idx);
   const auto value = fn(lhs, rhs);
@@ -228,7 +238,7 @@ inline ExecutionResult x87_binary_st_regs_with_status(ExecutionContext& ctx, std
   }
   const auto dst_idx = x87_st_index(dst);
   const auto src_idx = x87_st_index(src);
-  if (ctx.state.x87_is_empty(dst_idx) || ctx.state.x87_is_empty(src_idx)) return x87_stack_underflow(ctx);
+  if (ctx.state.x87_is_empty(dst_idx) || ctx.state.x87_is_empty(src_idx)) return x87_stack_underflow_into(ctx, dst_idx);
   const auto lhs = ctx.state.x87_get(dst_idx);
   const auto rhs = ctx.state.x87_get(src_idx);
   const auto [value, exceptions] = fn(lhs, rhs);
@@ -403,6 +413,31 @@ inline void x87_set_cmp_flags(ExecutionContext& ctx, int relation) {
   ctx.state.set_x87_status_word(sw);
 }
 
+inline void x87_set_c2(ExecutionContext& ctx, bool value) {
+  auto sw = ctx.state.get_x87_status_word();
+  sw = value ? static_cast<std::uint16_t>(sw | 0x0400u) : static_cast<std::uint16_t>(sw & ~0x0400u);
+  ctx.state.set_x87_status_word(sw);
+}
+
+// FPREM/FPREM1 hand back the low three bits of the quotient, and not in register order: Q2 goes to
+// C0, Q1 to C3, Q0 to C1. A guest reducing an argument by pi/4 reads them to work out which octant
+// it landed in, so getting the pairing wrong is silently wrong trigonometry rather than a fault.
+inline void x87_set_quotient_bits(ExecutionContext& ctx, std::uint64_t quotient) {
+  auto sw = ctx.state.get_x87_status_word();
+  sw &= static_cast<std::uint16_t>(~0x4300u);
+  if ((quotient & 0x4u) != 0) sw |= static_cast<std::uint16_t>(0x0100u);
+  if ((quotient & 0x2u) != 0) sw |= static_cast<std::uint16_t>(0x4000u);
+  if ((quotient & 0x1u) != 0) sw |= static_cast<std::uint16_t>(0x0200u);
+  ctx.state.set_x87_status_word(sw);
+}
+
+// FSIN/FCOS/FSINCOS/FPTAN only reduce arguments below 2^63. Past that hardware raises C2 and leaves
+// the operand and the stack exactly as they were rather than returning a meaningless answer.
+inline bool x87_trig_argument_out_of_range(const X87Scalar& value) {
+  if (seven::isnan(value) || seven::isinf(value)) return false;
+  return (value.val.signExp & 0x7FFFu) >= 0x403Eu;
+}
+
 inline void x87_set_eflags_cmp(ExecutionContext& ctx, int relation) {
   auto sw = ctx.state.get_x87_status_word();
   sw &= static_cast<std::uint16_t>(~0x0200u);
@@ -418,7 +453,7 @@ inline ExecutionResult x87_move_if(ExecutionContext& ctx, bool take) {
   const auto src = ctx.instr.op_register(1);
   if (src < iced_x86::Register::ST0 || src > iced_x86::Register::ST7) return detail::memory_fault(ctx, detail::memory_address(ctx));
   const auto src_idx = x87_st_index(src);
-  if (ctx.state.x87_is_empty(0) || ctx.state.x87_is_empty(src_idx)) return x87_stack_underflow(ctx);
+  if (ctx.state.x87_is_empty(0) || ctx.state.x87_is_empty(src_idx)) return x87_stack_underflow_into(ctx, 0);
   ctx.state.x87_set(0, ctx.state.x87_get(src_idx));
   return {};
 }
@@ -660,11 +695,30 @@ inline ExecutionResult x87_stack_underflow(ExecutionContext& ctx) {
   return x87_exception(ctx, static_cast<std::uint16_t>(kX87ExceptionInvalid | kX87ExceptionStackFault));
 }
 
+// Same fault, but for the instructions whose destination is a stack register. A masked stack
+// underflow is not a no-op on hardware: the instruction still completes and leaves the indefinite in
+// its destination. Only the unmasked path stops before writing anything.
+inline ExecutionResult x87_stack_underflow_into(ExecutionContext& ctx, std::size_t dst_index) {
+  auto result = x87_stack_underflow(ctx);
+  if (!result.ok()) return result;
+  ctx.state.x87_set(dst_index, x87_indefinite());
+  return {};
+}
+
 inline ExecutionResult x87_stack_overflow(ExecutionContext& ctx) {
   auto sw = ctx.state.get_x87_status_word();
   sw |= static_cast<std::uint16_t>(0x0200u);
   ctx.state.set_x87_status_word(sw);
-  return x87_exception(ctx, static_cast<std::uint16_t>(kX87ExceptionInvalid | kX87ExceptionStackFault));
+  auto result = x87_exception(ctx, static_cast<std::uint16_t>(kX87ExceptionInvalid | kX87ExceptionStackFault));
+  if (!result.ok()) return result;
+  // Masked: hardware still decrements TOP and drops the indefinite into the new top. Leaving TOP
+  // where it was is not a smaller error than writing the wrong value -- every later ST(i) then
+  // resolves to a different physical register than the guest is addressing.
+  const auto top = static_cast<std::uint8_t>((ctx.state.get_x87_top() + 7) & 0x7);
+  ctx.state.set_x87_top(top);
+  ctx.state.x87_stack[top] = x87_indefinite();
+  ctx.state.x87_tags[top] = 0x0;
+  return {};
 }
 
 inline ExecutionResult x87_precision_if_changed(ExecutionContext& ctx, const X87Scalar& before, const X87Scalar& after) {
