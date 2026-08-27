@@ -1502,3 +1502,79 @@ TEST(KuberaScalar, FcomppComparesTheTopTwoStackSlots) {
   EXPECT_EQ(state.x87_status_word & (1u << 14), 0u) << "C3: the operands are not equal";
   EXPECT_NE(state.x87_status_word & (1u << 8), 0u) << "C0: ST(0) is less than ST(1)";
 }
+
+// fnstcw/fldcw is the most common x87 idiom there is -- every _controlfp, every MSVC __ftol2, every
+// rounding-mode save/restore. Real hardware ignores the reserved control-word bits rather than
+// validating them, and the architectural default 0x037F has bit 6 set, so a reserved-bit check that
+// includes bit 6 faults on the value the FPU resets to.
+TEST(KuberaScalar, FldcwAcceptsTheArchitecturalDefaultControlWord) {
+  constexpr std::uint64_t kSlot = 0x4000;
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  memory.map(kSlot, 0x1000);
+  // fnstcw [rbx]; fldcw [rbx]
+  write_bytes(memory, kBase, seven::parse_hex_bytes("D9 3B D9 2B"));
+  state.gpr[3] = kSlot;
+
+  ASSERT_EQ(state.get_x87_control_word(), 0x037Fu) << "sanity: the reset control word";
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);  // fnstcw
+  std::uint16_t stored = 0;
+  ASSERT_TRUE(memory.read(kSlot, &stored, sizeof(stored)));
+  EXPECT_EQ(stored, 0x037Fu);
+
+  EXPECT_EQ(executor.step(state, memory).reason, seven::StopReason::none)
+      << "fldcw faulted on the control word the FPU had just stored";
+  EXPECT_EQ(state.get_x87_control_word(), 0x037Fu);
+}
+
+// Same wrong constant on the restore side: the control word has to survive its own save/restore.
+TEST(KuberaScalar, FxrstorKeepsTheControlWordFxsaveWrote) {
+  constexpr std::uint64_t kSave = 0x4000;
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  memory.map(kSave, 0x1000);
+  // fxsave [rbx]; fxrstor [rbx]
+  write_bytes(memory, kBase, seven::parse_hex_bytes("0F AE 03 0F AE 0B"));
+  state.gpr[3] = kSave;
+
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);  // fxsave
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);  // fxrstor
+  EXPECT_EQ(state.get_x87_control_word(), 0x037Fu) << "the restore cleared bits the save wrote";
+}
+
+// Hardware puts ST(i) in fxsave slot i while the abridged tag word is indexed by physical register.
+// fsave/frstor already pair the two conventions correctly; fxsave/fxrstor used physical for both,
+// so any image taken with TOP != 0 had its registers in the wrong slots. Only observable from
+// outside the round trip, which is why a save/restore pair alone never caught it.
+TEST(KuberaScalar, FxsaveWritesTheStackTopRelative) {
+  constexpr std::uint64_t kSave = 0x4000;
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  memory.map(kSave, 0x1000);
+  // fld1; fxsave [rbx]
+  write_bytes(memory, kBase, seven::parse_hex_bytes("D9 E8 0F AE 03"));
+  state.gpr[3] = kSave;
+
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);  // fld1
+  ASSERT_EQ(state.get_x87_top(), 7u) << "sanity: fld1 leaves TOP at 7";
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);  // fxsave
+
+  // 1.0 as an 80-bit extended: significand 0x8000000000000000, exponent 0x3FFF.
+  const auto expected = seven::parse_hex_bytes("00 00 00 00 00 00 00 80 FF 3F");
+  std::array<std::uint8_t, 10> slot0{};
+  ASSERT_TRUE(memory.read(kSave + 32, slot0.data(), slot0.size()));
+  EXPECT_TRUE(std::equal(expected.begin(), expected.end(), slot0.begin()))
+      << "slot 0 must hold ST(0), not physical register 0";
+}

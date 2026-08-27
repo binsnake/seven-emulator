@@ -320,8 +320,11 @@ ExecutionResult fxsave(ExecutionContext& ctx, bool /*is64*/) {
   const std::uint32_t mxcsr_mask = 0xFFFFu;
   if (!ctx.memory.write(base + 28, &mxcsr_mask, 4)) return detail::memory_fault(ctx, base + 28);
 
-  for (std::size_t phys = 0; phys < 8; ++phys) {
-    if (const auto r = write_fxsave_st(ctx, base, phys, ctx.state.x87_stack[phys]); !r.ok()) return r;
+  // Slot i holds ST(i). The tag word written above is indexed by physical register instead, which is
+  // the pairing fsave/frstor already use; doing both by physical index put every register in the
+  // wrong slot whenever TOP was not 0, and only showed up outside a save/restore round trip.
+  for (std::size_t i = 0; i < 8; ++i) {
+    if (const auto r = write_fxsave_st(ctx, base, i, ctx.state.x87_get(i)); !r.ok()) return r;
   }
   for (std::size_t i = 0; i < 16; ++i) {
     const auto value = ctx.state.vectors[i].value;
@@ -354,15 +357,19 @@ ExecutionResult fxrstor(ExecutionContext& ctx, bool /*is64*/) {
   if (!ctx.memory.read(base + 2, &fsw, 2)) return detail::memory_fault(ctx, base + 2);
   if (!ctx.memory.read(base + 4, &ftw, 1)) return detail::memory_fault(ctx, base + 4);
   if (!ctx.memory.read(base + 24, &mxcsr, 4)) return detail::memory_fault(ctx, base + 24);
-  fcw &= static_cast<std::uint16_t>(~0xE0C0u);
+  // Loaded as-is, same as FLDENV and FLDCW: clearing the reserved bits here meant the control word
+  // did not survive its own fxsave/fxrstor.
   mxcsr &= 0x0000FFFFu;
   ctx.state.set_x87_control_word(fcw);
   ctx.state.set_x87_status_word(fsw);
   ctx.state.mxcsr = mxcsr;
-  for (std::size_t phys = 0; phys < 8; ++phys) {
+  // Slot i is ST(i), the tag bits are physical -- see fxsave. The status word above carried TOP, so
+  // x87_phys_index resolves against the image's own top rather than the one we started with.
+  for (std::size_t i = 0; i < 8; ++i) {
+    const auto phys = ctx.state.x87_phys_index(i);
     if ((ftw >> phys) & 1u) {
       X87Scalar loaded{};
-      if (const auto r = read_fxsave_st(ctx, base, phys, loaded); !r.ok()) return r;
+      if (const auto r = read_fxsave_st(ctx, base, i, loaded); !r.ok()) return r;
       ctx.state.x87_stack[phys] = loaded;
       ctx.state.x87_tags[phys] = (loaded == 0) ? 0x1 : 0x0;
     } else {
@@ -690,9 +697,9 @@ ExecutionResult handle_code_FLDCW_M2BYTE(ExecutionContext& ctx) {
   if (!detail::read_operand_checked(ctx, 0, 2, value).ok()) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
-  if ((value & 0xE0C0u) != 0) {
-    return detail::memory_fault(ctx, detail::memory_address(ctx));
-  }
+  // No reserved-bit check, for the reason FLDENV's load already gives: hardware ignores those bits
+  // rather than faulting on them, and 0x037F -- the value the FPU resets to, so the one every
+  // fnstcw/fldcw pair round-trips -- has bit 6 set and was being rejected.
   ctx.state.set_x87_control_word(value);
   return {};
 }

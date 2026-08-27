@@ -968,3 +968,25 @@ TEST(KuberaMemory, AnInstructionRunningOffTheTopOfTheAddressSpaceFaultsThere) {
   ASSERT_TRUE(result.exception.has_value());
   EXPECT_EQ(result.exception->address, state.rip) << "the fault wrapped around to page zero";
 }
+
+// A store that faults partway must leave nothing behind. This is the property a guard page depends
+// on: a writable page abutting an unmapped one is the ordinary layout, and hardware checks the whole
+// footprint before it commits any of it.
+TEST(KuberaMemory, AWriteStraddlingOntoAnUnwritablePageCommitsNothing) {
+  const std::array<std::uint8_t, 8> value = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88};
+  const auto first_page_after = [&](bool map_second_read_only) {
+    seven::Memory memory{};
+    memory.map(0x1000, 0x1000, seven::kMemoryPermissionReadWrite);
+    if (map_second_read_only) {
+      memory.map(0x2000, 0x1000, static_cast<seven::MemoryPermissionMask>(seven::MemoryPermission::read));
+    }
+    EXPECT_FALSE(memory.write(0x1FFC, value.data(), value.size()));
+    std::array<std::uint8_t, 4> tail{};
+    EXPECT_TRUE(memory.read(0x1FFC, tail.data(), tail.size()));
+    return tail;
+  };
+
+  const std::array<std::uint8_t, 4> untouched = {0, 0, 0, 0};
+  EXPECT_EQ(first_page_after(true), untouched) << "bytes landed on the first page before the fault";
+  EXPECT_EQ(first_page_after(false), untouched) << "same, with the second page not mapped at all";
+}

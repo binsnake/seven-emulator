@@ -264,6 +264,11 @@ class Memory {
   void invalidate_all_code_epochs() noexcept;
   [[nodiscard]] const MmioRegion* find_mmio_region(std::uint64_t address, std::size_t size) const;
   [[nodiscard]] bool has_permission(MemoryPermissionMask permissions, MemoryAccessKind kind) const;
+  // Whether every page under [address, size) permits `kind`, by exactly the test the copy loops use.
+  // A multi-page access has to answer this before it moves any bytes: a store that commits the first
+  // page and then faults on the second is not what hardware does, and a guard page beside a writable
+  // one is the ordinary layout rather than a corner case.
+  [[nodiscard]] bool span_permits(std::uint64_t address, std::size_t size, MemoryAccessKind kind) const;
   [[nodiscard]] bool access_allowed(const MemoryAccessEvent& event) const;
 
   // Direct-mapped page lookup cache. The std::unordered_map remains the source

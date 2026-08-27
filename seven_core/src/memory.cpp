@@ -229,6 +229,21 @@ bool Memory::is_mapped(std::uint64_t address, std::size_t size) const {
   return true;
 }
 
+bool Memory::span_permits(std::uint64_t address, std::size_t size, MemoryAccessKind kind) const {
+  std::size_t remaining = size;
+  std::uint64_t current = address;
+  while (remaining != 0) {
+    const auto* entry = lookup_page(current / kPageSize);
+    if (entry == nullptr || !has_permission(entry->permissions, kind)) {
+      return false;
+    }
+    const auto chunk = std::min<std::size_t>(remaining, kPageSize - (current % kPageSize));
+    current += chunk;
+    remaining -= chunk;
+  }
+  return true;
+}
+
 bool Memory::has_permissions(std::uint64_t address, std::size_t size, MemoryPermissionMask required) const {
   if (access_wraps(address, size)) {
     return false;
@@ -329,7 +344,9 @@ bool Memory::read(std::uint64_t address, void* dst, std::size_t size, MemoryAcce
 
   auto* out = static_cast<std::byte*>(dst);
   if (!has_any_access_hooks_) {
-    return copy_from_pages(out);
+    // Checked up front so a refusal partway leaves dst untouched, which is what the hooked path
+    // below already gets for free by staging through temp.
+    return span_permits(address, size, kind) && copy_from_pages(out);
   }
 
   constexpr std::size_t kInlineReadBufferSize = 64;
@@ -479,6 +496,10 @@ bool Memory::write(std::uint64_t address, const void* src, std::size_t size, Mem
     return on_write(address - region_base, src, size);
   }
 
+  // Every page first, then any bytes: see span_permits.
+  if (!span_permits(address, size, kind)) {
+    return false;
+  }
   const auto* in = static_cast<const std::byte*>(src);
   std::size_t remaining = size;
   std::uint64_t current = address;
