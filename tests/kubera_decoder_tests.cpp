@@ -97,3 +97,32 @@ TEST(KuberaDecoder, TheMemoryFormsOfMovlpsAndMovhpsGetTheirOwnCode) {
   EXPECT_EQ(decode("0F 12 D1").code(), iced_x86::Code::MOVHLPS_XMM_XMM);
   EXPECT_EQ(decode("0F 16 D1").code(), iced_x86::Code::MOVLHPS_XMM_XMM);
 }
+
+// PUSH/POP FS and GS, ENTER, and the descriptor-table stores all default to a 64-bit operand size
+// in long mode -- there is no 32-bit encoding for them there, only 16 via a 66 prefix. The handlers
+// indexed their code array by state().operand_size, which reflects prefixes alone and reads "32"
+// when there are none, so every unprefixed encoding picked the 32-bit form. That is not cosmetic:
+// the emulator takes the number of bytes it pushes straight from the Code.
+TEST(KuberaDecoder, DefaultSixtyFourBitOperandsPickTheSixtyFourBitCode) {
+  struct Case { const char* name; const char* bytes; iced_x86::Code expected; };
+  const Case cases[] = {
+      {"push fs", "0F A0", iced_x86::Code::PUSHQ_FS},
+      {"pop fs", "0F A1", iced_x86::Code::POPQ_FS},
+      {"push gs", "0F A8", iced_x86::Code::PUSHQ_GS},
+      {"pop gs", "0F A9", iced_x86::Code::POPQ_GS},
+      {"enter", "C8 11 22 33", iced_x86::Code::ENTERQ_IMM16_IMM8},
+      {"sgdt", "0F 01 00", iced_x86::Code::SGDT_M1664},
+      {"sidt", "0F 01 08", iced_x86::Code::SIDT_M1664},
+      {"lgdt", "0F 01 10", iced_x86::Code::LGDT_M1664},
+      {"lidt", "0F 01 18", iced_x86::Code::LIDT_M1664},
+      // A 66 prefix is the only way to ask for the narrow form, and it must still work.
+      {"push fs, opsize 16", "66 0F A0", iced_x86::Code::PUSHW_FS},
+      {"enter, opsize 16", "66 C8 11 22 33", iced_x86::Code::ENTERW_IMM16_IMM8},
+      // iced gives the descriptor-table stores a separate Code for a 16-bit operand size rather
+      // than reusing the 32-bit one, so this is SGDT_M1632_16 and not SGDT_M1632.
+      {"sgdt, opsize 16", "66 0F 01 00", iced_x86::Code::SGDT_M1632_16},
+  };
+  for (const auto& c : cases) {
+    EXPECT_EQ(decode(c.bytes).code(), c.expected) << c.name << " (" << c.bytes << ")";
+  }
+}
