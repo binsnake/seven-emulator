@@ -44,7 +44,7 @@ namespace {
 
 constexpr bool kEnableAvx = SEVEN_ENABLE_AVX != 0;
 constexpr bool kEnableAvx512 = SEVEN_ENABLE_AVX512 != 0;
-constexpr std::size_t kMaxFaultRetries = 8;
+constexpr std::size_t kMaxFaultRetries = Executor::kMaxFaultRetries;
 
 constexpr std::size_t kVectorRegisterCount = 32;
 constexpr std::size_t kXmmWidth = 16;
@@ -1240,6 +1240,27 @@ TrapHookResult Executor::run_trap_hooks(TrapHookContext& ctx) {
     }
   }
   return {};
+}
+
+bool Executor::report_external_fault(CpuState& state, Memory& memory, const ExecutionResult& fault,
+                                     std::uint64_t fault_address) {
+  const auto action = run_fault_hooks(FaultHookEvent{state, memory, fault, state.rip, fault_address});
+  if (action != FaultHookAction::stop) {
+    // Both surviving actions mean "attempt this instruction again". step_impl's restart also rewinds
+    // rip, which is already where it needs to be here.
+    state.gpr[4] = mask_stack_pointer(state, state.gpr[4]);
+    return true;
+  }
+  if (fault.reason != StopReason::none && fault.reason != StopReason::halted &&
+      fault.reason != StopReason::execution_limit && fault.reason != StopReason::stop_requested) {
+    has_violation_ = true;
+    violation_reason_ = fault.reason;
+    violation_ip_ = state.rip;
+    violation_address_ = fault_address;
+  }
+  ++stop_reason_counts_[stop_reason_to_index(fault.reason)];
+  notify_stop_hooks(state, memory, fault, state.rip);
+  return false;
 }
 
 FaultHookAction Executor::run_fault_hooks(const FaultHookEvent& event) {

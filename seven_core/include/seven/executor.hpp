@@ -55,6 +55,14 @@ class Executor {
   [[nodiscard]] HookId add_stop_hook(StopHook hook);
   [[nodiscard]] HookId add_fault_hook(FaultHook hook);
   [[nodiscard]] HookId add_trap_hook(TrapKind kind, TrapHook hook);
+  // How many times step() will let a fault hook ask for the same instruction again before giving up.
+  static constexpr std::size_t kMaxFaultRetries = 8;
+  // The fault path step() runs, for an execution engine (see seven_jit) that raised the fault in its
+  // own generated code instead of going through step(). state.rip must already point at the faulting
+  // instruction. Returns true if a fault hook wants that instruction attempted again; otherwise it
+  // has recorded the violation and notified the stop hooks, and the caller should report the fault.
+  [[nodiscard]] bool report_external_fault(CpuState& state, Memory& memory, const ExecutionResult& fault,
+                                           std::uint64_t fault_address);
   [[nodiscard]] bool remove_hook(HookId id);
   void clear_hooks();
   [[nodiscard]] std::size_t supported_code_count() const noexcept;
