@@ -18,6 +18,13 @@ namespace {
 
 using namespace kubera::test;
 
+// CMake ships three SIMD profiles and Executor::simd_profile_allows refuses any encoding or vector
+// width the configured one turned off. A test written around EVEX or a 256-bit operand has a
+// different correct answer in each, so the ones that cannot hold everywhere say so rather than
+// failing two of the three builds we ship.
+constexpr bool kProfileHasAvx512 = SEVEN_ENABLE_AVX512 != 0;
+constexpr std::size_t kProfileVectorBytes = SEVEN_MAX_VECTOR_BYTES;
+
 TEST(KuberaSimd, VpAndUsesExplicitSources) {
   std::vector<std::uint8_t> bytes;
   const auto instr = iced_x86::InstructionFactory::with3(
@@ -310,7 +317,12 @@ TEST(KuberaSimd, LegacyMovupsAllowsMisalignedMemoryOperand) {
   EXPECT_EQ(result.reason, seven::StopReason::none);
 }
 
-TEST(KuberaSimd, VexVmovapsAllowsMisalignedMemoryOperand) {
+// "The VEX form never requires alignment" is true of exception classes 2 and 4 -- ADDPS, PAND and
+// the rest of the arithmetic families -- but not of class 1, which is where the explicitly-aligned
+// moves live. VMOVAPS keeps the requirement in every encoding, scaled to the operand width, which
+// is the whole reason a compiler still picks VMOVUPS when it cannot prove alignment even though
+// the two have run at the same speed since Sandy Bridge.
+TEST(KuberaSimd, VexVmovapsFaultsOnMisalignedMemoryOperand) {
   std::vector<std::uint8_t> bytes;
   const auto mem = iced_x86::MemoryOperand::with_base_displ(iced_x86::Register::RAX, 0);
   const auto instr = iced_x86::InstructionFactory::with2(iced_x86::Code::VEX_VMOVAPS_XMM_XMMM128, iced_x86::Register::XMM0, mem);
@@ -327,10 +339,10 @@ TEST(KuberaSimd, VexVmovapsAllowsMisalignedMemoryOperand) {
   memory.map(0x8000, 0x1000);
   std::vector<std::uint8_t> src(16, 0xFF);
   ASSERT_TRUE(memory.write(0x8000, src.data(), src.size()));
-  set_reg(state, iced_x86::Register::RAX, 0x8004);  // VEX form never requires alignment, "Aligned" name notwithstanding
+  set_reg(state, iced_x86::Register::RAX, 0x8004);
 
   const auto result = executor.step(state, memory);
-  EXPECT_EQ(result.reason, seven::StopReason::none);
+  EXPECT_EQ(result.reason, seven::StopReason::general_protection);
 }
 
 TEST(KuberaSimd, LegacyMovntpsFaultsOnMisalignedMemoryOperand) {
@@ -382,6 +394,7 @@ TEST(KuberaSimd, VexVshufpsSelectsCorrectLanesFromBothSources) {
 }
 
 TEST(KuberaSimd, VexVpslldYmmShiftsBothLanesByXmmSourcedCount) {
+  if (kProfileVectorBytes < 32) GTEST_SKIP() << "256-bit operands are off in this SIMD profile";
   // Regression for the same class of gap, plus the operand-width mismatch that made it: the real
   // Code enum's count operand is XMM-width (VEX_VPSLLD_YMM_YMM_XMMM128), not YMM-width as the
   // handler's original (wrong) name implied -- the SDM specifies the variable shift count for
@@ -436,9 +449,44 @@ TEST(KuberaSimd, Sse42Crc32MatchesCastagnoliReference) {
              });
 }
 
+// run_single asserts the step succeeded, so a refusal needs its own runner.
+[[nodiscard]] seven::StopReason run_for_stop_reason(std::span<const std::uint8_t> bytes) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.rflags = 0x202;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, bytes);
+  return executor.step(state, memory).reason;
+}
+
 }  // namespace
 
+// The gate itself, asserted from whichever side the build we are in happens to be on. This is the
+// only test of simd_profile_allows that means something in all three profiles, and the only one
+// that would have caught the gate being dead code back when the encoding lookup always answered
+// LEGACY.
+TEST(KuberaSimd, TheProfileGateRefusesExactlyTheEncodingsTheBuildDisabled) {
+  const auto evex_zmm = seven::parse_hex_bytes("62 F1 75 48 FE C2");  // vpaddd zmm0, zmm1, zmm2
+  const auto vex_ymm = seven::parse_hex_bytes("C5 F5 DB C2");         // vpand ymm0, ymm1, ymm2
+  const auto vex_xmm = seven::parse_hex_bytes("C5 F1 DB C2");         // vpand xmm0, xmm1, xmm2
+
+  const auto expected = [](bool allowed) {
+    return allowed ? seven::StopReason::none : seven::StopReason::unsupported_instruction;
+  };
+
+  EXPECT_EQ(run_for_stop_reason(evex_zmm), expected(kProfileHasAvx512))
+      << "EVEX follows SEVEN_ENABLE_AVX512";
+  EXPECT_EQ(run_for_stop_reason(vex_ymm), expected(kProfileVectorBytes >= 32))
+      << "a 256-bit operand follows SEVEN_MAX_VECTOR_BYTES";
+  EXPECT_EQ(run_for_stop_reason(vex_xmm), seven::StopReason::none)
+      << "128-bit VEX is in every profile we ship";
+}
+
 TEST(KuberaSimd, EvexBroadcastRepeatsTheElementNotTheWholeOperand) {
+  if (!kProfileHasAvx512) GTEST_SKIP() << "EVEX is off in this SIMD profile";
   constexpr std::uint64_t kData = 0x4000;
 
   // 62 F1 75 58 FE 07 -- vpaddd zmm0, zmm1, dword ptr [rdi]{1to16}. The broadcast element is the
@@ -619,6 +667,7 @@ TEST(KuberaSimd, AnEvexMoveWithAMaskRegisterStopsInsteadOfIgnoringIt) {
 }
 
 TEST(KuberaSimd, TheSameEvexMoveWithNoMaskStillWorks) {
+  if (!kProfileHasAvx512) GTEST_SKIP() << "EVEX is off in this SIMD profile";
   seven::Executor executor{};
   seven::CpuState state{};
   seven::Memory memory{};
@@ -738,4 +787,149 @@ TEST(KuberaSimd, VmovlhpsStillMovesTheLowHalvesUp) {
   ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
   EXPECT_EQ(xmm_u64(state, 1, 0), 0x4444'4444'4444'4444ull);
   EXPECT_EQ(xmm_u64(state, 1, 1), 0x4444'4444'4444'4444ull);
+}
+
+// vex_pack refuses a mask it cannot honour; vex_unpack, sitting right next to it in the same file
+// and backing the twelve reachable EVEX VPUNPCK codes, did not. `vpunpcklbw xmm0{k1}, xmm1, xmm2`
+// wrote all sixteen lanes whatever k1 held, which is a wrong register rather than a missing feature.
+TEST(KuberaSimd, AnEvexUnpackWithAMaskRegisterStopsInsteadOfIgnoringIt) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  // vpunpcklbw xmm0{k1}, xmm1, xmm2
+  write_bytes(memory, kBase, seven::parse_hex_bytes("62 F1 75 09 60 C2"));
+
+  state.opmask[1] = 0x1;  // only lane 0 active
+  set_xmm_u64(state, 0, 0, 0);
+  set_xmm_u64(state, 1, 0x0706050403020100ull, 0);
+  set_xmm_u64(state, 2, 0x1716151413121110ull, 0);
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::unsupported_instruction);
+  EXPECT_EQ(state.vectors[0].value, seven::SimdUint(0))
+      << "the destination must not have been written at all";
+}
+
+TEST(KuberaSimd, TheSameEvexUnpackWithNoMaskStillWorks) {
+  if (!kProfileHasAvx512) GTEST_SKIP() << "EVEX is off in this SIMD profile";
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  memory.map(kBase, 0x1000);
+  // vpunpcklbw xmm0, xmm1, xmm2 -- same instruction, no mask register named
+  write_bytes(memory, kBase, seven::parse_hex_bytes("62 F1 75 08 60 C2"));
+
+  set_xmm_u64(state, 0, 0, 0);
+  set_xmm_u64(state, 1, 0x0706050403020100ull, 0);
+  set_xmm_u64(state, 2, 0x1716151413121110ull, 0);
+
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+  EXPECT_EQ(xmm_u64(state, 0, 0), 0x1303120211011000ull);
+  EXPECT_EQ(xmm_u64(state, 0, 1), 0x1707160615051404ull);
+}
+
+// The legacy-SSE 16-byte rule reached the arithmetic, logic, shift, pack and shuffle families but
+// stopped short of three more legacy m128 forms: CMPPD, the packed double-to-integer converts, and
+// the PCMPxSTRx string compares. All three are exception class 2 or 4, so real hardware raises
+// #GP(0) on a misaligned memory operand exactly like ADDPS does.
+TEST(KuberaSimd, PackedCompareRequiresAnAlignedMemoryOperand) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.rflags = 0x202;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("66 0F C2 00 00"));  // cmppd xmm0, [rax], 0
+  memory.map(0x8000, 0x1000);
+  set_reg(state, iced_x86::Register::RAX, 0x8004);
+
+  EXPECT_EQ(executor.step(state, memory).reason, seven::StopReason::general_protection);
+}
+
+TEST(KuberaSimd, PackedDoubleToIntConvertRequiresAnAlignedMemoryOperand) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.rflags = 0x202;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("F2 0F E6 00"));  // cvtpd2dq xmm0, [rax]
+  memory.map(0x8000, 0x1000);
+  set_reg(state, iced_x86::Register::RAX, 0x8008);
+
+  EXPECT_EQ(executor.step(state, memory).reason, seven::StopReason::general_protection);
+}
+
+TEST(KuberaSimd, PcmpistriRequiresAnAlignedMemoryOperand) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.rflags = 0x202;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("66 0F 3A 63 00 00"));  // pcmpistri xmm0, [rax], 0
+  memory.map(0x8000, 0x1000);
+  set_reg(state, iced_x86::Register::RAX, 0x8001);
+
+  EXPECT_EQ(executor.step(state, memory).reason, seven::StopReason::general_protection);
+}
+
+// The unaligned twin at the neighbouring opcode must stay unaligned-safe.
+TEST(KuberaSimd, VexMovupsAcceptsAMisalignedMemoryOperand) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.rflags = 0x202;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("C5 F8 10 00"));  // vmovups xmm0, [rax]
+  memory.map(0x8000, 0x1000);
+  const std::uint64_t loaded = 0xDEAD'BEEF'CAFE'BABEull;
+  ASSERT_TRUE(memory.write(0x8004, &loaded, sizeof(loaded)));
+  set_reg(state, iced_x86::Register::RAX, 0x8004);
+
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+  EXPECT_EQ(xmm_u64(state, 0, 0), loaded);
+}
+
+// The required alignment is the operand width, not a flat 16 bytes, so a 32-byte-aligned address
+// still faults at zmm width.
+TEST(KuberaSimd, EvexMovapdRequiresTheFullVectorWidthOfAlignment) {
+  if (!kProfileHasAvx512) GTEST_SKIP() << "EVEX is off in this SIMD profile";
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.rflags = 0x202;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("62 F1 FD 48 28 00"));  // vmovapd zmm0, [rax]
+  memory.map(0x8000, 0x1000);
+  set_reg(state, iced_x86::Register::RAX, 0x8020);
+
+  EXPECT_EQ(executor.step(state, memory).reason, seven::StopReason::general_protection);
+}
+
+TEST(KuberaSimd, VexNonTemporalStoreRequiresAnAlignedMemoryOperand) {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.rflags = 0x202;
+  memory.map(kBase, 0x1000);
+  write_bytes(memory, kBase, seven::parse_hex_bytes("C5 F9 E7 00"));  // vmovntdq [rax], xmm0
+  memory.map(0x8000, 0x1000);
+  set_reg(state, iced_x86::Register::RAX, 0x8008);
+
+  EXPECT_EQ(executor.step(state, memory).reason, seven::StopReason::general_protection);
 }

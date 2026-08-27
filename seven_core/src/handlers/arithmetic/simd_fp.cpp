@@ -236,8 +236,13 @@ ExecutionResult packed_binary(ExecutionContext& ctx, Fn&& fn, bool zero_upper = 
   return {};
 }
 
+// Nothing in this file implements writemasking, and the EVEX handlers at the bottom share these VEX
+// helpers, so a named mask register has to stop the instruction rather than be ignored. None of
+// those EVEX codes is in handled_codes.def today, so this changes nothing until one is added --
+// which is exactly when a silently wrong destination register would be hardest to spot.
 template <typename T, typename Fn>
 ExecutionResult vex_packed_binary(ExecutionContext& ctx, Fn&& fn, bool zero_upper = true) {
+  if (detail::has_active_opmask(ctx.instr)) return detail::unsupported_opmask(ctx);
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
@@ -293,6 +298,7 @@ ExecutionResult scalar_binary(ExecutionContext& ctx, Fn&& fn, bool zero_upper = 
 
 template <typename T, typename Fn>
 ExecutionResult vex_scalar_binary(ExecutionContext& ctx, Fn&& fn, bool zero_upper = true) {
+  if (detail::has_active_opmask(ctx.instr)) return detail::unsupported_opmask(ctx);
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
@@ -345,6 +351,7 @@ ExecutionResult packed_unary(ExecutionContext& ctx, Fn&& fn, bool zero_upper = f
 
 template <typename T, typename Fn>
 ExecutionResult vex_packed_unary(ExecutionContext& ctx, Fn&& fn, bool zero_upper = true) {
+  if (detail::has_active_opmask(ctx.instr)) return detail::unsupported_opmask(ctx);
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
@@ -391,6 +398,7 @@ ExecutionResult scalar_unary(ExecutionContext& ctx, Fn&& fn, bool zero_upper = f
 
 template <typename T, typename Fn>
 ExecutionResult vex_scalar_unary(ExecutionContext& ctx, Fn&& fn, bool zero_upper = true) {
+  if (detail::has_active_opmask(ctx.instr)) return detail::unsupported_opmask(ctx);
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
@@ -417,6 +425,7 @@ ExecutionResult vex_scalar_unary(ExecutionContext& ctx, Fn&& fn, bool zero_upper
 // ORPD/XORPS/XORPD forms (rhs_index=1, DO require it) and the VEX forms (rhs_index=2, never do).
 ExecutionResult packed_logic(ExecutionContext& ctx, std::uint32_t lhs_index, std::uint32_t rhs_index, std::uint8_t op, bool zero_upper = false,
                              std::uint64_t alignment_mask = 0) {
+  if (detail::has_active_opmask(ctx.instr)) return detail::unsupported_opmask(ctx);
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
@@ -659,6 +668,8 @@ ExecutionResult packed_compare_mask(ExecutionContext& ctx) {
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
+  // Same legacy m128 alignment requirement as packed_binary above.
+  if (auto fault = detail::require_aligned_memory_operand(ctx, 1, 0xFULL)) return *fault;
   bool ok = false;
   const auto dst_reg = ctx.instr.op_register(0);
   const auto lhs_bits = read_vec(ctx.state, dst_reg);
@@ -877,6 +888,9 @@ ExecutionResult handle_code_CVTPD2PS_XMM_XMMM128(ExecutionContext& ctx) {
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
+  // Same legacy m128 alignment requirement as packed_binary above. The m64-source converts either
+  // side of this one (CVTPS2PD, CVTDQ2PD) genuinely have none.
+  if (auto fault = detail::require_aligned_memory_operand(ctx, 1, 0xFULL)) return *fault;
   bool ok = false;
   const auto dst_reg = ctx.instr.op_register(0);
   const auto src_bits = read_operand(ctx, 1, 16, &ok);
@@ -918,6 +932,7 @@ ExecutionResult handle_code_CVTPD2DQ_XMM_XMMM128(ExecutionContext& ctx) {
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
+  if (auto fault = detail::require_aligned_memory_operand(ctx, 1, 0xFULL)) return *fault;
   bool ok = false;
   const auto dst_reg = ctx.instr.op_register(0);
   const auto src_bits = read_operand(ctx, 1, 16, &ok);
@@ -942,6 +957,7 @@ ExecutionResult handle_code_CVTTPD2DQ_XMM_XMMM128(ExecutionContext& ctx) {
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
+  if (auto fault = detail::require_aligned_memory_operand(ctx, 1, 0xFULL)) return *fault;
   bool ok = false;
   const auto dst_reg = ctx.instr.op_register(0);
   const auto src_bits = read_operand(ctx, 1, 16, &ok);
@@ -1161,6 +1177,7 @@ ExecutionResult handle_code_CVTPI2PD_XMM_MMM64(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_CVTPD2PI_MM_XMMM128(ExecutionContext& ctx) {
+  if (auto fault = detail::require_aligned_memory_operand(ctx, 1, 0xFULL)) return *fault;
   bool ok = false;
   const auto src_bits = read_operand(ctx, 1, 16, &ok);
   if (!ok) return detail::memory_fault(ctx, detail::memory_address(ctx));
@@ -1184,6 +1201,7 @@ ExecutionResult handle_code_CVTPD2PI_MM_XMMM128(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_CVTTPD2PI_MM_XMMM128(ExecutionContext& ctx) {
+  if (auto fault = detail::require_aligned_memory_operand(ctx, 1, 0xFULL)) return *fault;
   bool ok = false;
   const auto src_bits = read_operand(ctx, 1, 16, &ok);
   if (!ok) return detail::memory_fault(ctx, detail::memory_address(ctx));

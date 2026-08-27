@@ -151,8 +151,13 @@ ExecutionResult legacy_binary_lanewise(ExecutionContext& ctx, std::size_t lane_b
   return {};
 }
 
+// Nothing in this file implements writemasking, and the EVEX handlers below share these VEX
+// helpers, so a named mask register has to stop the instruction rather than be ignored. None of
+// those EVEX codes is in handled_codes.def today, so this changes nothing until one is added --
+// which is exactly when a silently wrong destination register would be hardest to spot.
 template <typename T, std::size_t N, typename Fn>
 ExecutionResult vex_binary_lanewise(ExecutionContext& ctx, std::size_t lane_bytes, Fn&& fn, bool zero_upper = true) {
+  if (detail::has_active_opmask(ctx.instr)) return detail::unsupported_opmask(ctx);
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
@@ -201,6 +206,7 @@ ExecutionResult legacy_unary_lanewise(ExecutionContext& ctx, std::size_t lane_by
 
 template <typename T, std::size_t N, typename Fn>
 ExecutionResult vex_unary_lanewise(ExecutionContext& ctx, std::size_t lane_bytes, Fn&& fn, bool zero_upper = true) {
+  if (detail::has_active_opmask(ctx.instr)) return detail::unsupported_opmask(ctx);
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
@@ -219,6 +225,7 @@ ExecutionResult vex_unary_lanewise(ExecutionContext& ctx, std::size_t lane_bytes
 }
 
 ExecutionResult duplicate_low_double(ExecutionContext& ctx, bool zero_upper = false) {
+  if (detail::has_active_opmask(ctx.instr)) return detail::unsupported_opmask(ctx);
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }

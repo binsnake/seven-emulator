@@ -667,6 +667,9 @@ ExecutionResult pcmpstr(ExecutionContext& ctx, bool explicit_lengths, bool retur
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
+  // Legacy (non-VEX) form: real hardware requires the m128 source aligned to 16 bytes, #GP(0)
+  // otherwise -- see require_aligned_memory_operand's own doc comment.
+  if (auto fault = detail::require_aligned_memory_operand(ctx, 1, 0xFULL)) return *fault;
   const auto imm = static_cast<unsigned>(ctx.instr.immediate8());
   const auto elem_width = pcmp_element_width(imm);
   const auto elem_count = pcmp_element_count(imm);
