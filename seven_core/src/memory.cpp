@@ -325,7 +325,12 @@ bool Memory::read(std::uint64_t address, void* dst, std::size_t size, MemoryAcce
   // Not contained in one region, but still touching one: the bytes are partly the device's, and
   // falling through would serve all of them out of whatever page sits underneath it without the
   // device ever being asked. Refuse rather than answer on its behalf.
-  if (mmio_overlaps(address, size)) {
+  //
+  // A fetch is the exception, and deliberately so: it asks for a fixed 15 bytes regardless of how
+  // long the instruction actually is, so its window reaching a device says nothing about whether the
+  // instruction does. Refusing here would fault every fetch within 15 bytes of a device edge. A
+  // fetch landing inside a region is still served by it, since that is a contained access.
+  if (kind != MemoryAccessKind::instruction_fetch && mmio_overlaps(address, size)) {
     return false;
   }
 
