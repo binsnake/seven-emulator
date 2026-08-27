@@ -1,5 +1,6 @@
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -390,4 +391,112 @@ TEST(KuberaLiveness, AFaultCapableInstructionKeepsItsOwnFlagWrite) {
 
   EXPECT_EQ(liveness[0].dead_flags_mask, 0u)
       << "a store that can fault must keep the flag write the fault would expose";
+}
+
+// A fault is not the only way execution leaves a lifted span early: an instruction seven has no
+// handler for stops the run with unsupported_instruction, and the lift's boundary test does not
+// look at handler coverage at all, so an unhandled opcode really does sit in the middle of a span.
+// What keeps that sound is FlagsInfo's default of read=all-flags: a code with no table entry is
+// treated as reading everything, which pins `live` and blocks any cover across it. That is the
+// property under test, and it is easy to lose -- adding a table entry for a code that has no
+// handler would silently undo it, which is what KeepsEveryFlagsTableEntryExecutable guards.
+// RDRAND stands in for the decodable codes absent from handled_codes.def: register only (so
+// can_fault() is false), no trap kind, and not control flow.
+TEST(KuberaLiveness, MaskedWriteSurvivesAnUnsupportedInstructionMidBlock) {
+  seven::CpuState state{};
+  seven::Memory memory{};
+  seven::Executor executor{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.gpr[4] = kStackTop;
+  state.rflags = 0x202;
+  memory.map(0x4000, 0x2000);
+  // add eax, ebx ; rdrand eax ; cmp eax, ebx
+  write_bytes(memory, kBase, {0x01, 0xD8, 0x0F, 0xC7, 0xF0, 0x39, 0xD8});
+  state.gpr[0] = 5ull;
+  state.gpr[3] = 0xFFFFFFFBull;
+
+  const auto result = executor.run(state, memory, 64);
+  ASSERT_EQ(result.reason, seven::StopReason::unsupported_instruction);
+  EXPECT_EQ(state.rip, kBase + 2);
+  EXPECT_EQ(state.gpr[0], 0u);
+  EXPECT_NE(state.rflags & seven::kFlagZF, 0u)
+      << "the add's flag write was masked as covered by a cmp the run never reached";
+  EXPECT_NE(state.rflags & seven::kFlagCF, 0u);
+}
+
+
+// The invariant the test above leans on, checked directly rather than assumed.
+//
+// An instruction is only allowed to "cover" an earlier flag write if it is guaranteed to run. The
+// flags table decides who can cover; handled_codes.def decides who can run. Nothing ties the two
+// together, so a table entry for a code with no handler would produce an instruction that liveness
+// treats as an unconditional all-flags writer and that never executes at all -- every flag write in
+// front of it dropped, and the run stopping right there with the caller reading the stale values.
+//
+// dead_flags_mask over [add eax,ebx ; C] is exactly the set liveness would drop from the preceding
+// writer, so a non-zero mask is the same thing as "C claims a cover", and stepping C says whether
+// it can actually run. No test-only accessor needed for either half.
+TEST(KuberaLiveness, KeepsEveryFlagsTableEntryExecutable) {
+  const std::vector<std::vector<std::uint8_t>> prefixes = {
+      {}, {0x0F}, {0x66}, {0x66, 0x0F}, {0xF2}, {0xF3}, {0xF3, 0x0F},
+      {0x48}, {0x48, 0x0F}, {0x4C}, {0x66, 0x48, 0x0F},
+      {0x0F, 0x38}, {0x66, 0x0F, 0x38}, {0x0F, 0x3A}, {0x66, 0x0F, 0x3A},
+      {0xC4, 0xE2, 0x78}, {0xC4, 0xE2, 0xF8},
+  };
+  const std::uint8_t probe_bytes[] = {0x01, 0xD8};  // add eax, ebx
+  iced_x86::Decoder probe_decoder(64, std::span<const std::uint8_t>(probe_bytes, sizeof(probe_bytes)), 0x1000);
+  const auto probe = probe_decoder.decode();
+  ASSERT_TRUE(probe.has_value());
+  const auto probe_instr = probe.value();
+
+  constexpr std::uint64_t kCode = 0x400000ull;
+  constexpr std::uint64_t kData = 0x500000ull;
+  seven::Executor executor{};
+  seven::Memory memory{};
+  memory.map(kCode, 0x1000);
+  memory.map(kData, 0x2000);
+
+  std::size_t claiming = 0;
+  std::vector<std::string> unrunnable;
+  for (const auto& prefix : prefixes) {
+    for (unsigned opcode = 0; opcode < 256; ++opcode) {
+      for (unsigned modrm = 0; modrm < 256; ++modrm) {
+        std::vector<std::uint8_t> bytes = prefix;
+        bytes.push_back(static_cast<std::uint8_t>(opcode));
+        bytes.push_back(static_cast<std::uint8_t>(modrm));
+        for (int i = 0; i < 6; ++i) bytes.push_back(0x11);
+        ASSERT_TRUE(memory.write_unchecked(kCode, bytes.data(), bytes.size()));
+        iced_x86::Decoder decoder(64, std::span<const std::uint8_t>(bytes.data(), bytes.size()), kCode);
+        const auto decoded = decoder.decode();
+        if (!decoded.has_value() || decoded.value().code() == iced_x86::Code::INVALID) continue;
+        const auto candidate = decoded.value();
+        seven::FlagLivenessInstr items[2] = {{&probe_instr, 0}, {&candidate, 0}};
+        seven::compute_flag_liveness(std::span<seven::FlagLivenessInstr>(items, 2));
+        if (items[0].dead_flags_mask == 0) continue;
+        ++claiming;
+
+        seven::CpuState state{};
+        state.mode = seven::ExecutionMode::long64;
+        state.rip = kCode;
+        state.rflags = 0x202;
+        state.sreg[1] = 0x08;
+        for (std::size_t i = 0; i < 16; ++i) state.gpr[i] = kData + 0x800;
+        state.gpr[4] = kData + 0x1000;
+        const auto result = executor.step(state, memory);
+        if (result.reason != seven::StopReason::unsupported_instruction) continue;
+        if (unrunnable.size() < 8) {
+          char buf[64] = {};
+          std::snprintf(buf, sizeof(buf), "code=%d", static_cast<int>(candidate.code()));
+          unrunnable.emplace_back(buf);
+        }
+      }
+    }
+  }
+
+  EXPECT_GT(claiming, 5000u) << "nothing is being proved unless the sweep reached the flags table";
+  EXPECT_TRUE(unrunnable.empty())
+      << "these claim an unconditional flag write but have no handler, so liveness would drop a "
+         "preceding write that nothing restores: "
+      << (unrunnable.empty() ? std::string{} : unrunnable[0]);
 }
