@@ -22,15 +22,6 @@ constexpr std::uint32_t kMsrSysenterCs = 0x174u;
 constexpr std::uint32_t kMsrSysenterEsp = 0x175u;
 constexpr std::uint32_t kMsrSysenterEip = 0x176u;
 
-// 4-level paging (48-bit virtual address space): bits 63:47 of a linear address must all equal bit
-// 47. Real hardware raises #GP(0) for any data reference that fails this check, BEFORE even
-// attempting a page walk -- distinct from, and checked ahead of, an ordinary #PF for an
-// unmapped-but-canonical address. Confirmed against real hardware via a standalone probe.
-[[nodiscard]] bool is_canonical_address(std::uint64_t address) noexcept {
-  constexpr int kShift = 16;  // 64 - 48
-  return (static_cast<std::int64_t>(address << kShift) >> kShift) == static_cast<std::int64_t>(address);
-}
-
 std::uint64_t read_msr_unchecked(CpuState& state, std::uint32_t index) {
   if (index == kMsrTsc) {
     return state.tsc;
@@ -259,21 +250,30 @@ ExecutionResult dispatch_interrupt(ExecutionContext& ctx, std::uint8_t vector, s
   };
 
   const auto push_width = [&](std::uint64_t value, std::size_t width) -> ExecutionResult {
-    ctx.state.gpr[4] = mask_stack_pointer(ctx.state, ctx.state.gpr[4] - width);
+    const auto slot = mask_stack_pointer(ctx.state, ctx.state.gpr[4] - width);
+    ExecutionResult result{};
     switch (width) {
       case 2: {
         const auto v = static_cast<std::uint16_t>(value);
-        return write_memory_checked(ctx, ctx.state.gpr[4], v);
+        result = write_memory_checked(ctx, slot, v);
+        break;
       }
       case 4: {
         const auto v = static_cast<std::uint32_t>(value);
-        return write_memory_checked(ctx, ctx.state.gpr[4], v);
+        result = write_memory_checked(ctx, slot, v);
+        break;
       }
       case 8:
-        return write_memory_checked(ctx, ctx.state.gpr[4], value);
+        result = write_memory_checked(ctx, slot, value);
+        break;
       default:
         return gp_fault();
     }
+    if (!result.ok()) {
+      return result;
+    }
+    ctx.state.gpr[4] = slot;
+    return {};
   };
 
   std::uint64_t target_rip = 0;
@@ -356,19 +356,32 @@ ExecutionResult dispatch_interrupt(ExecutionContext& ctx, std::uint8_t vector, s
   const auto return_width = instruction_pointer_width(ctx.state.mode);
   const auto flags_width = instruction_pointer_width(ctx.state.mode);
   const auto pushed_rflags = push_rf_in_frame ? (ctx.state.rflags | kFlagRF) : ctx.state.rflags;
-  if (auto result = push_width(pushed_rflags, flags_width); !result.ok()) {
-    return result;
-  }
-  if (auto result = push_width(ctx.state.sreg[1], 2); !result.ok()) {
-    return result;
-  }
-  if (auto result = push_width(return_rip, return_width); !result.ok()) {
-    return result;
-  }
-  if (error_code.has_value()) {
-    if (auto result = push_width(error_code.value(), flags_width); !result.ok()) {
+  // The frame either lands whole or rsp goes back where it started. A guest that points rsp at a
+  // guard page and then takes an exception used to leave the emulator half a frame in: rsp lowered
+  // by the slots that did land, the rest unwritten, and the fault returned to the embedder with no
+  // way to tell how far it got. An embedder that maps the page and restarts then builds a second
+  // frame underneath the first.
+  const auto entry_sp = ctx.state.gpr[4];
+  const auto push_frame = [&]() -> ExecutionResult {
+    if (auto result = push_width(pushed_rflags, flags_width); !result.ok()) {
       return result;
     }
+    if (auto result = push_width(ctx.state.sreg[1], 2); !result.ok()) {
+      return result;
+    }
+    if (auto result = push_width(return_rip, return_width); !result.ok()) {
+      return result;
+    }
+    if (error_code.has_value()) {
+      if (auto result = push_width(error_code.value(), flags_width); !result.ok()) {
+        return result;
+      }
+    }
+    return {};
+  };
+  if (auto result = push_frame(); !result.ok()) {
+    ctx.state.gpr[4] = entry_sp;
+    return result;
   }
 
   if (gate_type == 0x0E) {
@@ -447,24 +460,56 @@ std::size_t operand_width(const iced_x86::Instruction& instr, std::uint32_t oper
   }
 }
 
-std::uint64_t memory_address(ExecutionContext& ctx) {
-  if (ctx.instr.is_ip_rel_memory_operand()) {
-    return mask_linear_address(ctx.state, ctx.instr.ip_rel_memory_address());
+// An address-size prefix leaves the base and index registers narrower than the mode, and the
+// effective address wraps within that width before any segment base is added: [eax-0x10] with
+// eax=8 is 0xFFFFFFF8, not a sign-extended 64-bit value. iced records the size nowhere except in
+// which register family it picked, so read it back from there. Neither a base nor an index means
+// a bare displacement, which the decoder has already truncated, since nothing here could tell a
+// 32-bit address apart from a 64-bit one.
+[[nodiscard]] std::uint64_t effective_address_mask(const iced_x86::Instruction& instr) {
+  const auto reg = instr.memory_base() != iced_x86::Register::NONE ? instr.memory_base()
+                                                                   : instr.memory_index();
+  if (reg == iced_x86::Register::NONE) return ~0ull;
+  switch (register_width(reg)) {
+    case 2: return 0xFFFFull;
+    case 4: return 0xFFFFFFFFull;
+    default: return ~0ull;
   }
+}
+
+// `extra` is folded in while the address is still an offset, which is where the bit-string
+// instructions need their element displacement to land: it has to wrap with the rest of the
+// address, and it sits below the segment base rather than on top of the linear result.
+std::uint64_t memory_address_with_displacement(ExecutionContext& ctx, std::uint64_t extra) {
   std::uint64_t address = 0;
-  if (ctx.instr.memory_base() != iced_x86::Register::NONE) {
-    address += read_register(ctx.state, ctx.instr.memory_base());
+  std::uint64_t mask = ~0ull;
+  if (ctx.instr.is_ip_rel_memory_operand()) {
+    address = ctx.instr.ip_rel_memory_address();
+    if (ctx.instr.memory_base() == iced_x86::Register::EIP) mask = 0xFFFFFFFFull;
+  } else {
+    if (ctx.instr.memory_base() != iced_x86::Register::NONE) {
+      address += read_register(ctx.state, ctx.instr.memory_base());
+    }
+    if (ctx.instr.memory_index() != iced_x86::Register::NONE) {
+      address += read_register(ctx.state, ctx.instr.memory_index()) * ctx.instr.memory_index_scale();
+    }
+    address += ctx.instr.memory_displacement64();
+    mask = effective_address_mask(ctx.instr);
   }
-  if (ctx.instr.memory_index() != iced_x86::Register::NONE) {
-    address += read_register(ctx.state, ctx.instr.memory_index()) * ctx.instr.memory_index_scale();
-  }
-  address += ctx.instr.memory_displacement64();
+  address = (address + extra) & mask;
+  // An IP-relative operand used to return before reaching this, so a segment override on one was
+  // silently dropped. FS and GS are the two whose base is live in 64-bit mode, and nothing about
+  // RIP-relative addressing exempts them.
   if (ctx.instr.segment_prefix() == iced_x86::Register::FS) {
     address += ctx.state.fs_base;
   } else if (ctx.instr.segment_prefix() == iced_x86::Register::GS) {
     address += ctx.state.gs_base;
   }
   return mask_linear_address(ctx.state, address);
+}
+
+std::uint64_t memory_address(ExecutionContext& ctx) {
+  return memory_address_with_displacement(ctx, 0);
 }
 
 std::uint64_t read_register(CpuState& state, iced_x86::Register reg) {

@@ -73,6 +73,17 @@ ExecutionResult dispatch_interrupt(ExecutionContext& ctx, std::uint8_t vector, s
 
 std::uint64_t debug_data_breakpoint_hits(CpuState& state, std::uint64_t address, std::size_t size, bool is_read, bool is_write) noexcept;
 
+// The stack slot a push writes and a pop reads is implicit, so it never appears in the
+// instruction's operand list and the executor's generic watchpoint sweep cannot see it. Report it
+// from the handler instead, or a guest evades a data breakpoint just by pointing rsp at the watched
+// address and pushing.
+inline void note_stack_access(ExecutionContext& ctx, std::uint64_t slot, std::size_t width, bool is_write) {
+  if (ctx.state.dr[7] == 0) {
+    return;
+  }
+  ctx.debug_hit_bits |= debug_data_breakpoint_hits(ctx.state, slot, width, !is_write, is_write);
+}
+
 [[nodiscard]] inline bool note_debug_break(ExecutionContext& ctx, std::uint64_t hit_bits, bool will_continue) noexcept {
   if (hit_bits == 0) return false;
   ctx.debug_hit_bits |= hit_bits;
@@ -84,6 +95,9 @@ std::uint64_t debug_data_breakpoint_hits(CpuState& state, std::uint64_t address,
 std::size_t register_width(iced_x86::Register reg);
 std::size_t operand_width(const iced_x86::Instruction& instr, std::uint32_t operand_index);
 std::uint64_t memory_address(ExecutionContext& ctx);
+// Same, with an extra offset folded in before the address wraps and before the segment base is
+// added. The bit-string instructions displace their operand by whole elements and need both.
+std::uint64_t memory_address_with_displacement(ExecutionContext& ctx, std::uint64_t extra);
 std::uint64_t read_register(CpuState& state, iced_x86::Register reg);
 void write_register(CpuState& state, iced_x86::Register reg, std::uint64_t value, std::size_t width_override = 0);
 std::uint64_t immediate_value(const iced_x86::Instruction& instr, std::uint32_t operand_index);

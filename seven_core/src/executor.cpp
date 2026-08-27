@@ -46,14 +46,6 @@ constexpr bool kEnableAvx = SEVEN_ENABLE_AVX != 0;
 constexpr bool kEnableAvx512 = SEVEN_ENABLE_AVX512 != 0;
 constexpr std::size_t kMaxFaultRetries = Executor::kMaxFaultRetries;
 
-// Bits 63:47 of a linear address must all equal bit 47 under the 48-bit space seven models. Kept
-// local the way handlers/misc/system.cpp keeps its own copy; handler_helpers.cpp's lives in an
-// anonymous namespace.
-[[nodiscard]] bool is_canonical_address(std::uint64_t address) noexcept {
-  constexpr int kShift = 16;  // 64 - 48
-  return (static_cast<std::int64_t>(address << kShift) >> kShift) == static_cast<std::int64_t>(address);
-}
-
 constexpr std::size_t kVectorRegisterCount = 32;
 constexpr std::size_t kXmmWidth = 16;
 constexpr std::size_t kYmmWidth = 32;

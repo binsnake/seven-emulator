@@ -9,7 +9,9 @@
 #include <iced_x86/op_code_info.hpp>
 #include <iced_x86/op_code_operand_kind.hpp>
 
+#include "seven/executor.hpp"
 #include "seven/handler_helpers.hpp"
+#include "seven/memory.hpp"
 
 // The x86 decoder here is a hand-written C++ port of the Rust iced_x86 crate, and the emulator
 // makes real decisions from what it reports: which register a SIMD operand names, whether an
@@ -287,4 +289,75 @@ TEST(KuberaDecoder, DerivedCodesAgreeWithTheirOwnOperandTables) {
       }
     }
   }
+}
+
+// A 0x67 prefix in 64-bit mode makes a mod=0 rm=101 operand EIP-relative rather than RIP-relative:
+// the target is computed in 32 bits and wraps at 4G. The decoder chose between the two off its
+// bitness, so every 0x67 form took the RIP path and the EIP branch next to it was unreachable.
+TEST(KuberaDecoder, AddressSizePrefixMakesAnIpRelativeOperandEipRelative) {
+  // mov eax, [eip-0x2000] decoded at 0x1000, so the target wraps from 0x1007 - 0x2000.
+  const auto narrow = decode("67 8B 05 00 E0 FF FF");
+  EXPECT_EQ(narrow.memory_base(), iced_x86::Register::EIP);
+  EXPECT_EQ(narrow.ip_rel_memory_address(), 0xFFFFF007ull);
+
+  const auto wide = decode("48 8B 05 00 E0 FF FF");
+  EXPECT_EQ(wide.memory_base(), iced_x86::Register::RIP);
+  EXPECT_EQ(wide.ip_rel_memory_address(), 0xFFFFFFFFFFFFF007ull);
+}
+
+// [disp32] with neither a base nor an index leaves no register behind for a consumer to read the
+// address size off, so the displacement has to be truncated at decode time.
+TEST(KuberaDecoder, AddressSizePrefixTruncatesABareDisplacement) {
+  const auto narrow = decode("67 8B 04 25 00 E0 FF FF");
+  EXPECT_EQ(narrow.memory_base(), iced_x86::Register::NONE);
+  EXPECT_EQ(narrow.memory_index(), iced_x86::Register::NONE);
+  EXPECT_EQ(narrow.memory_displacement64(), 0xFFFFE000ull);
+
+  const auto wide = decode("8B 04 25 00 E0 FF FF");
+  EXPECT_EQ(wide.memory_displacement64(), 0xFFFFFFFFFFFFE000ull);
+}
+
+// The effective address wraps within the address size before any segment base is added, so
+// [eax-0x10] with eax=8 lands just under 4G instead of at a sign-extended -8.
+TEST(KuberaDecoder, ThirtyTwoBitEffectiveAddressWrapsAtFourGigabytes) {
+  seven::CpuState state{};
+  seven::Memory memory{};
+  seven::Executor executor{};
+  state.mode = seven::ExecutionMode::long64;
+  memory.map(0x1000, 0x1000);
+  memory.map(0xFFFFF000, 0x1000);
+  const std::uint32_t marker = 0x00C0FFEEu;
+  ASSERT_TRUE(memory.write(0xFFFFFFF8, &marker, sizeof(marker)));
+
+  const std::uint8_t code[] = {0x67, 0x8B, 0x40, 0xF0};
+  ASSERT_TRUE(memory.write(0x1000, code, sizeof(code)));
+
+  state.rip = 0x1000;
+  state.gpr[0] = 8;
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::none);
+  EXPECT_EQ(state.gpr[0], marker);
+}
+
+// A segment override on a RIP-relative operand was dropped: that path returned the ip-relative
+// target directly, before the FS/GS base was ever added.
+TEST(KuberaDecoder, ASegmentOverrideStillAppliesToARipRelativeOperand) {
+  seven::CpuState state{};
+  seven::Memory memory{};
+  seven::Executor executor{};
+  state.mode = seven::ExecutionMode::long64;
+  memory.map(0x1000, 0x1000);
+  memory.map(0x51000, 0x1000);
+  state.fs_base = 0x50000;
+
+  // mov rax, fs:[rip+0], eight bytes long, so the operand resolves to fs_base + 0x1008.
+  const std::uint8_t code[] = {0x64, 0x48, 0x8B, 0x05, 0x00, 0x00, 0x00, 0x00};
+  ASSERT_TRUE(memory.write(0x1000, code, sizeof(code)));
+  const std::uint64_t marker = 0x1122334455667788ull;
+  ASSERT_TRUE(memory.write(state.fs_base + 0x1008, &marker, sizeof(marker)));
+
+  state.rip = 0x1000;
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::none);
+  EXPECT_EQ(state.gpr[0], marker);
 }

@@ -289,6 +289,20 @@ constexpr std::uint64_t kFlagRF = 1ull << 16;
 // dead-code-eliminated, only ever set explicitly by the instructions that own them.
 constexpr std::uint64_t kAluStatusFlagsMask = kFlagCF | kFlagPF | kFlagAF | kFlagZF | kFlagSF | kFlagOF;
 
+// The rflags bits that actually exist. Bit 1 reads back as 1 no matter what is written; bits 3, 5,
+// 15 and everything from 22 up read back as 0. POPF and IRET are the only two instructions that
+// load rflags wholesale from guest memory, so they are the only two that can smuggle a reserved bit
+// in, and both have to drop it on the way through.
+constexpr std::uint64_t kRflagsWritableMask = 0x00000000003F7FD5ull;
+constexpr std::uint64_t kRflagsReservedOnes = 0x0000000000000002ull;
+
+// 4-level paging (48-bit virtual addresses): bits 63:47 must all equal bit 47. Anything else is a
+// #GP(0) on real hardware, raised ahead of any page walk.
+[[nodiscard]] constexpr bool is_canonical_address(std::uint64_t address) noexcept {
+  constexpr int kShift = 16;  // 64 - 48
+  return (static_cast<std::int64_t>(address << kShift) >> kShift) == static_cast<std::int64_t>(address);
+}
+
 // DR6 keeps B0-B3 plus BD/BS/BT; DR7 keeps the enable pairs, LE/GE, GD, and the R/W+LEN fields.
 // Everything else in each reads back as a fixed 1 or 0 whatever the guest writes, and both are
 // 32 bits of architectural state, so the upper half never sticks either.
