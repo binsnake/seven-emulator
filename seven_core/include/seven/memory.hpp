@@ -255,6 +255,9 @@ class Memory {
   // -- unmap() (erases the underlying PageEntry outright), restore_pages() (rebuilds pages_ from
   // scratch), and reprotect() (permissions, also cached per-slot, could change either direction).
   void clear_jit_tlb() noexcept { jit_tlb.fill(JitTlbSlot{}); }
+  // Mapping a device changes what a fetch returns without any page being written.
+  void invalidate_code_epochs(std::uint64_t base, std::size_t size) noexcept;
+  void invalidate_all_code_epochs() noexcept;
   [[nodiscard]] const MmioRegion* find_mmio_region(std::uint64_t address, std::size_t size) const;
   [[nodiscard]] bool has_permission(MemoryPermissionMask permissions, MemoryAccessKind kind) const;
   [[nodiscard]] bool access_allowed(const MemoryAccessEvent& event) const;

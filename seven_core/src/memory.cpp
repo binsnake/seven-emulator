@@ -79,15 +79,39 @@ Memory::PageEntry* Memory::lookup_page(std::uint64_t page_index) const noexcept 
   return slot.entry;
 }
 
+void Memory::invalidate_code_epochs(std::uint64_t base, std::size_t size) noexcept {
+  ++code_epoch_;
+  if (size == 0) {
+    return;
+  }
+  const auto first_page = base / kPageSize;
+  const auto last_page = page_range_end(base, size);
+  // Walks pages_, not the range: a device region can dwarf what is mapped under it.
+  for (auto& [page_index, entry] : pages_) {
+    if (page_index >= first_page && page_index < last_page) {
+      entry.code_epoch = code_epoch_;
+    }
+  }
+}
+
+void Memory::invalidate_all_code_epochs() noexcept {
+  ++code_epoch_;
+  for (auto& [page_index, entry] : pages_) {
+    entry.code_epoch = code_epoch_;
+  }
+}
+
 void Memory::set_passthrough(PassthroughReadFn read_fn, PassthroughWriteFn write_fn) {
   passthrough_read_  = std::move(read_fn);
   passthrough_write_ = std::move(write_fn);
+  invalidate_all_code_epochs();
   refresh_jit_fast_path_blocked();
 }
 
 void Memory::clear_passthrough() {
   passthrough_read_  = nullptr;
   passthrough_write_ = nullptr;
+  invalidate_all_code_epochs();
   refresh_jit_fast_path_blocked();
 }
 
@@ -356,6 +380,16 @@ bool Memory::read_code_page(std::uint64_t page_base, void* dst) const {
   if ((page_base % kPageSize) != 0) {
     return false;
   }
+  // A device anywhere in this page means the page bytes are not what a fetch here returns. Decline
+  // and let the caller fetch per instruction through read(), which consults the region.
+  const auto page_end = range_end_saturating(page_base, kPageSize);
+  if (!mmio_regions_.empty() && page_base < mmio_max_end_ && mmio_min_base_ < page_end) {
+    for (const auto& region : mmio_regions_) {
+      if (page_base < range_end_saturating(region.base, region.size) && region.base < page_end) {
+        return false;
+      }
+    }
+  }
   const auto* entry = lookup_page(page_base / kPageSize);
   if (entry == nullptr || !has_permission(entry->permissions, MemoryAccessKind::instruction_fetch)) {
     return false;
@@ -562,6 +596,7 @@ Memory::HookId Memory::map_mmio(std::uint64_t base, std::size_t size, MmioReadCa
     mmio_min_base_ = std::min(mmio_min_base_, base);
     mmio_max_end_ = std::max(mmio_max_end_, range_end_saturating(base, size));
   }
+  invalidate_code_epochs(base, size);
   refresh_jit_fast_path_blocked();
   return id;
 }
@@ -569,7 +604,10 @@ Memory::HookId Memory::map_mmio(std::uint64_t base, std::size_t size, MmioReadCa
 bool Memory::unmap_mmio(HookId id) {
   for (auto it = mmio_regions_.begin(); it != mmio_regions_.end(); ++it) {
     if (it->id == id) {
+      const auto gone_base = it->base;
+      const auto gone_size = it->size;
       mmio_regions_.erase(it);
+      invalidate_code_epochs(gone_base, gone_size);
       if (mmio_regions_.empty()) {
         mmio_min_base_ = ~0ull;
         mmio_max_end_ = 0;
@@ -590,6 +628,7 @@ bool Memory::unmap_mmio(HookId id) {
 
 void Memory::clear_mmio_regions() {
   mmio_regions_.clear();
+  invalidate_all_code_epochs();
   mmio_min_base_ = ~0ull;
   mmio_max_end_ = 0;
   refresh_jit_fast_path_blocked();
@@ -661,6 +700,7 @@ void Memory::restore_mmio_regions(const std::vector<MmioRegionSnapshot>& regions
       mmio_max_end_ = std::max(mmio_max_end_, range_end_saturating(region.base, region.size));
     }
   }
+  invalidate_all_code_epochs();
   // Every other mmio mutator refreshes this. Without it a restore that brings regions back into an
   // empty Memory leaves compiled code believing it can still take the raw-page fast path, so the
   // mmio callbacks never fire for anything that is also backed by a real page.

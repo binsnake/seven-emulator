@@ -819,3 +819,46 @@ TEST(KuberaMemory, DeviceDispatchCountTracksCallbacksNotConfiguration) {
   EXPECT_EQ(memory.device_dispatch_count(), 2u)
       << "an access that never reached a device moved the counter anyway";
 }
+
+// A device mapped over an address changes what a fetch there returns, so a cached decode is stale.
+TEST(KuberaMemory, MappingADeviceOverCodeInvalidatesCachedDecodes) {
+  constexpr std::uint64_t kProg = 0x1000;
+  seven::Memory memory{};
+  seven::Executor executor{};
+  memory.map(kProg, 0x1000);
+  const std::vector<std::uint8_t> code = {0x83, 0xC0, 0x01, 0x83, 0xC0, 0x01, 0xF4};  // add eax,1 x2 ; hlt
+  ASSERT_TRUE(memory.write(kProg, code.data(), code.size()));
+
+  const auto go = [&] {
+    seven::CpuState state{};
+    state.mode = seven::ExecutionMode::long64;
+    state.rip = kProg;
+    state.rflags = 0x202;
+    state.gpr[4] = kProg + 0x800;
+    const auto result = executor.run(state, memory, 64);
+    return std::pair{result.reason, state.gpr[0]};
+  };
+
+  const auto before = go();
+  ASSERT_EQ(before.first, seven::StopReason::halted);
+  ASSERT_EQ(before.second, 2u) << "the warm-up did not run the adds, so nothing got cached";
+
+  // The device answers every fetch with hlt, so the adds are simply not there any more.
+  const auto id = memory.map_mmio(
+      kProg, 0x1000,
+      [](std::uint64_t, void* dst, std::size_t size) {
+        std::memset(dst, 0xF4, size);
+        return true;
+      },
+      [](std::uint64_t, const void*, std::size_t) { return true; });
+  ASSERT_NE(id, 0u);
+
+  const auto after = go();
+  EXPECT_EQ(after.first, seven::StopReason::halted);
+  EXPECT_EQ(after.second, 0u) << "the cached decode kept running instructions the device replaced";
+
+  ASSERT_TRUE(memory.unmap_mmio(id));
+  const auto restored = go();
+  EXPECT_EQ(restored.first, seven::StopReason::halted);
+  EXPECT_EQ(restored.second, 2u) << "removing the device left the decode it served cached";
+}
