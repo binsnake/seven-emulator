@@ -47,6 +47,26 @@ constexpr std::uint64_t kCr4DeBit = 1ull << 3;
   return index;
 }
 
+// SDM Vol 3, 17.2: DR0-DR3 hold linear addresses, so a non-canonical one is #GP the same way any
+// other non-canonical linear address is. DR6/DR7 are 32 bits of architectural state whose reserved
+// bits read back fixed no matter what is written, and setting any bit above 31 is #GP in 64-bit
+// mode. Returns the value to store, or nothing if the write faults.
+[[nodiscard]] std::optional<std::uint64_t> debug_register_write_value(std::uint32_t index, std::uint64_t value) {
+  if (index <= 3u) {
+    constexpr int kShift = 16;  // 64 - 48
+    const bool canonical =
+        (static_cast<std::int64_t>(value << kShift) >> kShift) == static_cast<std::int64_t>(value);
+    return canonical ? std::optional<std::uint64_t>{value} : std::nullopt;
+  }
+  if ((value >> 32) != 0) {
+    return std::nullopt;
+  }
+  if (index == 6u) {
+    return (value & kDr6WritableMask) | kDr6ReservedOnes;
+  }
+  return (value & kDr7WritableMask) | kDr7ReservedOnes;
+}
+
 // SDM Vol 3, 2.5: MOV to/from a control register requires the reg field to name CR0, CR2, CR3,
 // CR4, or (64-bit mode only) CR8 -- any other encoding (CR1, CR5-CR7, CR9-CR15) is #UD on real
 // hardware. `state.cr` is sized to cover CR0-CR15 so an unfiltered index never reads/writes out
@@ -461,7 +481,11 @@ ExecutionResult handle_code_MOV_DR_R32(ExecutionContext& ctx) {
   }
   const auto src = ctx.instr.op_register(1);
   const auto value = detail::truncate(detail::read_register(ctx.state, src), 4);
-  ctx.state.dr[dst_index.value()] = value;
+  const auto stored = debug_register_write_value(dst_index.value(), value);
+  if (!stored.has_value()) {
+    return gp_fault(ctx);
+  }
+  ctx.state.dr[dst_index.value()] = stored.value();
   return {};
 }
 
@@ -475,7 +499,11 @@ ExecutionResult handle_code_MOV_DR_R64(ExecutionContext& ctx) {
   }
   const auto src = ctx.instr.op_register(1);
   const auto value = detail::read_register(ctx.state, src);
-  ctx.state.dr[dst_index.value()] = value;
+  const auto stored = debug_register_write_value(dst_index.value(), value);
+  if (!stored.has_value()) {
+    return gp_fault(ctx);
+  }
+  ctx.state.dr[dst_index.value()] = stored.value();
   return {};
 }
 

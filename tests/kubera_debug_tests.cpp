@@ -769,3 +769,53 @@ TEST(KuberaDebug, StackPushAndPopTriggerDataBreakpoints) {
     EXPECT_EQ(state.gpr[0], secret);
   }
 }
+
+// DR6 and DR7 have bits that read as 1 on every real x86-64 regardless of what is written, and the
+// address registers hold linear addresses, so a non-canonical one faults the way any other
+// non-canonical linear address does.
+TEST(KuberaDebug, DebugRegisterReservedBitsAndCanonicalChecks) {
+  seven::Memory memory{};
+  seven::Executor executor{};
+  memory.map(0x1000, 0x1000);
+
+  const auto run_one = [&](const std::vector<std::uint8_t>& code, seven::CpuState& state) {
+    EXPECT_TRUE(memory.write(0x1000, code.data(), code.size()));
+    state.mode = seven::ExecutionMode::long64;
+    state.rip = 0x1000;
+    return executor.step(state, memory);
+  };
+
+  {
+    seven::CpuState state{};
+    EXPECT_EQ(state.dr[6] & 0xFFFF0FF0ull, 0xFFFF0FF0ull) << "DR6 reset value";
+    EXPECT_EQ(state.dr[7] & 0x400ull, 0x400ull) << "DR7 reset value";
+  }
+  {
+    // mov dr7, rax with every architectural bit set -- the reserved zeros must not stick.
+    seven::CpuState state{};
+    state.gpr[0] = 0xFFFFFFFFull;
+    ASSERT_EQ(run_one({0x0F, 0x23, 0xF8}, state).reason, seven::StopReason::none);
+    EXPECT_EQ(state.dr[7] & 0x400ull, 0x400ull) << "DR7 bit 10 must stay set";
+    EXPECT_EQ(state.dr[7] & 0xFFFFFFFF00000000ull, 0u) << "DR7 is 32 bits of architectural state";
+    EXPECT_EQ(state.dr[7] & 0xC000ull, 0u) << "DR7 bits 14-15 are reserved zero";
+  }
+  {
+    // Setting anything above bit 31 is #GP in 64-bit mode.
+    seven::CpuState state{};
+    state.gpr[0] = 1ull << 32;
+    EXPECT_EQ(run_one({0x0F, 0x23, 0xF8}, state).reason, seven::StopReason::general_protection);
+  }
+  {
+    // mov dr6, rax likewise.
+    seven::CpuState state{};
+    state.gpr[0] = 0;
+    ASSERT_EQ(run_one({0x0F, 0x23, 0xF0}, state).reason, seven::StopReason::none);
+    EXPECT_EQ(state.dr[6] & 0xFFFF0FF0ull, 0xFFFF0FF0ull) << "DR6 reserved ones must read back set";
+  }
+  {
+    // mov dr0, rax with a non-canonical address.
+    seven::CpuState state{};
+    state.gpr[0] = 0x0000'8000'0000'0000ull;
+    EXPECT_EQ(run_one({0x0F, 0x23, 0xC0}, state).reason, seven::StopReason::general_protection);
+  }
+}

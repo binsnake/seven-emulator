@@ -106,7 +106,9 @@ struct CpuState {
   std::array<std::uint16_t, 6> sreg{};  // ES,CS,SS,DS,FS,GS selectors
   // cr[0]=CR0, cr[4]=CR4 — Windows 10/11 x64 typical values
   std::array<std::uint64_t, 16> cr{0x80050033u, 0, 0, 0, 0x370678u};
-  std::array<std::uint64_t, 16> dr{};
+  // dr[6]/dr[7] carry bits that read as 1 on real hardware no matter what is written; these are
+  // their reset values. See kDr6ReservedOnes/kDr7ReservedOnes.
+  std::array<std::uint64_t, 16> dr{0, 0, 0, 0, 0, 0, 0xFFFF0FF0ull, 0x400ull};
   std::array<std::uint64_t, 8> tr{};
   std::uint64_t rip = 0;
   ExecutionMode mode = ExecutionMode::long64;
@@ -286,6 +288,14 @@ constexpr std::uint64_t kFlagRF = 1ull << 16;
 // seven/ir.hpp). Deliberately excludes control bits (TF/IF/DF/RF/...) -- those are never
 // dead-code-eliminated, only ever set explicitly by the instructions that own them.
 constexpr std::uint64_t kAluStatusFlagsMask = kFlagCF | kFlagPF | kFlagAF | kFlagZF | kFlagSF | kFlagOF;
+
+// DR6 keeps B0-B3 plus BD/BS/BT; DR7 keeps the enable pairs, LE/GE, GD, and the R/W+LEN fields.
+// Everything else in each reads back as a fixed 1 or 0 whatever the guest writes, and both are
+// 32 bits of architectural state, so the upper half never sticks either.
+constexpr std::uint64_t kDr6WritableMask = 0x0000E00Full;
+constexpr std::uint64_t kDr6ReservedOnes = 0xFFFF0FF0ull;
+constexpr std::uint64_t kDr7WritableMask = 0xFFFF23FFull;
+constexpr std::uint64_t kDr7ReservedOnes = 0x00000400ull;
 
 [[nodiscard]] constexpr std::uint64_t mask_for_width(std::size_t width) noexcept {
   return width >= 8 ? ~0ull : ((1ull << (width * 8)) - 1ull);
