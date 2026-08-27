@@ -431,6 +431,26 @@ TEST(KuberaMemory, InstructionThatGenuinelyStraddlesAnUnmappedPageStillFaults) {
   EXPECT_EQ(result.exception->address, 0x2000u) << "the fault belongs to the page it ran into";
 }
 
+// The test above uses B8, whose immediate is read through read_u32. An instruction whose missing
+// byte is the modrm instead goes down a different exhaustion path in the decoder.
+TEST(KuberaMemory, InstructionWhoseModrmStraddlesAnUnmappedPageStillFaults) {
+  seven::CpuState state{};
+  seven::Memory memory{};
+  seven::Executor executor{};
+  state.mode = seven::ExecutionMode::long64;
+  memory.map(0x1000, 0x1000);
+  // mov [rax], rbx is three bytes; the modrm is the one that lands past the boundary.
+  const std::uint8_t head[] = {0x48, 0x89};
+  ASSERT_TRUE(memory.write(0x1FFE, head, sizeof(head)));
+
+  state.rip = 0x1FFE;
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::page_fault);
+  EXPECT_EQ(state.rip, 0x1FFEu);
+  ASSERT_TRUE(result.exception.has_value());
+  EXPECT_EQ(result.exception->address, 0x2000u) << "the fault belongs to the page it ran into";
+}
+
 // CpuState::msr is an unordered_map keyed on the 32-bit MSR index, and WRMSR used to insert
 // unconditionally. A CPL0 guest walking ECX through a wrmsr loop therefore made the host allocate
 // one node per index -- around 200 GB before the counter wraps, with no cooperative-cancellation
