@@ -413,7 +413,12 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
   // against the nested instruction's operands: an `add rax, rbx` executing as `add rcx, rdx`.
   // Nested frames get their own private slot instead and never touch the shared array.
   const bool nested = step_depth_ > 1;
-  if (cache_memory_instance_ != memory.instance_id()) [[unlikely]] {
+  // Nested frames are excluded because they use neither cache (see can_use_decode_cache and the
+  // scratch slot above), so claiming ownership on their behalf only mislabels what the outer frame
+  // has cached. A hook re-entering with a second Memory used to leave the tag naming that one while
+  // the outer frame carried on filling entries decoded from the first, and the next step against the
+  // second Memory then found them and ran the wrong guest's bytes.
+  if (!nested && cache_memory_instance_ != memory.instance_id()) [[unlikely]] {
     // Both caches below are validated on (rip, page epoch, mode) alone, and those epochs come from
     // a per-Memory counter that every Memory starts near zero. An Executor reused across two of them
     // -- separate guests, or one guest rebuilt in a loop -- would find a cached decode from the

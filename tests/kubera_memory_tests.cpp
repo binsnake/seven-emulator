@@ -882,3 +882,57 @@ TEST(KuberaMemory, MappingADeviceOverCodeInvalidatesCachedDecodes) {
   EXPECT_EQ(restored.first, seven::StopReason::halted);
   EXPECT_EQ(restored.second, 2u) << "removing the device left the decode it served cached";
 }
+
+// One Executor across two Memory objects is what the decode cache's instance tag exists for. The
+// tag was claimed once per step() rather than per fault-retry attempt, so a hook that re-entered
+// with the other Memory left the outer frame filling entries under the wrong owner's name.
+TEST(KuberaMemory, AReenteringFaultHookCannotMisclaimTheDecodeCache) {
+  seven::Executor executor{};
+  seven::Memory a{};
+  seven::Memory b{};
+  b.map(0x1000, 0x1000);
+
+  const std::uint8_t a_code[] = {0x83, 0xC0, 0x01};  // add eax,1
+  const std::uint8_t b_code[] = {0x83, 0xE8, 0x01};  // sub eax,1
+  ASSERT_TRUE(b.write(0x1000, b_code, sizeof(b_code)));
+
+  bool reentered = false;
+  const auto id = executor.add_fault_hook([&](const seven::FaultHookEvent& event) {
+    if (reentered) {
+      return seven::FaultHookAction::stop;
+    }
+    reentered = true;
+    seven::CpuState nested{};
+    nested.mode = seven::ExecutionMode::long64;
+    nested.rip = 0x1000;
+    nested.rflags = 0x202;
+    nested.gpr[4] = 0x1800;
+    (void)executor.step(nested, b);
+    event.memory.map(0x1000, 0x1000);
+    EXPECT_TRUE(event.memory.write(0x1000, a_code, sizeof(a_code)));
+    return seven::FaultHookAction::restart_instruction;
+  });
+  ASSERT_NE(id, 0u);
+
+  seven::CpuState state_a{};
+  state_a.mode = seven::ExecutionMode::long64;
+  state_a.rip = 0x1000;
+  state_a.rflags = 0x202;
+  state_a.gpr[4] = 0x1800;
+  state_a.gpr[0] = 10;
+  // One step, not run(): every step_impl call reclaims the tag, so a second one would paper over
+  // the entry this one cached under the wrong owner before anything could read it back.
+  const auto ran_a = executor.step(state_a, a);
+  ASSERT_EQ(ran_a.reason, seven::StopReason::none);
+  ASSERT_EQ(state_a.gpr[0], 11u) << "a should have added";
+
+  seven::CpuState state_b{};
+  state_b.mode = seven::ExecutionMode::long64;
+  state_b.rip = 0x1000;
+  state_b.rflags = 0x202;
+  state_b.gpr[4] = 0x1800;
+  state_b.gpr[0] = 10;
+  const auto ran_b = executor.step(state_b, b);
+  EXPECT_EQ(ran_b.reason, seven::StopReason::none);
+  EXPECT_EQ(state_b.gpr[0], 9u) << "b ran the decode cached for a";
+}
