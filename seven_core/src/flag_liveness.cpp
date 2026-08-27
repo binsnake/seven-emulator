@@ -382,6 +382,23 @@ bool can_fault(const iced_x86::Instruction& instr) noexcept {
   }
 }
 
+// Whether a fault can strike AFTER this instruction has written its flags, which is what makes
+// that write observable even though something later in the block would have overwritten it.
+//
+// Handlers read their operands, set the flags, then write the result (add.cpp's
+// handle_code_ADD_RM8_R8 calls set_add_flags before write_operand's fault check), so the answer is
+// only yes when the result goes to memory. An instruction that faults on a memory SOURCE never
+// reaches the flag computation at all, and its flags stay masked as before -- which matters,
+// because a register destination with a memory source is the common shape by far.
+//
+// Operand 0 is the destination for every flag-writing memory form: the read-modify-write ALU ops,
+// INC/DEC/NEG/NOT, the shifts and rotates, BT variants, CMPXCHG and XADD. CMP against memory is
+// caught too and does not write anything, which costs a mask and is harmless. No string
+// instruction both writes memory and writes flags, so none of them need to be listed here.
+[[nodiscard]] bool faults_after_writing_flags(const iced_x86::Instruction& instr) noexcept {
+  return instr.op_count() > 0 && instr.op_kind(0) >= iced_x86::OpKind::MEMORY_SEG_SI;
+}
+
 void compute_flag_liveness(std::span<FlagLivenessInstr> insts) noexcept {
   // Live-out of the block is conservatively "every ALU status flag" -- Phase 1 does no
   // cross-block liveness, so whatever comes after this block
@@ -395,7 +412,12 @@ void compute_flag_liveness(std::span<FlagLivenessInstr> insts) noexcept {
     // guaranteed to run. That forces `live` back to "everything live" at this point, which
     // prevents any earlier write from being masked across it. See can_fault()'s comment.
     const auto read = (info.read | (can_fault(*it->instr) ? kAluStatusFlagsMask : 0)) & kAluStatusFlagsMask;
-    it->dead_flags_mask = written & ~live;
+    // The line above keeps an EARLIER write from being masked across a possible fault. This one
+    // covers the faulting instruction's own write, which needs the same protection and was not
+    // getting it: the boost went into `live` for the next iteration only, after the current
+    // instruction's mask had already been computed.
+    const auto own = faults_after_writing_flags(*it->instr) ? kAluStatusFlagsMask : 0;
+    it->dead_flags_mask = written & ~(live | own);
     live = (live & ~written) | read;
   }
 }

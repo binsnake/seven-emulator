@@ -361,3 +361,33 @@ TEST(KuberaLiveness, ANestedRunFromAnMmioCallbackDoesNotClobberTheOuterMask) {
   EXPECT_EQ(mask_after_nested, mask_at_entry)
       << "the nested run left its own mask installed for the rest of the outer handler";
 }
+
+// The fault-capable case exists so that nothing after a possible fault can be used to justify
+// dropping a flag write before it. It used to apply that only to writes made EARLIER in the block:
+// the boost was folded into `live` for the next iteration, while the current instruction's own
+// dead mask had already been computed against the unboosted value.
+//
+// That leaves the faulting instruction's own write unprotected, and it is observable. seven_core's
+// handlers commit flags before attempting the write-back, so a store that faults still updates the
+// flags, and the instruction that was supposed to overwrite them never runs. A JIT-vs-interpreter
+// fuzz lane caught this as the two engines reporting different flags after the same faulting store.
+TEST(KuberaLiveness, AFaultCapableInstructionKeepsItsOwnFlagWrite) {
+  // xor [rbp+0x26], edx then sar rdi, 1. The sar overwrites every flag the xor writes, which is
+  // exactly the reasoning that used to mark the xor's write dead.
+  const auto raw = seven::parse_hex_bytes("31 55 26 48 D1 FF");
+  iced_x86::Decoder decoder(64, std::span<const std::uint8_t>(raw.data(), raw.size()), 0x1000);
+  std::vector<iced_x86::Instruction> instrs;
+  for (int i = 0; i < 2; ++i) {
+    const auto decoded = decoder.decode();
+    ASSERT_TRUE(decoded.has_value());
+    instrs.push_back(decoded.value());
+  }
+  ASSERT_TRUE(seven::can_fault(instrs[0]));
+
+  std::vector<seven::FlagLivenessInstr> liveness;
+  for (const auto& instr : instrs) liveness.push_back({&instr, 0});
+  seven::compute_flag_liveness(liveness);
+
+  EXPECT_EQ(liveness[0].dead_flags_mask, 0u)
+      << "a store that can fault must keep the flag write the fault would expose";
+}
