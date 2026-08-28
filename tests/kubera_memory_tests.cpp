@@ -1448,3 +1448,39 @@ TEST(KuberaMemory, GuardedBuildFaultsOnAWideAccessStraddlingTheEndOfAGuestPage) 
   }
 }
 #endif
+
+// classify_faulting_address only exists in the guarded build, so unlike the two tests above this
+// one cannot compile at all without the flag and has to be excluded rather than skipped.
+#if defined(_MSC_VER) && defined(SEVEN_GUARDED_PAGES)
+// A fault handler has to be able to tell a guard hit apart from an ordinary crash, otherwise the
+// fuzzer's escape lane can only report "something died" and every finding needs a debugger.
+TEST(KuberaMemory, AGuardPageAddressIsIdentifiableFromAFaultHandler) {
+  seven::Memory memory;
+  memory.map(0xC000, seven::Memory::kPageSize);
+
+  auto* page = memory.page_data(0xC000 / seven::Memory::kPageSize);
+  ASSERT_NE(page, nullptr);
+
+  const auto inside = seven::classify_faulting_address(page + seven::Memory::kPageSize - 1);
+  EXPECT_FALSE(inside.is_guard_page) << "the last byte the guest owns was reported as a guard page";
+
+  const auto overrun = seven::classify_faulting_address(page + seven::Memory::kPageSize);
+  EXPECT_TRUE(overrun.is_guard_page);
+  EXPECT_EQ(overrun.bytes_past_payload, 0u);
+
+  const auto further = seven::classify_faulting_address(page + seven::Memory::kPageSize + 24);
+  EXPECT_TRUE(further.is_guard_page);
+  EXPECT_EQ(further.bytes_past_payload, 24u);
+  EXPECT_EQ(further.guard_base, overrun.guard_base);
+
+  // Address space gets handed back and reused, so an unmapped page's guard has to stop being
+  // reported as one or the classifier would manufacture findings out of unrelated crashes.
+  const auto guard_base = overrun.guard_base;
+  memory.unmap(0xC000, seven::Memory::kPageSize);
+  EXPECT_FALSE(seven::classify_faulting_address(reinterpret_cast<const void*>(guard_base))
+                   .is_guard_page);
+
+  EXPECT_FALSE(seven::classify_faulting_address(&memory).is_guard_page)
+      << "a plain stack address was reported as a guard page";
+}
+#endif

@@ -20,11 +20,22 @@
 // mapped guest page and is meant for tests and fuzzing, not production.
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 
 namespace seven {
 
 #if defined(SEVEN_GUARDED_PAGES)
+
+// What a faulting address turned out to be. A fault handler needs to tell "the guest ran off the
+// end of a page", which is a finding, apart from an ordinary crash, which is a different one.
+struct GuardHit {
+  bool is_guard_page = false;
+  std::uintptr_t guard_base = 0;
+  // The payload ends exactly where the guard starts, so this doubles as how far past the end of
+  // the guest page the access reached.
+  std::size_t bytes_past_payload = 0;
+};
 
 namespace detail {
 // Defined in guarded_allocator.cpp. The reservation calls live out of line so that windows.h stays
@@ -32,8 +43,12 @@ namespace detail {
 // min/max as macros and float80.hpp stops compiling.
 [[nodiscard]] std::size_t guarded_page_size() noexcept;
 [[nodiscard]] void* guarded_reserve(std::size_t committed_bytes);
-void guarded_release(void* base) noexcept;
+void guarded_release(void* base, std::size_t committed_bytes) noexcept;
 }  // namespace detail
+
+// Safe to call from an exception handler: it takes a lock and reads a hash set, and never
+// allocates. Only ever contends with map/unmap, never with the faulting access itself.
+[[nodiscard]] GuardHit classify_faulting_address(const void* address) noexcept;
 
 template <class T>
 struct GuardedPageAllocator {
@@ -67,8 +82,9 @@ struct GuardedPageAllocator {
     if (p == nullptr) return;
     // The allocation ends on a page boundary by construction, so the base is recoverable from the
     // pointer and the size alone and nothing has to be stored alongside it.
+    const std::size_t committed = committed_for(n);
     auto* end = reinterpret_cast<std::byte*>(p) + footprint(n);
-    detail::guarded_release(end - committed_for(n));
+    detail::guarded_release(end - committed, committed);
   }
 
   template <class U>

@@ -2,7 +2,9 @@
 
 #if defined(SEVEN_GUARDED_PAGES)
 
+#include <mutex>
 #include <new>
+#include <unordered_set>
 
 #if !defined(WIN32_LEAN_AND_MEAN)
 #define WIN32_LEAN_AND_MEAN
@@ -23,6 +25,24 @@ std::size_t guarded_page_size() noexcept {
   return cached;
 }
 
+namespace {
+
+// Which pages are guards, so a fault handler can answer the question without guessing. Address
+// space gets reused, so this has to be kept exact rather than approximated by a low/high range.
+// Both are leaked on purpose. A fault can arrive during static destruction, and a handler that
+// reaches a destroyed mutex or set turns a useful finding into a second crash.
+std::mutex& registry_lock() {
+  static auto* lock = new std::mutex();
+  return *lock;
+}
+
+std::unordered_set<std::uintptr_t>& guard_pages() {
+  static auto* pages = new std::unordered_set<std::uintptr_t>();
+  return *pages;
+}
+
+}  // namespace
+
 void* guarded_reserve(std::size_t committed_bytes) {
   const std::size_t page = guarded_page_size();
   auto* base = static_cast<std::byte*>(
@@ -34,11 +54,33 @@ void* guarded_reserve(std::size_t committed_bytes) {
     ::VirtualFree(base, 0, MEM_RELEASE);
     throw std::bad_alloc();
   }
+  {
+    const std::lock_guard<std::mutex> held(registry_lock());
+    guard_pages().insert(reinterpret_cast<std::uintptr_t>(base + committed_bytes));
+  }
   return base;
 }
 
-void guarded_release(void* base) noexcept { ::VirtualFree(base, 0, MEM_RELEASE); }
+void guarded_release(void* base, std::size_t committed_bytes) noexcept {
+  {
+    const std::lock_guard<std::mutex> held(registry_lock());
+    guard_pages().erase(reinterpret_cast<std::uintptr_t>(base) + committed_bytes);
+  }
+  ::VirtualFree(base, 0, MEM_RELEASE);
+}
 
 }  // namespace seven::detail
+
+namespace seven {
+
+GuardHit classify_faulting_address(const void* address) noexcept {
+  const auto addr = reinterpret_cast<std::uintptr_t>(address);
+  const auto base = addr & ~static_cast<std::uintptr_t>(detail::guarded_page_size() - 1);
+  const std::lock_guard<std::mutex> held(detail::registry_lock());
+  if (detail::guard_pages().count(base) == 0) return {};
+  return {true, base, static_cast<std::size_t>(addr - base)};
+}
+
+}  // namespace seven
 
 #endif
