@@ -57,6 +57,12 @@ class Executor {
   [[nodiscard]] HookId add_trap_hook(TrapKind kind, TrapHook hook);
   // How many times step() will let a fault hook ask for the same instruction again before giving up.
   static constexpr std::size_t kMaxFaultRetries = 8;
+  // How deep an embedder callback may re-enter step() before it stops instead of running out of
+  // host stack. Legitimate nesting is a couple of frames (a device callback inside a fault handler
+  // inside a step is three). A step frame plus a hook dispatch is expensive enough that this has to
+  // stay small to be worth anything: 16 was measured to overflow a default 1MB thread stack before
+  // the cap could fire, which is the exact thing it exists to prevent. 8 does not.
+  static constexpr std::size_t kMaxStepDepth = 8;
   // The fault path step() runs, for an execution engine (see seven_jit) that raised the fault in its
   // own generated code instead of going through step(). state.rip must already point at the faulting
   // instruction. Returns true if a fault hook wants that instruction attempted again; otherwise it

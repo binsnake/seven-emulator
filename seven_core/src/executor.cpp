@@ -45,6 +45,7 @@ namespace {
 constexpr bool kEnableAvx = SEVEN_ENABLE_AVX != 0;
 constexpr bool kEnableAvx512 = SEVEN_ENABLE_AVX512 != 0;
 constexpr std::size_t kMaxFaultRetries = Executor::kMaxFaultRetries;
+constexpr std::size_t kMaxStepDepth = Executor::kMaxStepDepth;
 
 constexpr std::size_t kVectorRegisterCount = 32;
 constexpr std::size_t kXmmWidth = 16;
@@ -416,6 +417,13 @@ bool Executor::jit_bypass_eligible(const CpuState& state, const Memory& memory) 
 
 ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_masking) {
   StepDepthScope depth_scope{*this};
+  // Each level here is an embedder callback re-entering step(), costing a host stack frame and a
+  // nested_decode_scratch_ slot that is never given back. The guest cannot drive this on its own,
+  // but nothing bounded it either, so a hook that re-enters unconditionally took the host down by
+  // stack exhaustion instead of returning something the embedder could act on.
+  if (step_depth_ > kMaxStepDepth) {
+    return {StopReason::execution_limit, 0, std::nullopt, std::nullopt};
+  }
   // A hook callback is free to call back into step()/run(), and the decode cache is direct-mapped
   // on (rip >> 1), so a nested step at any rip 0x4000 away from the outer one lands on the exact
   // same slot. The outer frame is still holding a reference into that slot -- ExecutionContext's

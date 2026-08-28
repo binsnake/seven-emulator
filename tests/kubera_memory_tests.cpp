@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -1166,4 +1167,52 @@ TEST(KuberaMemory, StringSourceOperandHonoursASegmentOverride) {
   EXPECT_EQ(result.reason, seven::StopReason::none);
   EXPECT_EQ(state.gpr[0], through_fs);
   EXPECT_EQ(state.gpr[6], 0x1238u) << "rsi steps by the operand size, not the linear address";
+}
+
+// An access hook is free to call back into step(), and each level of that costs a host stack frame
+// plus a nested decode-scratch slot that is never released. A hook that re-enters unconditionally
+// therefore took the host process down by stack exhaustion, with no error anyone could act on.
+// The guest cannot reach this on its own -- only an embedder can install the hook -- but "the
+// embedder wrote a silly hook" should be a stop, not a crash.
+TEST(KuberaMemory, AnAccessHookThatReentersForeverStopsInsteadOfExhaustingTheStack) {
+  constexpr std::uint64_t kBase = 0x1000;
+  constexpr std::uint64_t kData = 0x4000;
+
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.gpr[3] = kData;  // rbx
+
+  memory.map(kBase, 0x1000);
+  memory.map(kData, 0x1000);
+  const std::uint8_t code[] = {0x48, 0x8B, 0x03};  // mov rax, [rbx]
+  ASSERT_TRUE(memory.write(kBase, code, sizeof(code)));
+
+  // Scoped to the data page so the hook does not also fire on the instruction fetch. An unscoped
+  // hook makes each frame spawn two nested steps and the recursion fans out exponentially, which
+  // is a different (and much noisier) failure than the straight-line descent being bounded here.
+  std::size_t depth_now = 0;
+  std::size_t depth_max = 0;
+  const auto hook = memory.add_access_hook(
+      [&](const seven::MemoryAccessEvent&) {
+        ++depth_now;
+        depth_max = std::max(depth_max, depth_now);
+        seven::CpuState nested = state;
+        nested.rip = kBase;
+        (void)executor.step(nested, memory);
+        --depth_now;
+        return true;
+      },
+      seven::MemoryHookRange{kData, 0x1000});
+  (void)hook;
+
+  // The outermost step still retires normally. Only the frames past the cap give up, and they give
+  // up by returning rather than by taking the process with them, which is the whole point.
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::none);
+  EXPECT_GT(depth_max, 0u) << "the hook never ran, so this test proved nothing";
+  EXPECT_LE(depth_max, seven::Executor::kMaxStepDepth + 2)
+      << "the re-entry ran deeper than the step-depth cap should ever allow";
 }
