@@ -430,3 +430,38 @@ TEST(KuberaDecoder, TheLegacyFormsOfTheVexAndEvexOpcodesStillDecode) {
   ASSERT_TRUE(decoded.has_value());
   EXPECT_EQ(decoded->code(), iced_x86::Code::VEX_VMOVD_XMM_RM32);
 }
+
+// The C4/C5/62 handlers dispatch to a handler_mem for the legacy (mod != 3) forms, and until
+// recently that field was stored and never called, so the whole path was dead. Enabling it means
+// every one of those table entries is now reachable from guest bytes. read_handler's own "assert
+// not null" comment has no assert behind it, so this walks every ModRM value in both modes that
+// have the legacy forms and checks the decoder comes back with something sane rather than calling
+// through whatever the table happened to hold.
+TEST(KuberaDecoder, EveryModrmForTheVexAndEvexOpcodesDecodesSafely) {
+  for (const std::uint8_t op : {0x62, 0xC4, 0xC5}) {
+    for (const std::uint32_t bitness : {16u, 32u, 64u}) {
+      for (int modrm = 0; modrm < 256; ++modrm) {
+        // Enough trailing bytes that nothing is truncated for its own reasons: a 3-byte VEX with a
+        // disp32 and an immediate is still under this.
+        const std::vector<std::uint8_t> bytes = {
+            op, static_cast<std::uint8_t>(modrm), 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
+            0x90, 0xA0, 0xB0, 0xC0, 0xD0};
+        iced_x86::Decoder dec(bitness, std::span<const std::uint8_t>(bytes.data(), bytes.size()), 0);
+        const auto decoded = dec.decode();
+        if (!decoded) continue;  // a decode error is a fine answer, just not a crash
+        EXPECT_LE(decoded->length(), 15u)
+            << "op " << std::hex << int(op) << " modrm " << modrm << " bitness " << std::dec << bitness;
+        EXPECT_GT(decoded->length(), 0u)
+            << "op " << std::hex << int(op) << " modrm " << modrm << " bitness " << std::dec << bitness;
+        EXPECT_LE(decoded->op_count(), 5u);
+        for (std::uint32_t i = 0; i < decoded->op_count(); ++i) {
+          if (decoded->op_kind(i) == iced_x86::OpKind::REGISTER) {
+            const auto reg = static_cast<std::uint32_t>(decoded->op_register(i));
+            EXPECT_LT(reg, static_cast<std::uint32_t>(iced_x86::IcedConstants::REGISTER_ENUM_COUNT))
+                << "op " << std::hex << int(op) << " modrm " << modrm << " operand " << std::dec << i;
+          }
+        }
+      }
+    }
+  }
+}
