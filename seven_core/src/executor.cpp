@@ -424,6 +424,21 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
   if (step_depth_ > kMaxStepDepth) {
     return {StopReason::execution_limit, 0, std::nullopt, std::nullopt};
   }
+  // The level cap above says nothing about how many bytes a level costs, and this frame is large
+  // enough that the two disagree badly -- see kMaxStepStackBytes. Measure the descent instead of
+  // assuming it. The probe is volatile so it keeps an address to compare rather than being folded
+  // away, and the comparison is by magnitude so it does not bake in which way the stack grows.
+  volatile char stack_probe = 0;
+  const auto probe_here = reinterpret_cast<std::uintptr_t>(const_cast<const char*>(&stack_probe));
+  if (step_depth_ == 1) {
+    step_stack_base_ = probe_here;
+  } else if (step_stack_base_ != 0) {
+    const auto descended = step_stack_base_ > probe_here ? step_stack_base_ - probe_here
+                                                         : probe_here - step_stack_base_;
+    if (descended > kMaxStepStackBytes) {
+      return {StopReason::execution_limit, 0, std::nullopt, std::nullopt};
+    }
+  }
   // A hook callback is free to call back into step()/run(), and the decode cache is direct-mapped
   // on (rip >> 1), so a nested step at any rip 0x4000 away from the outer one lands on the exact
   // same slot. The outer frame is still holding a reference into that slot -- ExecutionContext's

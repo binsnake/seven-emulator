@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -59,10 +60,19 @@ class Executor {
   static constexpr std::size_t kMaxFaultRetries = 8;
   // How deep an embedder callback may re-enter step() before it stops instead of running out of
   // host stack. Legitimate nesting is a couple of frames (a device callback inside a fault handler
-  // inside a step is three). A step frame plus a hook dispatch is expensive enough that this has to
-  // stay small to be worth anything: 16 was measured to overflow a default 1MB thread stack before
-  // the cap could fire, which is the exact thing it exists to prevent. 8 does not.
+  // inside a step is three).
   static constexpr std::size_t kMaxStepDepth = 8;
+  // Counting levels is not by itself a bound on what has to fit, which is bytes, and the two only
+  // agree if the per-level cost is known. It is not small: one re-entry cycle (a step_impl frame
+  // plus the handler and Memory frames under it) measures about 105 KB optimized, so the level cap
+  // alone permits roughly 950 KB and leaves a default 1 MB stack nothing for the embedder's own
+  // hook body. A build that pads locals, such as a sanitizer one, runs out partway through the cap
+  // instead, which is the crash the cap exists to prevent. So re-entry is bounded by how far the
+  // stack has actually descended since the outermost step as well as by how many levels deep it is.
+  // Overshoots by the one frame already entered when the check runs, which the budget leaves room
+  // for. Sized to still admit the three legitimate levels described above at the measured cost,
+  // while capping the worst case near a third of a 1 MB stack instead of very nearly all of it.
+  static constexpr std::size_t kMaxStepStackBytes = 256u * 1024u;
   // The fault path step() runs, for an execution engine (see seven_jit) that raised the fault in its
   // own generated code instead of going through step(). state.rip must already point at the faulting
   // instruction. Returns true if a fault hook wants that instruction attempted again; otherwise it
@@ -222,6 +232,9 @@ class Executor {
   // Depth of step_impl frames on the stack, and one private decode slot per nested depth. Held by
   // unique_ptr so an outer frame's reference into its slot survives this vector growing.
   std::size_t step_depth_ = 0;
+  // Where the outermost step_impl frame sat, so a nested one can tell how much stack the re-entry
+  // has eaten. Only meaningful while step_depth_ is non-zero.
+  std::uintptr_t step_stack_base_ = 0;
   std::vector<std::unique_ptr<DecodedInstructionCacheEntry>> nested_decode_scratch_;
   ContextSyncCallback context_read_cb_{};
   ContextSyncCallback context_write_cb_{};
