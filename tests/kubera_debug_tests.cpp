@@ -1035,3 +1035,61 @@ TEST(KuberaDebug, AnOutOfRangeStopReasonFromAHookStaysInsideTheCountsVector) {
   EXPECT_EQ(static_cast<unsigned>(result.reason), 200u);
   EXPECT_EQ(executor.stop_reason_counts()[0], before + 1) << "the count landed outside the vector";
 }
+
+// BOUND out of range is #BR, vector 5. It was reporting a plain #GP, so a guest with a real #BR
+// handler never reached it. Only compat32 and real16 can decode the instruction at all: in long
+// mode 62 is the EVEX prefix.
+TEST(KuberaDebug, BoundOutOfRangeDispatchesTheBoundRangeVector) {
+  constexpr std::uint64_t kData = 0x6000;
+  constexpr std::uint32_t kBrHandler = 0x9000;
+
+  const auto set_up = [&](seven::CpuState& state, seven::Memory& memory) {
+    state.mode = seven::ExecutionMode::compat32;
+    state.rip = kBase;
+    state.gpr[4] = kStackTop;
+    state.gpr[0] = 100;      // eax, well outside the bounds below
+    state.gpr[3] = kData;    // ebx
+    write_bytes(memory, kBase, {0x62, 0x03});  // bound eax, [ebx]
+    memory.map(kData, 0x1000);
+    memory.map(kStackTop - 0x1000, 0x1000);
+    const std::uint32_t bounds[2] = {10u, 20u};
+    (void)memory.write(kData, bounds, sizeof(bounds));
+  };
+
+  {
+    seven::CpuState state{};
+    seven::Memory memory{};
+    seven::Executor executor{};
+    set_up(state, memory);
+    state.idtr.base = kIdtBase;
+    state.idtr.limit = 0x1000 - 1;
+    memory.map(kIdtBase, 0x1000);
+    memory.map(kBrHandler, 0x1000);
+    write_idt_gate32(memory, kIdtBase, 5, 0x08, kBrHandler, 0x8E);
+
+    const auto result = executor.step(state, memory);
+    EXPECT_EQ(result.reason, seven::StopReason::none) << "the #BR should have been delivered";
+    EXPECT_EQ(state.rip, kBrHandler) << "and it should land in the guest's own handler";
+  }
+
+  {
+    // With no IDT there is nothing to deliver to, and dispatch_interrupt's own fallback is the #GP
+    // this used to report unconditionally. That keeps the no-IDT guest seeing what it always saw.
+    seven::CpuState state{};
+    seven::Memory memory{};
+    seven::Executor executor{};
+    set_up(state, memory);
+    EXPECT_EQ(executor.step(state, memory).reason, seven::StopReason::general_protection);
+  }
+
+  {
+    // In range is still unremarkable.
+    seven::CpuState state{};
+    seven::Memory memory{};
+    seven::Executor executor{};
+    set_up(state, memory);
+    state.gpr[0] = 15;
+    EXPECT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+    EXPECT_EQ(state.rip, kBase + 2);
+  }
+}

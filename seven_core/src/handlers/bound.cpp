@@ -2,6 +2,10 @@
 
 namespace seven::handlers {
 
+// Out of range is #BR, vector 5, not #GP. It is a fault, so the frame carries this instruction's
+// own rip rather than the next one, and it is hardware-generated, so the gate's DPL is not checked
+// the way INT n's is. A guest with no IDT still ends up with #GP, since that is what
+// dispatch_interrupt falls back to when the vector has no entry.
 ExecutionResult handle_code_BOUND_R16_M1616(ExecutionContext& ctx) {
   const auto destination = detail::read_register(ctx.state, ctx.instr.op_register(0));
 
@@ -16,7 +20,7 @@ ExecutionResult handle_code_BOUND_R16_M1616(ExecutionContext& ctx) {
   const auto lower_sign = static_cast<std::int16_t>(lower);
   const auto upper_sign = static_cast<std::int16_t>(upper);
   if (destination_sign < lower_sign || destination_sign > upper_sign) {
-    return {StopReason::general_protection, 0, ExceptionInfo{StopReason::general_protection, ctx.state.rip, 0}, ctx.instr.code()};
+    return detail::dispatch_interrupt(ctx, 5u, ctx.state.rip);
   }
   return {};
 }
@@ -35,7 +39,7 @@ ExecutionResult handle_code_BOUND_R32_M3232(ExecutionContext& ctx) {
   const auto lower_sign = static_cast<std::int32_t>(lower);
   const auto upper_sign = static_cast<std::int32_t>(upper);
   if (destination_sign < lower_sign || destination_sign > upper_sign) {
-    return {StopReason::general_protection, 0, ExceptionInfo{StopReason::general_protection, ctx.state.rip, 0}, ctx.instr.code()};
+    return detail::dispatch_interrupt(ctx, 5u, ctx.state.rip);
   }
   return {};
 }

@@ -390,3 +390,43 @@ TEST(KuberaDecoder, ASegmentOverrideStillAppliesToARipRelativeOperand) {
   EXPECT_EQ(result.reason, seven::StopReason::none);
   EXPECT_EQ(state.gpr[0], marker);
 }
+
+// Outside 64-bit mode, C4, C5 and 62 are only a VEX or EVEX prefix when the byte after them has
+// mod == 3. With mod != 3 they are LES, LDS and BOUND. The three prefix handlers each carry a
+// handler_mem for exactly that case and all three ignored it and decoded as a prefix regardless,
+// so those instructions were undecodable in the two modes that have them -- BOUND's handler was
+// sitting there unreachable -- and the reported length was wrong on top of it, which desynchronises
+// everything walking the stream afterwards.
+TEST(KuberaDecoder, TheLegacyFormsOfTheVexAndEvexOpcodesStillDecode) {
+  struct Case { const char* name; std::uint8_t op; iced_x86::Code in16; iced_x86::Code in32; };
+  const Case cases[] = {
+      {"bound", 0x62, iced_x86::Code::BOUND_R16_M1616, iced_x86::Code::BOUND_R32_M3232},
+      {"les", 0xC4, iced_x86::Code::LES_R16_M1616, iced_x86::Code::LES_R32_M1632},
+      {"lds", 0xC5, iced_x86::Code::LDS_R16_M1616, iced_x86::Code::LDS_R32_M1632},
+  };
+
+  for (const auto& c : cases) {
+    // modrm 0x03 is mod=00 rm=011, so a memory operand: the legacy form, not a prefix.
+    const std::vector<std::uint8_t> bytes = {c.op, 0x03, 0x10, 0x20, 0x30, 0x40, 0x50};
+    for (const std::uint32_t bitness : {16u, 32u}) {
+      iced_x86::Decoder dec(bitness, std::span<const std::uint8_t>(bytes.data(), bytes.size()), 0);
+      const auto decoded = dec.decode();
+      ASSERT_TRUE(decoded.has_value()) << c.name << " at bitness " << bitness;
+      EXPECT_EQ(decoded->code(), bitness == 16 ? c.in16 : c.in32) << c.name << " at bitness " << bitness;
+      EXPECT_EQ(decoded->length(), 2u) << c.name << " consumes only the opcode and its modrm";
+    }
+
+    // In long mode there is no legacy form: all three are always a prefix, and this encoding is
+    // not a valid one, so it must still be rejected rather than silently becoming an instruction.
+    iced_x86::Decoder dec64(64, std::span<const std::uint8_t>(bytes.data(), bytes.size()), 0);
+    const auto decoded64 = dec64.decode();
+    EXPECT_FALSE(decoded64.has_value() && decoded64->code() == c.in32) << c.name << " has no legacy form in long mode";
+  }
+
+  // mod == 3 still selects the prefix in 32-bit mode, which is the half that already worked.
+  const std::vector<std::uint8_t> vex = {0xC5, 0xF9, 0x6E, 0xC1};  // vmovd xmm0, ecx
+  iced_x86::Decoder dec(32, std::span<const std::uint8_t>(vex.data(), vex.size()), 0);
+  const auto decoded = dec.decode();
+  ASSERT_TRUE(decoded.has_value());
+  EXPECT_EQ(decoded->code(), iced_x86::Code::VEX_VMOVD_XMM_RM32);
+}
