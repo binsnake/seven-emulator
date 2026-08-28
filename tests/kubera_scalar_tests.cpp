@@ -2786,3 +2786,273 @@ TEST(KuberaScalar, FxtractSplitsTheExponentFromTheSignificand) {
   EXPECT_EQ(static_cast<double>(state.x87_get(0)), 1.5) << "the significand is pushed";
   EXPECT_EQ(static_cast<double>(state.x87_get(1)), 3.0) << "the unbiased exponent stays below it";
 }
+
+// Hardware derives the tag from the register's own bits, so anything that is not a plain normalized
+// number reads back as SPECIAL. x87_set and x87_push settled it with `(value == 0) ? zero : valid`,
+// which is what a guest saw through FNSTENV and FNSAVE for every infinity, NaN, denormal and
+// unnormal it had ever written.
+TEST(KuberaScalar, TheTagWordReportsSpecialForEverythingThatIsNotAnOrdinaryNumber) {
+  {
+    X87Fixture f;
+    f.state.gpr[1] = kX87Data + 0x100;
+    write_extf80(f.memory, kX87Data + 0x00, 0x8000000000000000ull, 0x7FFF);  // +infinity
+    write_extf80(f.memory, kX87Data + 0x10, 0xC000000000000000ull, 0x7FFF);  // a quiet NaN
+    write_extf80(f.memory, kX87Data + 0x20, 0x4000000000000000ull, 0x0000);  // a denormal
+    write_extf80(f.memory, kX87Data + 0x30, 0x4000000000000000ull, 0x4000);  // an unnormal
+    write_extf80(f.memory, kX87Data + 0x40, 0x8000000000000000ull, 0x3FFF);  // 1.0
+    write_extf80(f.memory, kX87Data + 0x50, 0x0000000000000000ull, 0x0000);  // +0.0
+    // six fld tbyte, then fnstenv [rcx]
+    f.load_code("DB 2B DB 6B 10 DB 6B 20 DB 6B 30 DB 6B 40 DB 6B 50 D9 31");
+    f.run(7);
+
+    std::uint16_t ftw = 0;
+    ASSERT_TRUE(f.memory.read(kX87Data + 0x100 + 8, &ftw, sizeof(ftw)));
+    // Two bits per PHYSICAL register, and the six pushes filled R7 down to R2.
+    EXPECT_EQ(ftw, 0xAA1Fu) << "special, special, special, special, valid, zero, then two empties";
+  }
+  {
+    // The indefinite a stack overflow leaves behind is a NaN, so it is special too.
+    X87Fixture f;
+    f.state.gpr[1] = kX87Data + 0x100;
+    // nine fld1 against an eight-register stack, then fnsave [rcx]
+    f.load_code("D9 E8 D9 E8 D9 E8 D9 E8 D9 E8 D9 E8 D9 E8 D9 E8 D9 E8 DD 31");
+    f.run(10);
+
+    std::uint16_t ftw = 0;
+    ASSERT_TRUE(f.memory.read(kX87Data + 0x100 + 8, &ftw, sizeof(ftw)));
+    EXPECT_EQ(ftw, 0x8000u) << "seven ordinary 1.0s and the overflow's indefinite on top";
+  }
+}
+
+// C1 means the rounding pushed the result away from zero, and every operation with a defined C1
+// writes it. seven wrote it from the compares and the stack faults and nowhere else, so an ordinary
+// FADD left whatever the guest happened to be carrying.
+TEST(KuberaScalar, OrdinaryArithmeticWritesC1FromTheRoundingDirection) {
+  // Each case starts with C1 already holding the opposite of the answer, so a handler that never
+  // writes it cannot pass by accident.
+  const auto add_to_one = [](std::uint64_t addend_bits, bool seed_c1) {
+    X87Fixture f;
+    f.state.gpr[1] = kX87Data + 64;
+    EXPECT_TRUE(f.memory.write(kX87Data + 64, &addend_bits, sizeof(addend_bits)));
+    auto sw = f.state.get_x87_status_word();
+    sw = seed_c1 ? static_cast<std::uint16_t>(sw | 0x0200u) : static_cast<std::uint16_t>(sw & ~0x0200u);
+    f.state.set_x87_status_word(sw);
+    f.load_code("D9 E8 DC 01");  // fld1 ; fadd qword [rcx]
+    f.run(2);
+    return f.status();
+  };
+
+  // 1.0 carries a 2^-63 ulp here, so three quarters of one rounds to the next and a quarter does not.
+  const auto away_from_zero = add_to_one(0x3BF8000000000000ull, false);  // 3 * 2^-65
+  EXPECT_EQ(away_from_zero & 0x0020u, 0x0020u) << "#P";
+  EXPECT_EQ(away_from_zero & 0x0200u, 0x0200u) << "C1: the sum was rounded up";
+
+  const auto toward_zero = add_to_one(0x3BE0000000000000ull, true);  // 2^-65
+  EXPECT_EQ(toward_zero & 0x0020u, 0x0020u) << "#P";
+  EXPECT_EQ(toward_zero & 0x0200u, 0u) << "C1: the same magnitude of loss, the other direction";
+
+  const auto exact = add_to_one(0x3FF0000000000000ull, true);  // 1.0
+  EXPECT_EQ(exact & 0x0020u, 0u) << "1 + 1 loses nothing";
+  EXPECT_EQ(exact & 0x0200u, 0u) << "and an exact result clears C1 rather than leaving it alone";
+}
+
+// An m32 or m64 operand has to be classified in its own format. Once widened it is an ordinary
+// 80-bit normal, so the #D hardware raises for a denormal could never be seen, and the widening went
+// through the host's float, which quietens a signalling NaN before anything can report #IA.
+TEST(KuberaScalar, NarrowMemoryOperandsAreClassifiedBeforeTheyAreWidened) {
+  const auto fld_m32 = [](std::uint32_t bits) {
+    X87Fixture f;
+    f.state.gpr[1] = kX87Data + 64;
+    EXPECT_TRUE(f.memory.write(kX87Data + 64, &bits, sizeof(bits)));
+    f.load_code("D9 01");  // fld dword [rcx]
+    f.run(1);
+    return f.status();
+  };
+
+  EXPECT_EQ(fld_m32(0x00000001u) & 0x0002u, 0x0002u) << "the smallest denormal float is #D";
+  EXPECT_EQ(fld_m32(0x7F800001u) & 0x0001u, 0x0001u) << "a signalling NaN float is #IA";
+  EXPECT_EQ(fld_m32(0x3F800000u) & 0x0003u, 0u) << "and 1.0f is neither";
+
+  {
+    X87Fixture f;
+    f.state.gpr[1] = kX87Data + 64;
+    const std::uint64_t denormal = 0x0000000000000001ull;
+    ASSERT_TRUE(f.memory.write(kX87Data + 64, &denormal, sizeof(denormal)));
+    f.load_code("D9 E8 DC 01");  // fld1 ; fadd qword [rcx]
+    f.run(2);
+    EXPECT_EQ(f.status() & 0x0002u, 0x0002u) << "the arithmetic forms classify their operand too";
+  }
+  {
+    X87Fixture f;
+    f.state.gpr[1] = kX87Data + 64;
+    const std::uint32_t snan = 0x7FA00000u;
+    ASSERT_TRUE(f.memory.write(kX87Data + 64, &snan, sizeof(snan)));
+    f.load_code("D9 E8 D8 01");  // fld1 ; fadd dword [rcx]
+    f.run(2);
+    EXPECT_EQ(f.status() & 0x0001u, 0x0001u) << "#IA";
+    EXPECT_TRUE(seven::isnan(f.state.x87_get(0)));
+    EXPECT_FALSE(seven::issnan(f.state.x87_get(0))) << "and the answer is that NaN, quietened";
+  }
+}
+
+// FLD ST(i) reads a register like any other operand, so an empty source is a stack underflow and the
+// indefinite is what gets pushed. It used to hand back a value the guest had already popped, with no
+// #IS to say anything had gone wrong.
+TEST(KuberaScalar, FldStiFromAnEmptyRegisterPushesTheIndefinite) {
+  X87Fixture f;
+  write_extf80(f.memory, kX87Data, 0xA5A5A5A5A5A5A5A5ull, 0x4000);
+  // fld tbyte [rbx] ; ffree st(0) ; fld st(0)
+  f.load_code("DB 2B DD C0 D9 C0");
+  f.run(3);
+
+  EXPECT_EQ(f.state.x87_get(0).val.signExp, 0xFFFFu) << "the indefinite, not the freed register";
+  EXPECT_EQ(f.state.x87_get(0).val.signif, 0xC000000000000000ull);
+  EXPECT_EQ(f.status() & 0x0041u, 0x0041u) << "IE and SF";
+}
+
+// The five irrational constants are not baked-in values: hardware correctly rounds the true
+// irrational under the guest's rounding control. The old code went through Float80(double), which
+// threw away eleven bits of significand before RC could matter.
+TEST(KuberaScalar, TheIrrationalConstantsAreRoundedUnderTheGuestsRoundingControl) {
+  constexpr std::uint16_t kNearest = 0x037F;
+  constexpr std::uint16_t kTowardZero = 0x0F7F;
+  const auto load_constant = [](const char* code, std::uint16_t control_word) {
+    X87Fixture f;
+    EXPECT_TRUE(f.memory.write(kX87Data + 32, &control_word, sizeof(control_word)));
+    f.load_code(code);
+    f.run(2);
+    return f.state.x87_get(0);
+  };
+
+  struct Constant {
+    const char* name;
+    const char* code;  // fldcw [rbx+0x20] ; the constant
+    std::uint16_t sign_exp;
+    std::uint64_t truncated;
+    std::uint64_t nearest;
+  };
+  const Constant constants[] = {
+      {"fldl2t", "D9 6B 20 D9 E9", 0x4000, 0xD49A784BCD1B8AFEull, 0xD49A784BCD1B8AFEull},
+      {"fldl2e", "D9 6B 20 D9 EA", 0x3FFF, 0xB8AA3B295C17F0BBull, 0xB8AA3B295C17F0BCull},
+      {"fldpi", "D9 6B 20 D9 EB", 0x4000, 0xC90FDAA22168C234ull, 0xC90FDAA22168C235ull},
+      {"fldlg2", "D9 6B 20 D9 EC", 0x3FFD, 0x9A209A84FBCFF798ull, 0x9A209A84FBCFF799ull},
+      {"fldln2", "D9 6B 20 D9 ED", 0x3FFE, 0xB17217F7D1CF79ABull, 0xB17217F7D1CF79ACull},
+  };
+
+  for (const auto& c : constants) {
+    const auto nearest = load_constant(c.code, kNearest);
+    EXPECT_EQ(nearest.val.signExp, c.sign_exp) << c.name;
+    EXPECT_EQ(nearest.val.signif, c.nearest) << c.name << " under RC = nearest";
+
+    const auto truncated = load_constant(c.code, kTowardZero);
+    EXPECT_EQ(truncated.val.signExp, c.sign_exp) << c.name;
+    EXPECT_EQ(truncated.val.signif, c.truncated) << c.name << " under RC = toward zero";
+  }
+
+  EXPECT_NE(load_constant("D9 6B 20 D9 EB", kNearest).val.signif,
+            load_constant("D9 6B 20 D9 EB", kTowardZero).val.signif)
+      << "pi is irrational, so no single answer can serve both rounding modes";
+}
+
+// A NaN, an infinity and an unnormal have no integer at all: hardware raises #IA, stores the integer
+// indefinite and stops. seven rounded them first, so it reported a #P for a rounding that never
+// happened, and an unnormal came back as an ordinary number with nothing raised at all.
+TEST(KuberaScalar, FistOfAValueWithNoIntegerRaisesInvalidAndNotPrecision) {
+  const auto store_integer = [](const char* what, const char* code, std::uint64_t significand,
+                                std::uint16_t sign_exp) {
+    X87Fixture f;
+    f.state.gpr[1] = kX87Data + 64;
+    write_extf80(f.memory, kX87Data, significand, sign_exp);
+    f.state.set_x87_status_word(static_cast<std::uint16_t>(f.state.get_x87_status_word() | 0x0200u));
+    f.load_code(code);
+    f.run(2);
+
+    std::uint32_t stored = 0;
+    EXPECT_TRUE(f.memory.read(kX87Data + 64, &stored, sizeof(stored)));
+    EXPECT_EQ(stored, 0x80000000u) << what << ": the integer indefinite";
+    EXPECT_EQ(f.status() & 0x0001u, 0x0001u) << what << ": #IA";
+    EXPECT_EQ(f.status() & 0x0020u, 0u) << what << ": nothing was rounded, so no #P";
+    EXPECT_EQ(f.status() & 0x0200u, 0u) << what << ": and no rounding direction to report";
+  };
+
+  // fld tbyte [rbx] ; fist / fistp / fisttp dword [rcx]
+  store_integer("fist of a quiet NaN", "DB 2B DB 11", 0xC000000000000000ull, 0x7FFF);
+  store_integer("fistp of an unnormal", "DB 2B DB 19", 0x4000000000000000ull, 0x4000);
+  store_integer("fisttp of +infinity", "DB 2B DB 09", 0x8000000000000000ull, 0x7FFF);
+}
+
+// The FCOMI family writes all six status flags, not just the three it has answers for. Leaving OF,
+// SF and AF alone let whatever the guest was carrying survive the compare.
+TEST(KuberaScalar, FcomiAndFucomiClearOverflowSignAndAdjust) {
+  // fld1 ; fld1 ; fcomi st(1) / fucomi st(1)
+  for (const auto* code : {"D9 E8 D9 E8 DB F1", "D9 E8 D9 E8 DB E9"}) {
+    X87Fixture f;
+    f.state.rflags = 0x202 | seven::kFlagOF | seven::kFlagSF | seven::kFlagAF;
+    f.load_code(code);
+    f.run(3);
+
+    EXPECT_EQ(f.state.rflags & (seven::kFlagOF | seven::kFlagSF | seven::kFlagAF), 0u) << code;
+    EXPECT_NE(f.state.rflags & seven::kFlagZF, 0u) << code << ": 1.0 equals 1.0";
+    EXPECT_EQ(f.state.rflags & seven::kFlagCF, 0u) << code;
+    EXPECT_EQ(f.state.rflags & seven::kFlagPF, 0u) << code;
+  }
+}
+
+// An empty operand has nothing to compare, so the unordered answer IS the answer. The compares set
+// it and then fell through into an ordinary comparison of whatever stale bits were left in the
+// register, and reported a bare #IA rather than the stack fault it is.
+TEST(KuberaScalar, TheComparesRaiseAStackFaultAndStopOnAnEmptyOperand) {
+  {
+    X87Fixture f;
+    f.state.rflags = 0x202;
+    f.load_code("D9 E8 DF F1");  // fld1 ; fcomip st(1), with ST(1) empty
+    f.run(2);
+
+    constexpr std::uint64_t kUnordered = seven::kFlagZF | seven::kFlagPF | seven::kFlagCF;
+    EXPECT_EQ(f.state.rflags & kUnordered, kUnordered) << "the comparison never happened";
+    EXPECT_EQ(f.status() & 0x0041u, 0x0041u) << "IE and SF";
+    EXPECT_EQ(f.state.get_x87_top(), 0u) << "and the pop still retires";
+  }
+  {
+    X87Fixture f;
+    f.state.gpr[1] = kX87Data + 64;
+    const double one = 1.0;
+    ASSERT_TRUE(f.memory.write(kX87Data + 64, &one, sizeof(one)));
+    f.load_code("DC 19");  // fcomp qword [rcx], with ST(0) empty
+    f.run(1);
+
+    EXPECT_EQ(f.status() & 0x4700u, 0x4500u) << "C3, C2 and C0 all set: unordered";
+    EXPECT_EQ(f.status() & 0x0041u, 0x0041u) << "IE and SF";
+    EXPECT_EQ(f.state.get_x87_top(), 1u);
+  }
+}
+
+// FFREEP marks a register empty and then advances TOP, and neither half asks whether anything was
+// there. Going through x87_pop() meant `ffreep st(0)` freed ST(0), found it empty, and reported a
+// stack underflow that hardware never raises.
+TEST(KuberaScalar, FfreepDoesNotRaiseAPhantomStackFault) {
+  X87Fixture f;
+  f.load_code("D9 E8 DF C0");  // fld1 ; ffreep st(0)
+  f.run(2);
+
+  EXPECT_EQ(f.status() & 0x0041u, 0u) << "freeing and popping are both unconditional here";
+  EXPECT_EQ(f.state.get_x87_top(), 0u) << "and TOP still advances";
+  EXPECT_TRUE(f.state.x87_is_empty(7)) << "the register that was freed";
+}
+
+// A quiet NaN operand is not an invalid operation: the partial remainder propagates it. seven raised
+// #IA and handed back the indefinite, which loses the NaN's payload along with the class.
+TEST(KuberaScalar, FpremAndFprem1PropagateAQuietNan) {
+  // fld1 ; fld tbyte [rbx] ; fprem / fprem1
+  for (const auto* code : {"D9 E8 DB 2B D9 F8", "D9 E8 DB 2B D9 F5"}) {
+    X87Fixture f;
+    write_extf80(f.memory, kX87Data, 0xC123456789ABCDEFull, 0x7FFF);
+    f.load_code(code);
+    f.run(3);
+
+    EXPECT_EQ(f.status() & 0x0001u, 0u) << code << ": a quiet NaN is not an invalid operand";
+    EXPECT_EQ(f.state.x87_get(0).val.signExp, 0x7FFFu) << code;
+    EXPECT_EQ(f.state.x87_get(0).val.signif, 0xC123456789ABCDEFull) << code << ": payload and all";
+    EXPECT_EQ(f.status() & 0x0400u, 0u) << code << ": C2 clear, there is nothing left to reduce";
+  }
+}
