@@ -9,7 +9,40 @@
 #include <gtest/gtest.h>
 
 #include "seven/executor.hpp"
+#include "seven/guarded_allocator.hpp"
 #include "seven/memory.hpp"
+
+#if defined(_MSC_VER)
+#include <excpt.h>
+
+namespace {
+
+constexpr unsigned kAccessViolation = 0xC0000005u;
+
+// __try/__except cannot share a frame with anything that unwinds, so the probes are their own
+// functions. The volatile pointer keeps the access from being optimized away.
+bool reading_faults(const volatile std::byte* p) {
+  __try {
+    (void)*p;
+    return false;
+  } __except (GetExceptionCode() == kAccessViolation ? EXCEPTION_EXECUTE_HANDLER
+                                                     : EXCEPTION_CONTINUE_SEARCH) {
+    return true;
+  }
+}
+
+bool writing_faults(volatile std::byte* p) {
+  __try {
+    *p = std::byte{0xCC};
+    return false;
+  } __except (GetExceptionCode() == kAccessViolation ? EXCEPTION_EXECUTE_HANDLER
+                                                     : EXCEPTION_CONTINUE_SEARCH) {
+    return true;
+  }
+}
+
+}  // namespace
+#endif
 
 // Regression test for a real integer-overflow bug in Memory::find_mmio_region: address + size can
 // wrap past the top of the 64-bit address space for a guest-chosen address near ~0ull, and the
@@ -1299,3 +1332,119 @@ TEST(KuberaMemory, AnAccessHookThatReentersForeverStopsInsteadOfExhaustingTheSta
   EXPECT_LE(depth_max, seven::Executor::kMaxStepDepth + 2)
       << "the re-entry ran deeper than the step-depth cap should ever allow";
 }
+
+// The cap above counts levels, but what has to actually fit on the host stack is bytes: one full
+// re-entry cycle (step -> step_impl -> handler -> Memory::read -> hook) times the cap. Nothing
+// checks that product, so the cap only stops a crash if the per-level cost stays small. It does not
+// on every build -- an AddressSanitizer build, which pads every local with redzones and stops
+// reusing slots between scopes, blows a default 1 MiB stack partway through the cap. This pins the
+// per-level cost to a measured number so a frame that grows quietly gets caught here first.
+TEST(KuberaMemory, ReentrantStepCostsABoundedNumberOfStackBytesPerLevel) {
+  constexpr std::uint64_t kBase = 0x1000;
+  constexpr std::uint64_t kData = 0x4000;
+
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.gpr[3] = kData;  // rbx
+
+  memory.map(kBase, 0x1000);
+  memory.map(kData, 0x1000);
+  const std::uint8_t code[] = {0x48, 0x8B, 0x03};  // mov rax, [rbx]
+  ASSERT_TRUE(memory.write(kBase, code, sizeof(code)));
+
+  // One probe per nesting level, in entry order, so consecutive differences are the cost of exactly
+  // one cycle. Scoped to the data page for the same reason as the test above.
+  std::vector<const char*> marks;
+  const auto hook = memory.add_access_hook(
+      [&](const seven::MemoryAccessEvent&) {
+        volatile char probe = 0;
+        marks.push_back(const_cast<const char*>(&probe));
+        seven::CpuState nested = state;
+        nested.rip = kBase;
+        (void)executor.step(nested, memory);
+        return true;
+      },
+      seven::MemoryHookRange{kData, 0x1000});
+  (void)hook;
+
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(result.reason, seven::StopReason::none);
+  ASSERT_GE(marks.size(), 2u) << "need two nesting levels before a per-level cost means anything";
+
+  // Stack grows down, so each deeper probe sits at a lower address than the one before it.
+  std::ptrdiff_t worst_level = 0;
+  for (std::size_t i = 1; i < marks.size(); ++i) {
+    worst_level = std::max(worst_level, marks[i - 1] - marks[i]);
+  }
+  ASSERT_GT(worst_level, 0) << "probes did not descend, so this measured nothing";
+
+  // What the guard promises: the whole re-entry descends no further than the byte budget, plus the
+  // single frame that was already entered when the check for it ran. Asserting the measured total
+  // rather than a projection from the level cap is the point -- the level cap on its own permitted
+  // roughly 950 KB here, which is what made a 1 MiB stack a coin toss.
+  const auto total = static_cast<std::size_t>(marks.front() - marks.back());
+  const auto allowed = seven::Executor::kMaxStepStackBytes + static_cast<std::size_t>(worst_level);
+  EXPECT_LE(total, allowed)
+      << "the re-entry descended " << total << " bytes of host stack with a budget of "
+      << seven::Executor::kMaxStepStackBytes << " and a per-level cost of " << worst_level
+      << " bytes, so the descent is not being bounded by the byte budget any more.";
+}
+
+#if defined(_MSC_VER)
+// The guarded build's whole claim is that an access one byte past a guest page stops in hardware.
+// Nothing else in the suite can check that: every other test goes through Memory's own bounds
+// checks, and the accesses this is meant to catch are the ones that skip those -- the JIT's fast
+// path stores through the raw pointer page_data() hands out, from code it emitted itself, which no
+// sanitizer and no bounds check ever sees.
+//
+// So this test takes that exact pointer and walks off the end of it. It has to fail in the default
+// build for the guarded build's pass to mean anything, which is why the two halves assert opposite
+// things rather than the disabled half quietly passing.
+TEST(KuberaMemory, GuardedBuildFaultsOnAnAccessOneBytePastAGuestPage) {
+  if (!seven::kGuardedPagesEnabled) {
+    GTEST_SKIP() << "built without SEVEN_GUARDED_PAGES, so there is no guard page to hit";
+  }
+
+  seven::Memory memory;
+  memory.map(0x4000, seven::Memory::kPageSize);
+
+  auto* page = memory.page_data(0x4000 / seven::Memory::kPageSize);
+  ASSERT_NE(page, nullptr);
+
+  // The last byte the guest owns has to stay readable and writable, or the guard is simply sitting
+  // in the wrong place and the test would pass for the wrong reason.
+  EXPECT_FALSE(reading_faults(page + seven::Memory::kPageSize - 1));
+  EXPECT_FALSE(writing_faults(page + seven::Memory::kPageSize - 1));
+
+  EXPECT_TRUE(reading_faults(page + seven::Memory::kPageSize))
+      << "a read one byte past the page did not fault, so the page bytes are not ending against "
+         "the guard page";
+  EXPECT_TRUE(writing_faults(page + seven::Memory::kPageSize))
+      << "a write one byte past the page did not fault, so an emitted store that overruns a page "
+         "would still be landing in live heap memory";
+}
+
+// A one-byte overrun is the friendly case. The failure this is really aimed at is an access whose
+// width disagrees with the bounds check that let it through, which lands several bytes over.
+TEST(KuberaMemory, GuardedBuildFaultsOnAWideAccessStraddlingTheEndOfAGuestPage) {
+  if (!seven::kGuardedPagesEnabled) {
+    GTEST_SKIP() << "built without SEVEN_GUARDED_PAGES, so there is no guard page to hit";
+  }
+
+  seven::Memory memory;
+  memory.map(0x8000, seven::Memory::kPageSize);
+
+  auto* page = memory.page_data(0x8000 / seven::Memory::kPageSize);
+  ASSERT_NE(page, nullptr);
+
+  // Eight bytes starting four from the end: the first four are the guest's, the rest are not.
+  for (std::size_t i = 0; i < 8; ++i) {
+    const bool past_the_end = (seven::Memory::kPageSize - 4 + i) >= seven::Memory::kPageSize;
+    EXPECT_EQ(writing_faults(page + seven::Memory::kPageSize - 4 + i), past_the_end)
+        << "byte " << i << " of a straddling 8-byte store behaved unexpectedly";
+  }
+}
+#endif

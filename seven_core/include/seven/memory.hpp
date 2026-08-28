@@ -8,6 +8,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "seven/guarded_allocator.hpp"
+
 namespace seven {
 
 enum class MemoryAccessKind : std::uint8_t {
@@ -345,7 +347,14 @@ class Memory {
   // Mutable because read() and read_code_page() are const and still dispatch to a device.
   mutable std::uint64_t device_dispatch_count_ = 0;
 
-  std::unordered_map<std::uint64_t, PageEntry> pages_;
+  // The allocator is std::allocator unless SEVEN_GUARDED_PAGES is defined, in which case each node
+  // is placed with its last byte against an unmapped page -- see guarded_allocator.hpp. PageEntry's
+  // byte array is its last member (the static_assert above keeps it there), so that page is what an
+  // access running off the end of a guest page hits, including one issued by JIT-emitted code that
+  // no sanitizer can instrument.
+  std::unordered_map<std::uint64_t, PageEntry, std::hash<std::uint64_t>, std::equal_to<std::uint64_t>,
+                     PageMapAllocator<std::pair<const std::uint64_t, PageEntry>>>
+      pages_;
   // Which Memory the two caches below were filled for, by instance_id() rather than by address.
   // Copying a Memory deep-copies pages_ into fresh PageEntry objects, but tlb_ and jit_tlb come
   // across holding raw pointers into the SOURCE object's pages -- so without noticing, the copy
