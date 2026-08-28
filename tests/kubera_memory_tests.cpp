@@ -829,6 +829,57 @@ TEST(KuberaMemory, SelfModifyingCodeThroughAPassthroughInvalidatesTheDecodeCache
   EXPECT_EQ(state.gpr[0], 10u) << "the rewritten sub rax, rcx has to be what ran";
 }
 
+// page_code_epoch() gated on passthrough_read_ alone. A write-only passthrough is a legitimate
+// configuration (reads stay page-backed), and its writes bump only the global counter, never a
+// PageEntry -- so every page reported its stale per-entry epoch and a write through the passthrough
+// never looked like it changed anything.
+TEST(KuberaMemory, AWriteOnlyPassthroughWriteMovesThePageEpoch) {
+  seven::Memory memory{};
+  memory.map(0x1000, 0x1000);
+  memory.set_passthrough(nullptr, [](std::uint64_t, const void*, std::size_t) { return true; });
+  // Captured after the install: set_passthrough re-stamps every page epoch, so the only thing left
+  // to move page_code_epoch is the write itself -- which is exactly what the bug missed.
+  const auto before = memory.page_code_epoch(1);
+  std::uint8_t byte = 0;
+  ASSERT_TRUE(memory.write(0x1000, &byte, 1));
+  EXPECT_NE(memory.page_code_epoch(1), before)
+      << "a passthrough write bumps only the global epoch; page_code_epoch has to report it";
+}
+
+// The same hole one layer up: a decode cache keyed on page_code_epoch() replayed pre-modification
+// bytes when the store went through a write-only passthrough. Mirrors the read+write case above,
+// with reads left on the page-backed path so PageEntries actually exist to go stale.
+TEST(KuberaMemory, SelfModifyingCodeThroughAWriteOnlyPassthroughInvalidatesTheDecodeCache) {
+  seven::Memory memory{};
+  memory.map(0x1000, 0x1000);
+  memory.set_passthrough(nullptr, [&](std::uint64_t address, const void* src, std::size_t size) {
+    auto* page = memory.page_data(address / 0x1000);
+    if (page == nullptr) return false;
+    std::memcpy(page + (address % 0x1000), src, size);
+    return true;
+  });
+
+  const std::uint8_t add_code[3] = {0x48, 0x01, 0xC8};  // add rax, rcx
+  ASSERT_TRUE(memory.write(0x1000, add_code, sizeof(add_code)));
+
+  seven::CpuState state{};
+  state.mode = seven::ExecutionMode::long64;
+  state.gpr[0] = 10;  // rax
+  state.gpr[1] = 3;   // rcx
+
+  seven::Executor executor{};
+  state.rip = 0x1000;
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+  EXPECT_EQ(state.gpr[0], 13u) << "sanity: add rax, rcx";
+
+  const std::uint8_t sub_opcode = 0x29;  // add -> sub
+  ASSERT_TRUE(memory.write(0x1001, &sub_opcode, 1));
+
+  state.rip = 0x1000;
+  ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+  EXPECT_EQ(state.gpr[0], 10u) << "the rewritten sub rax, rcx has to be what ran";
+}
+
 // jit_bypass_eligible answers "is it safe for a codegen layer to run a span without going through
 // step() at all". It listed hooks, the trap flag and DR7, but not the context-sync callbacks --
 // which are per-instruction machinery in exactly the same sense, just not stored as hooks. A
