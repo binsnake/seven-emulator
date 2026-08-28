@@ -59,6 +59,35 @@ TEST(KuberaDecoder, EvexRegisterIndexDoesNotCountTheBBitTwice) {
   }
 }
 
+// The same double count reached the memory base, which was missed because the fix above only
+// touched the register operands. A memory base is four bits wide, rm plus EVEX.B; EVEX.X extends
+// the SIB index and nothing else, and read_sib already applies it there. Adding
+// extra_base_register_base_evex (which packs B and X together) on top of extra_base_register_base
+// counted B twice and folded X in on top, so vmovups zmm0, [r8] named EIP as its base and every
+// AVX-512 access through r8-r15 addressed off the wrong register. Past RIP the index walks on into
+// the segment registers and the vector file.
+TEST(KuberaDecoder, EvexMemoryBaseDoesNotCountTheBBitTwice) {
+  struct Case { const char* name; const char* bytes; iced_x86::Register expected; };
+  const Case cases[] = {
+      // vmovups zmm0, [rcx] -- nothing extended
+      {"[rcx]", "62 F1 7C 48 10 01", iced_x86::Register::RCX},
+      // vmovups zmm0, [r9] -- B extends the base
+      {"[r9] via B", "62 D1 7C 48 10 01", iced_x86::Register::R9},
+      // X is only the SIB index's high bit, so with no SIB byte it must not touch the base
+      {"[rcx] with X set", "62 B1 7C 48 10 01", iced_x86::Register::RCX},
+      // the disp8 and disp32 forms compute the base separately and had the same fault
+      {"[r8+0x10]", "62 D1 7C 48 10 40 10", iced_x86::Register::R8},
+      {"[r8+0x10000]", "62 D1 7C 48 10 80 00 00 01 00", iced_x86::Register::R8},
+      // the SIB path takes B through read_sib instead and must stay where it is
+      {"[r12]", "62 D1 7C 48 10 04 24", iced_x86::Register::R12},
+  };
+  for (const auto& c : cases) {
+    const auto instr = decode(c.bytes);
+    EXPECT_EQ(instr.op1_kind(), iced_x86::OpKind::MEMORY) << c.name << " (" << c.bytes << ")";
+    EXPECT_EQ(instr.memory_base(), c.expected) << c.name << " (" << c.bytes << ")";
+  }
+}
+
 // 0F 20/22 are the control-register moves and 0F 21/23 the debug-register ones, but both pairs land
 // in the same two handlers and those handlers hardcoded Register::CR0 as the base. So MOV r64, DR2
 // reported CR2, and resolve_debug_index rejected it -- the DR0-DR3 watchpoint emulation could not
