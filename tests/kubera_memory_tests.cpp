@@ -587,6 +587,38 @@ TEST(KuberaMemory, CopyAssignmentAlsoDropsTheInheritedCaches) {
   EXPECT_EQ(original_value, before);
 }
 
+// Moving a Memory relocates the map but not its PageEntry nodes, so the destination correctly
+// inherits a jit_tlb that still points at the right storage. The moved-from source is the hazard: a
+// defaulted move leaves its jit_tlb warm too, now naming storage that belongs to the destination,
+// and the JIT fast path reads jit_tlb directly without the reconciliation lookup_page does. A
+// compiled block run against the moved-from Memory would then read and write straight into the
+// destination's pages. The source must come out of a move with its fast path cleared.
+TEST(KuberaMemory, AMovedFromMemoryKeepsNoFastPathIntoItsDestination) {
+  seven::Memory source{};
+  source.map(0x1000, 0x1000);
+  const std::uint32_t seed = 0x33333333;
+  ASSERT_TRUE(source.write(0x1000, &seed, sizeof(seed)));
+
+  // Warm a fast-path slot by hand: the JIT owns this cache in production, but the property under
+  // test is purely that a move clears whatever the source had, and this needs no JIT to state.
+  auto& slot = source.jit_tlb[0];
+  slot.guest_page = 0x1000 / seven::Memory::kPageSize;
+  slot.host_data = source.page_data(slot.guest_page);
+  slot.permissions = 0xFF;
+  ASSERT_NE(slot.host_data, nullptr);
+
+  seven::Memory destination = std::move(source);
+
+  for (const auto& s : source.jit_tlb) {
+    EXPECT_EQ(s.host_data, nullptr) << "a moved-from Memory kept a warm host pointer into the destination";
+    EXPECT_EQ(s.guest_page, ~0ull) << "a moved-from Memory kept a warm page tag";
+  }
+  // The destination still works, and reads its own seed.
+  std::uint32_t value = 0;
+  ASSERT_TRUE(destination.read(0x1000, &value, sizeof(value)));
+  EXPECT_EQ(value, seed);
+}
+
 // Executor's decode and code-page caches are validated on (rip, code_epoch, mode), and code_epoch
 // is a per-Memory counter that every Memory starts near zero. Reusing one Executor across two of
 // them -- separate guests, or one guest torn down and rebuilt -- meant the second could hit a

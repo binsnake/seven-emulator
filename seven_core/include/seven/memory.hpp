@@ -95,7 +95,37 @@ class Memory {
     std::uint8_t permissions = 0;
   };
   static constexpr std::size_t kJitTlbSize = 16;  // power of two -- direct-mapped by guest_page & (kJitTlbSize-1)
-  std::array<JitTlbSlot, kJitTlbSize> jit_tlb{};
+  // Every slot holds a raw pointer into THIS object's pages_, so no slot survives a copy (which
+  // deep-copies those pages) or a move (which hands them to somebody else). lookup_page() already
+  // notices a table filled for a different instance, but it only gets the chance when something
+  // calls a Memory method, and the whole point of this table is that generated code reads it without
+  // calling anything -- a compiled block run straight against a moved-from Memory found its slots
+  // still warm and stored into the object it had been moved into. Resetting here instead makes it
+  // structural: the slots are gone before either object can be used again, whichever path gets there
+  // first. Standard-layout with the array first, so offsetof-computed codegen is unaffected.
+  struct JitTlb {
+    std::array<JitTlbSlot, kJitTlbSize> slots{};
+
+    JitTlb() noexcept = default;
+    JitTlb(const JitTlb&) noexcept {}
+    JitTlb& operator=(const JitTlb&) noexcept { slots = {}; return *this; }
+    JitTlb(JitTlb&& other) noexcept : slots(other.slots) { other.slots = {}; }
+    JitTlb& operator=(JitTlb&& other) noexcept {
+      slots = other.slots;
+      other.slots = {};
+      return *this;
+    }
+
+    [[nodiscard]] JitTlbSlot& operator[](std::size_t index) noexcept { return slots[index]; }
+    [[nodiscard]] const JitTlbSlot& operator[](std::size_t index) const noexcept { return slots[index]; }
+    [[nodiscard]] std::size_t size() const noexcept { return slots.size(); }
+    [[nodiscard]] JitTlbSlot* begin() noexcept { return slots.data(); }
+    [[nodiscard]] JitTlbSlot* end() noexcept { return slots.data() + slots.size(); }
+    [[nodiscard]] const JitTlbSlot* begin() const noexcept { return slots.data(); }
+    [[nodiscard]] const JitTlbSlot* end() const noexcept { return slots.data() + slots.size(); }
+    void clear() noexcept { slots = {}; }
+  };
+  JitTlb jit_tlb{};
   // True whenever an access hook, an MMIO region, or a passthrough callback is active -- any of
   // which means SOME address might need to be intercepted rather than read/written directly, the
   // same condition read()/write() themselves already gate their own internal fast path on. A JIT
@@ -258,7 +288,7 @@ class Memory {
   // Resets every jit_tlb slot to empty. Called anywhere a cached host_data pointer could go stale
   // -- unmap() (erases the underlying PageEntry outright), restore_pages() (rebuilds pages_ from
   // scratch), and reprotect() (permissions, also cached per-slot, could change either direction).
-  void clear_jit_tlb() noexcept { jit_tlb.fill(JitTlbSlot{}); }
+  void clear_jit_tlb() noexcept { jit_tlb.clear(); }
   // Mapping a device changes what a fetch returns without any page being written.
   void invalidate_code_epochs(std::uint64_t base, std::size_t size) noexcept;
   void invalidate_all_code_epochs() noexcept;
@@ -286,15 +316,22 @@ class Memory {
   void invalidate_tlb() noexcept { ++tlb_epoch_; }
 
   // A copy is a different Memory, so it takes a fresh number rather than inheriting one that a
-  // consumer's cache is already tagged with. A move keeps it: the map relocates but its nodes do
-  // not, so a cache filled before the move is still describing the right object.
+  // consumer's cache is already tagged with. A move hands the number to the destination: the map
+  // relocates but its nodes do not, so a cache filled before the move is still describing the right
+  // object. The SOURCE of a move takes a fresh one instead of keeping a duplicate -- its pages have
+  // just become the destination's while its own caches still name them, and leaving both objects
+  // answering to the same number let a cache filled for one be judged current for the other.
   class InstanceIdentity {
    public:
     InstanceIdentity() noexcept : value_(allocate()) {}
     InstanceIdentity(const InstanceIdentity&) noexcept : value_(allocate()) {}
     InstanceIdentity& operator=(const InstanceIdentity&) noexcept { value_ = allocate(); return *this; }
-    InstanceIdentity(InstanceIdentity&&) noexcept = default;
-    InstanceIdentity& operator=(InstanceIdentity&&) noexcept = default;
+    InstanceIdentity(InstanceIdentity&& other) noexcept : value_(other.value_) { other.value_ = allocate(); }
+    InstanceIdentity& operator=(InstanceIdentity&& other) noexcept {
+      value_ = other.value_;
+      other.value_ = allocate();
+      return *this;
+    }
     [[nodiscard]] std::uint64_t value() const noexcept { return value_; }
 
    private:
@@ -306,14 +343,21 @@ class Memory {
   mutable std::uint64_t device_dispatch_count_ = 0;
 
   std::unordered_map<std::uint64_t, PageEntry> pages_;
-  // Whichever Memory the two caches below were filled for. Copying a Memory deep-copies pages_ into
-  // fresh PageEntry objects, but tlb_ and jit_tlb come across holding raw pointers into the SOURCE
-  // object's pages -- so without noticing, the copy would read and write straight through to the
-  // original, and keep doing so after the original is gone. Neither cache holds anything worth
-  // keeping, so a mismatch here just drops both and they refill on the next access. Moving is safe
-  // (an unordered_map move relocates the map, not its nodes) but is treated the same way; it costs
-  // one refill and nothing has to reason about which operation it was.
-  mutable const Memory* cache_owner_ = this;
+  // Which Memory the two caches below were filled for, by instance_id() rather than by address.
+  // Copying a Memory deep-copies pages_ into fresh PageEntry objects, but tlb_ and jit_tlb come
+  // across holding raw pointers into the SOURCE object's pages -- so without noticing, the copy
+  // would read and write straight through to the original, and keep doing so after the original is
+  // gone. Neither cache holds anything worth keeping, so a mismatch here just drops both and they
+  // refill on the next access.
+  //
+  // An address cannot be the tag, for exactly the reason instance_id() itself exists: addresses come
+  // back around. Assigning a Memory from a copy of ITSELF hands the destination its own address back
+  // and the check matched, keeping a table naming the storage that assignment had just freed; two
+  // Memories in sequence at one stack slot or heap block did the same thing across objects. Instance
+  // numbers only ever go up, so the copy's number can never collide with the destination's fresh
+  // one, and a move (which does keep its number, since an unordered_map move relocates the map and
+  // not its nodes) still keeps the caches it is entitled to.
+  mutable std::uint64_t cache_owner_id_ = 0;  // 0 is never a real instance number, so a fresh Memory refills once
   mutable std::array<TlbSlot, kTlbSize> tlb_{};
   std::uint64_t tlb_epoch_ = 1;
   std::vector<AccessHookEntry> access_hooks_;
