@@ -183,7 +183,7 @@ class Executor {
   std::vector<std::pair<HookId, StopHook>> stop_hooks_;
   std::vector<std::pair<HookId, FaultHook>> fault_hooks_;
   std::unordered_map<TrapKind, std::vector<std::pair<HookId, TrapHook>>> trap_hooks_;
-  // Heap-allocated to avoid stack pressure — the combined size (~1 MB) would
+  // Heap-allocated to avoid stack pressure -- the combined size (~1 MB) would
   // blow Windows' default 1 MB thread stack if Executors are stack-allocated.
   std::unique_ptr<std::array<CachedCodePageEntry, kCodePageCacheSize>> code_page_cache_ =
       std::make_unique<std::array<CachedCodePageEntry, kCodePageCacheSize>>();

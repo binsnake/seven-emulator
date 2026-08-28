@@ -1,6 +1,6 @@
 #pragma once
 
-// Windows process-memory passthrough — example only, not compiled into seven_core.
+// Windows process-memory passthrough -- example only, not compiled into seven_core.
 //
 // Forwards all Memory reads/writes to a target process via ReadProcessMemory /
 // WriteProcessMemory, bypassing the emulator's internal page table entirely.

@@ -103,7 +103,7 @@ struct DescriptorTableRegister {
 struct CpuState {
   std::array<std::uint64_t, 16> gpr{};
   std::array<std::uint16_t, 6> sreg{};  // ES,CS,SS,DS,FS,GS selectors
-  // cr[0]=CR0, cr[4]=CR4 — Windows 10/11 x64 typical values
+  // cr[0]=CR0, cr[4]=CR4 -- Windows 10/11 x64 typical values
   std::array<std::uint64_t, 16> cr{0x80050033u, 0, 0, 0, 0x370678u};
   // dr[6]/dr[7] carry bits that read as 1 on real hardware no matter what is written; these are
   // their reset values. See kDr6ReservedOnes/kDr7ReservedOnes.
@@ -116,7 +116,7 @@ struct CpuState {
   std::uint64_t gs_base = 0;
   DescriptorTableRegister gdtr{};
   DescriptorTableRegister idtr{};
-  // EFER (LME+LMA+NXE+SCE) and STAR (syscall CS/SS) — Windows 10/11 x64 typical values
+  // EFER (LME+LMA+NXE+SCE) and STAR (syscall CS/SS) -- Windows 10/11 x64 typical values
   std::unordered_map<std::uint32_t, std::uint64_t> msr{
     {0xC0000080u, 0x0000'0000'0000'0D01u},  // EFER
     {0xC0000081u, 0x0023'0010'0000'0000u},  // STAR

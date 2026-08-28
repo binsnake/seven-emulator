@@ -15,7 +15,7 @@ ExecutionResult read_rm64(ExecutionContext& ctx, std::uint64_t& value) {
 
 void clear_count_flags(CpuState& state);
 
-// 16/32-bit forms of POPCNT/TZCNT/LZCNT — the counting must happen at the
+// 16/32-bit forms of POPCNT/TZCNT/LZCNT -- the counting must happen at the
 // actual operand width (std::countl_zero of a 32-bit value differs from a
 // 64-bit value holding the same bits, since it counts leading zeros
 // relative to the type's own width) rather than reusing the 64-bit path on
