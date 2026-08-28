@@ -12,12 +12,24 @@ ExecutionResult handle_code_FNOP(ExecutionContext&) {
   return {};
 }
 
+namespace {
+
+// Both of these clear C1 on hardware. It has to happen before set_x87_top, which rewrites the TOP
+// field of the same status word.
+void clear_c1(CpuState& state) {
+  state.set_x87_status_word(static_cast<std::uint16_t>(state.get_x87_status_word() & ~0x0200u));
+}
+
+}  // namespace
+
 ExecutionResult handle_code_FDECSTP(ExecutionContext& ctx) {
+  clear_c1(ctx.state);
   ctx.state.set_x87_top(static_cast<std::uint8_t>((ctx.state.get_x87_top() + 7) & 0x7));
   return {};
 }
 
 ExecutionResult handle_code_FINCSTP(ExecutionContext& ctx) {
+  clear_c1(ctx.state);
   ctx.state.set_x87_top(static_cast<std::uint8_t>((ctx.state.get_x87_top() + 1) & 0x7));
   return {};
 }

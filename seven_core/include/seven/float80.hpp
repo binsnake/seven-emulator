@@ -81,6 +81,24 @@ inline bool signbit(Float80 x) noexcept {
     return (x.val.signExp & 0x8000u) != 0;
 }
 
+// A quiet NaN sets both the integer bit and the top fraction bit. Everything else under the all-ones
+// exponent -- signalling NaNs, plus the pseudo-NaN and pseudo-infinity encodings that the explicit
+// integer bit makes representable -- raises #IA even on the compares that stay quiet for a QNaN.
+inline bool issnan(Float80 x) noexcept {
+    if ((x.val.signExp & 0x7FFFu) != 0x7FFFu) return false;
+    if (x.val.signif == 0x8000000000000000ULL) return false;  // infinity
+    return (x.val.signif & 0xC000000000000000ULL) != 0xC000000000000000ULL;
+}
+
+// The 80-bit format carries its integer bit explicitly, so an encoding can contradict its own
+// exponent: unnormals, pseudo-NaNs and pseudo-infinities all clear the integer bit under an exponent
+// that says it should be set. Hardware does not treat those as numbers at all, which is why FXAM has
+// a class of its own for them rather than folding them into NaN or normal.
+inline bool isunsupported(Float80 x) noexcept {
+    if ((x.val.signExp & 0x7FFFu) == 0u) return false;  // zero, denormal, pseudo-denormal
+    return (x.val.signif & 0x8000000000000000ULL) == 0u;
+}
+
 inline Float80 abs(Float80 x) noexcept {
     extFloat80_t r = x.val;
     r.signExp &= 0x7FFFu;
@@ -88,6 +106,31 @@ inline Float80 abs(Float80 x) noexcept {
 }
 
 // ── rounding ─────────────────────────────────────────────────────────────────
+
+// SoftFloat takes the rounding mode for add/sub/mul/div/sqrt from a mutable global instead of an
+// argument, so honouring the guest's FCW.RC means writing that global around the call. Every write
+// is paired with a restore on the same scope exit, and the guard writes nothing at all when the
+// mode already matches, which covers every guest that leaves RC at round-to-nearest.
+//
+// The global is not thread-local in this build: softfloat's generated platform.h leaves THREAD_LOCAL
+// empty, so two guests running on separate host threads can interleave a save/restore pair and
+// strand the loser's mode. Defining THREAD_LOCAL for the softfloat target is what makes that safe.
+class RoundingGuard {
+public:
+    explicit RoundingGuard(uint_fast8_t mode) noexcept
+        : saved_(softfloat_roundingMode), changed_(mode != softfloat_roundingMode) {
+        if (changed_) softfloat_roundingMode = mode;
+    }
+    ~RoundingGuard() noexcept {
+        if (changed_) softfloat_roundingMode = saved_;
+    }
+    RoundingGuard(const RoundingGuard&) = delete;
+    RoundingGuard& operator=(const RoundingGuard&) = delete;
+
+private:
+    uint_fast8_t saved_;
+    bool changed_;
+};
 
 inline Float80 trunc(Float80 x) noexcept {
     return Float80(extF80_roundToInt(x.val, softfloat_round_minMag, false));

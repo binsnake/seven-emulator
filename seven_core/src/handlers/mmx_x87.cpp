@@ -477,7 +477,7 @@ ExecutionResult handle_code_FSQRT(ExecutionContext& ctx) {
   if (ctx.state.x87_is_empty(0)) return x87_stack_underflow_into(ctx, 0);
   const X87Scalar value = ctx.state.x87_get(0);
   if (value < 0) return x87_exception(ctx, kX87ExceptionInvalid);
-  const X87Scalar result = seven::sqrt(value);
+  const X87Scalar result = x87_with_rounding(ctx.state, [&] { return seven::sqrt(value); });
   if (value != 0 && result == 0) {
     auto r = x87_exception(ctx, static_cast<std::uint16_t>(kX87ExceptionUnderflow | kX87ExceptionPrecision));
     if (!r.ok()) return r;

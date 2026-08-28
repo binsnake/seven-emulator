@@ -1233,6 +1233,251 @@ TEST(KuberaScalar, Fyl2xOnALargeExponentDoesNotSaturateThroughDouble) {
       << "2^1100 does not fit in a double, so narrowing before taking the log gave infinity";
 }
 
+namespace {
+
+// Every x87 test below wants the same shape: data at kX87Data, code at kBase, long mode.
+struct X87Fixture {
+  seven::Executor executor{};
+  seven::CpuState state{};
+  seven::Memory memory{};
+
+  X87Fixture() {
+    state.mode = seven::ExecutionMode::long64;
+    state.rip = kBase;
+    state.gpr[3] = kX87Data;
+    memory.map(kX87Data, 0x1000);
+  }
+
+  void load_code(std::string_view hex) { write_bytes(memory, kBase, seven::parse_hex_bytes(hex)); }
+
+  void run(int steps) {
+    for (int i = 0; i < steps; ++i) {
+      ASSERT_EQ(executor.step(state, memory).reason, seven::StopReason::none) << "step " << i;
+    }
+  }
+
+  [[nodiscard]] std::uint16_t status() const { return state.get_x87_status_word(); }
+};
+
+}  // namespace
+
+TEST(KuberaScalar, DecstpAndIncstpClearC1) {
+  for (const auto* code : {"D9 F6", "D9 F7"}) {  // fdecstp, fincstp
+    X87Fixture f;
+    f.state.set_x87_status_word(static_cast<std::uint16_t>(f.state.get_x87_status_word() | 0x0200u));
+    f.load_code(code);
+    f.run(1);
+    EXPECT_EQ(f.status() & 0x0200u, 0u) << code << " must clear C1";
+  }
+}
+
+// A masked stack underflow does not skip the instruction on hardware. The register-destination forms
+// already knew that; the memory-destination ones returned having written nothing and having left TOP
+// where it was, so the guest read a stale destination and an unmoved stack.
+TEST(KuberaScalar, StoringFromAnEmptyStackWritesTheIndefiniteAndStillPops) {
+  {
+    X87Fixture f;
+    f.state.gpr[1] = kX87Data + 64;
+    const std::uint64_t sentinel = 0x0123456789ABCDEFull;
+    ASSERT_TRUE(f.memory.write(kX87Data + 64, &sentinel, sizeof(sentinel)));
+    f.load_code("DD 19");  // fstp qword [rcx]
+    f.run(1);
+
+    std::uint64_t stored = 0;
+    ASSERT_TRUE(f.memory.read(kX87Data + 64, &stored, sizeof(stored)));
+    EXPECT_EQ(stored, 0xFFF8000000000000ull) << "the double-precision floating-point indefinite";
+    EXPECT_EQ(f.state.get_x87_top(), 1u) << "the pop still retires";
+    EXPECT_EQ(f.status() & 0x0041u, 0x0041u) << "IE and SF";
+  }
+  {
+    // FIST/FISTP store the INTEGER indefinite, which is a different value entirely.
+    X87Fixture f;
+    f.state.gpr[1] = kX87Data + 64;
+    f.load_code("DB 19");  // fistp dword [rcx]
+    f.run(1);
+
+    std::uint32_t stored = 0;
+    ASSERT_TRUE(f.memory.read(kX87Data + 64, &stored, sizeof(stored)));
+    EXPECT_EQ(stored, 0x80000000u);
+    EXPECT_EQ(f.state.get_x87_top(), 1u);
+  }
+  {
+    // And packed decimal has a third one, FFFFC000_00000000_0000.
+    X87Fixture f;
+    f.state.gpr[1] = kX87Data + 64;
+    f.load_code("DF 31");  // fbstp tbyte [rcx]
+    f.run(1);
+
+    std::array<std::uint8_t, 10> stored{};
+    ASSERT_TRUE(f.memory.read(kX87Data + 64, stored.data(), stored.size()));
+    const std::array<std::uint8_t, 10> expected{0, 0, 0, 0, 0, 0, 0, 0xC0, 0xFF, 0xFF};
+    EXPECT_EQ(stored, expected);
+    EXPECT_EQ(f.state.get_x87_top(), 1u);
+  }
+  {
+    // FSTP m80 writes the 80-bit indefinite straight through.
+    X87Fixture f;
+    f.state.gpr[1] = kX87Data + 64;
+    f.load_code("DB 39");  // fstp tbyte [rcx]
+    f.run(1);
+
+    std::uint64_t significand = 0;
+    std::uint16_t sign_exp = 0;
+    ASSERT_TRUE(f.memory.read(kX87Data + 64, &significand, sizeof(significand)));
+    ASSERT_TRUE(f.memory.read(kX87Data + 72, &sign_exp, sizeof(sign_exp)));
+    EXPECT_EQ(significand, 0xC000000000000000ull);
+    EXPECT_EQ(sign_exp, 0xFFFFu);
+    EXPECT_EQ(f.state.get_x87_top(), 1u);
+  }
+  {
+    // FSTP ST(i) with an empty top leaves the indefinite in the destination register and pops.
+    X87Fixture f;
+    f.load_code("DD DA");  // fstp st(2)
+    f.run(1);
+
+    ASSERT_FALSE(f.state.x87_is_empty(1)) << "what was ST(2) before the pop";
+    EXPECT_EQ(f.state.x87_get(1).val.signExp, 0xFFFFu);
+    EXPECT_EQ(f.state.x87_get(1).val.signif, 0xC000000000000000ull);
+    EXPECT_EQ(f.state.get_x87_top(), 1u);
+  }
+}
+
+// FXCH is both source and destination on both operands, so a masked underflow fills whichever one is
+// empty and the exchange still happens. It used to return without swapping anything.
+TEST(KuberaScalar, FxchWithAnEmptyRegisterFillsItAndStillSwaps) {
+  X87Fixture f;
+  f.load_code("D9 E8 D9 C9");  // fld1 ; fxch st(1)
+  f.run(2);
+
+  EXPECT_EQ(f.state.x87_get(0).val.signExp, 0xFFFFu) << "ST(1) was empty, so ST(0) gets its indefinite";
+  EXPECT_EQ(f.state.x87_get(0).val.signif, 0xC000000000000000ull);
+  ASSERT_FALSE(f.state.x87_is_empty(1));
+  EXPECT_EQ(static_cast<double>(f.state.x87_get(1)), 1.0) << "and the 1.0 moves down to ST(1)";
+}
+
+// An instruction that faults must not have touched its destination. FIST wrote the integer
+// indefinite first and only then asked whether #IA was masked.
+TEST(KuberaScalar, FistpLeavesTheDestinationAloneWhenInvalidIsUnmasked) {
+  X87Fixture f;
+  f.state.gpr[1] = kX87Data + 64;
+  write_extf80(f.memory, kX87Data, 0x8000000000000000ull, 0x7FFF);  // +inf, out of range for any int
+  const std::uint16_t unmasked_invalid = 0x037E;
+  ASSERT_TRUE(f.memory.write(kX87Data + 32, &unmasked_invalid, sizeof(unmasked_invalid)));
+  const std::uint32_t sentinel = 0xDEADBEEFu;
+  ASSERT_TRUE(f.memory.write(kX87Data + 64, &sentinel, sizeof(sentinel)));
+  // fldcw [rbx+0x20] ; fld tbyte [rbx] ; fistp dword [rcx]
+  f.load_code("D9 6B 20 DB 2B DB 19");
+  f.run(2);
+
+  EXPECT_EQ(f.executor.step(f.state, f.memory).reason, seven::StopReason::floating_point_exception);
+  std::uint32_t stored = 0;
+  ASSERT_TRUE(f.memory.read(kX87Data + 64, &stored, sizeof(stored)));
+  EXPECT_EQ(stored, sentinel) << "the store must not have happened";
+}
+
+// softfloat_roundingMode was never assigned anywhere in the tree, so extF80_add and friends rounded
+// to nearest-even no matter what the guest put in FCW.RC.
+TEST(KuberaScalar, TheGuestsRoundingControlReachesTheSoftFloatArithmetic) {
+  X87Fixture f;
+  write_extf80(f.memory, kX87Data, 0x8000000000000000ull, 0x3FFF);       // 1.0
+  write_extf80(f.memory, kX87Data + 16, 0x8000000000000000ull, 0x3FBE);  // 2^-65, a quarter of an ulp
+  const std::uint16_t round_up = 0x0B7F;  // RC = 10, toward +infinity
+  ASSERT_TRUE(f.memory.write(kX87Data + 32, &round_up, sizeof(round_up)));
+  // fldcw [rbx+0x20] ; fld tbyte [rbx] ; fld tbyte [rbx+0x10] ; faddp st(1), st(0)
+  f.load_code("D9 6B 20 DB 2B DB 6B 10 DE C1");
+  f.run(4);
+
+  EXPECT_EQ(f.state.x87_get(0).val.signExp, 0x3FFFu);
+  EXPECT_EQ(f.state.x87_get(0).val.signif, 0x8000000000000001ull)
+      << "rounding to nearest collapses this back to 1.0";
+  EXPECT_EQ(softfloat_roundingMode, softfloat_round_near_even)
+      << "the mode is a process-wide global, so the guard has to put it back";
+}
+
+// x87_classify_result read the exceptions off the result alone: any infinity was an overflow and any
+// NaN was an invalid operand, whatever the operands had been.
+TEST(KuberaScalar, AnInfiniteOperandIsNotAnOverflowAndAQuietNanPropagatesSilently) {
+  {
+    X87Fixture f;
+    f.state.gpr[1] = kX87Data + 64;
+    write_extf80(f.memory, kX87Data, 0x8000000000000000ull, 0x7FFF);  // +inf
+    const double one = 1.0;
+    ASSERT_TRUE(f.memory.write(kX87Data + 64, &one, sizeof(one)));
+    f.load_code("DB 2B DC 01");  // fld tbyte [rbx] ; fadd qword [rcx]
+    f.run(2);
+
+    EXPECT_TRUE(seven::isinf(f.state.x87_get(0)));
+    EXPECT_EQ(f.status() & 0x0008u, 0u) << "inf + 1 is inf, not an overflow";
+  }
+  {
+    X87Fixture f;
+    f.state.gpr[1] = kX87Data + 64;
+    write_extf80(f.memory, kX87Data, 0xC000000000000000ull, 0x7FFF);  // a quiet NaN
+    const double one = 1.0;
+    ASSERT_TRUE(f.memory.write(kX87Data + 64, &one, sizeof(one)));
+    f.load_code("DB 2B DC 01");
+    f.run(2);
+
+    EXPECT_TRUE(seven::isnan(f.state.x87_get(0)));
+    EXPECT_EQ(f.status() & 0x0001u, 0u) << "a quiet NaN propagates without raising #IA";
+  }
+}
+
+// The infinity a division by zero produces is #Z and nothing else. Reading the exception off the
+// result made it an overflow as well, so the guest saw two exceptions where hardware raises one.
+TEST(KuberaScalar, DividingByZeroIsNotAlsoAnOverflow) {
+  X87Fixture f;
+  f.state.gpr[1] = kX87Data + 64;
+  const double zero = 0.0;
+  ASSERT_TRUE(f.memory.write(kX87Data + 64, &zero, sizeof(zero)));
+  f.load_code("D9 E8 DC 31");  // fld1 ; fdiv qword [rcx]
+  f.run(2);
+
+  EXPECT_TRUE(seven::isinf(f.state.x87_get(0)));
+  EXPECT_EQ(f.status() & 0x0004u, 0x0004u) << "#Z";
+  EXPECT_EQ(f.status() & 0x0008u, 0u) << "and not #O as well";
+}
+
+// FUCOM is quiet about quiet NaNs only. The flag used to suppress #IA for signalling ones too.
+TEST(KuberaScalar, FucompIsQuietForAQuietNanButNotForASignallingOne) {
+  const auto run_with = [](std::uint64_t significand) {
+    X87Fixture f;
+    write_extf80(f.memory, kX87Data, significand, 0x7FFF);
+    f.load_code("DB 2B D9 E8 DA E9");  // fld tbyte [rbx] ; fld1 ; fucompp
+    f.run(3);
+    return f.status();
+  };
+
+  EXPECT_EQ(run_with(0xC000000000000000ull) & 0x0001u, 0u) << "quiet NaN, quiet compare";
+  EXPECT_EQ(run_with(0xA000000000000000ull) & 0x0001u, 0x0001u) << "signalling NaN still raises #IA";
+}
+
+// FXAM answers about the register, not about a value: C1 is the sign bit even when the register is
+// empty, and the encodings that contradict their own exponent get a class of their own.
+TEST(KuberaScalar, FxamReportsTheSignOfAnEmptyRegisterAndTheUnsupportedClass) {
+  {
+    X87Fixture f;
+    write_extf80(f.memory, kX87Data, 0x8000000000000000ull, 0xBFFF);  // -1.0
+    f.load_code("DB 2B DD C0 D9 E5");  // fld tbyte [rbx] ; ffree st(0) ; fxam
+    f.run(3);
+
+    // The class lives in C3, C2 and C0; C1 is the sign and is read separately.
+    EXPECT_EQ(f.status() & 0x4500u, 0x4100u) << "still the empty class";
+    EXPECT_EQ(f.status() & 0x0200u, 0x0200u) << "C1 is the register's sign bit, empty or not";
+  }
+  {
+    X87Fixture f;
+    write_extf80(f.memory, kX87Data, 0x4000000000000000ull, 0x4000);       // unnormal
+    write_extf80(f.memory, kX87Data + 16, 0x4000000000000000ull, 0x7FFF);  // pseudo-NaN
+    // fld tbyte [rbx] ; fxam ; fld tbyte [rbx+0x10] ; fxam
+    f.load_code("DB 2B D9 E5 DB 6B 10 D9 E5");
+    f.run(2);
+    EXPECT_EQ(f.status() & 0x4500u, 0x0000u) << "an unnormal used to read as an ordinary normal";
+    f.run(2);
+    EXPECT_EQ(f.status() & 0x4500u, 0x0000u) << "a pseudo-NaN used to read as a NaN";
+  }
+}
+
 // The RDTSC counter used to be a function-local static, so every guest in the process shared it.
 // Two Executors that are meant to be isolated could watch each other's progress through it, and on
 // separate threads they raced on the increment. RDTSCP read a hardcoded 0 at the same time, so a

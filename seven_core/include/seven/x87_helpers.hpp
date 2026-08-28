@@ -46,11 +46,38 @@ inline std::size_t x87_st_index(iced_x86::Register reg) {
   return static_cast<std::size_t>(static_cast<std::uint32_t>(reg) - static_cast<std::uint32_t>(iced_x86::Register::ST0));
 }
 
+// A masked stack underflow does not skip the instruction: hardware still retires the pop. x87_pop()
+// deliberately refuses to move TOP while ST(0) is empty, which is right everywhere else, so the
+// indefinite goes into ST(0) first and the ordinary pop then leaves exactly what hardware leaves --
+// TOP advanced, the vacated register tagged empty.
+inline void x87_underflow_pop(CpuState& state) {
+  state.x87_set(0, x87_indefinite());
+  (void)state.x87_pop();
+}
+
+inline uint_fast8_t x87_softfloat_rounding_mode(const CpuState& state) {
+  switch ((state.get_x87_control_word() >> 10) & 0x3u) {
+    case 0: return softfloat_round_near_even;
+    case 1: return softfloat_round_min;
+    case 2: return softfloat_round_max;
+    default: return softfloat_round_minMag;
+  }
+}
+
+// SoftFloat reads its rounding mode from a global, so FCW.RC only reaches extF80_add and friends if
+// it is installed around the call. Scoped to the operation itself and nothing more: the exactness
+// probes in x87_precision_from_binary want plain nearest-even arithmetic to compare against.
+template <typename Fn>
+inline auto x87_with_rounding(const CpuState& state, Fn&& fn) {
+  seven::RoundingGuard guard(x87_softfloat_rounding_mode(state));
+  return fn();
+}
+
 template <typename Fn>
 inline ExecutionResult x87_unary_st0(ExecutionContext& ctx, Fn&& fn) {
   if (ctx.state.x87_is_empty(0)) return x87_stack_underflow_into(ctx, 0);
   const auto input = ctx.state.x87_get(0);
-  const auto value = fn(input);
+  const auto value = x87_with_rounding(ctx.state, [&] { return fn(input); });
   const auto exceptions = x87_classify_result(value, input, 0);
   if (exceptions != 0) {
     auto result = x87_exception(ctx, exceptions);
@@ -70,7 +97,12 @@ inline ExecutionResult x87_fxch(ExecutionContext& ctx) {
   }
   const auto idx = x87_st_index(reg);
   if (ctx.state.x87_is_empty(0) || ctx.state.x87_is_empty(idx)) {
-    return x87_stack_underflow(ctx);
+    auto result = x87_stack_underflow(ctx);
+    if (!result.ok()) return result;
+    // Both registers are source and destination here, so a masked underflow fills whichever one is
+    // empty with the indefinite and the exchange still happens.
+    if (ctx.state.x87_is_empty(0)) ctx.state.x87_set(0, x87_indefinite());
+    if (ctx.state.x87_is_empty(idx)) ctx.state.x87_set(idx, x87_indefinite());
   }
   ctx.state.x87_swap(idx);
   return {};
@@ -92,7 +124,7 @@ inline ExecutionResult x87_binary_mem_st0(ExecutionContext& ctx, std::size_t wid
   }
   if (ctx.state.x87_is_empty(0)) return x87_stack_underflow_into(ctx, 0);
   const auto lhs = ctx.state.x87_get(0);
-  const auto value = fn(lhs, rhs);
+  const auto value = x87_with_rounding(ctx.state, [&] { return fn(lhs, rhs); });
   const auto exceptions = static_cast<std::uint16_t>(x87_classify_result(value, lhs, rhs) | x87_precision_from_binary(lhs, rhs, value));
   if (exceptions != 0) {
     auto result = x87_exception(ctx, exceptions);
@@ -117,7 +149,7 @@ inline ExecutionResult x87_binary_mem_st0_with_status(ExecutionContext& ctx, std
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (ctx.state.x87_is_empty(0)) return x87_stack_underflow_into(ctx, 0);
-  const auto [value, exceptions] = fn(ctx.state.x87_get(0), rhs);
+  const auto [value, exceptions] = x87_with_rounding(ctx.state, [&] { return fn(ctx.state.x87_get(0), rhs); });
   const auto lhs = ctx.state.x87_get(0);
   const auto classified = static_cast<std::uint16_t>(x87_classify_result(value, lhs, rhs) | x87_precision_from_binary(lhs, rhs, value));
   if ((exceptions | classified) != 0) {
@@ -148,7 +180,7 @@ inline ExecutionResult x87_binary_mem_int_st0(ExecutionContext& ctx, std::size_t
   }
   if (ctx.state.x87_is_empty(0)) return x87_stack_underflow_into(ctx, 0);
   const auto lhs = ctx.state.x87_get(0);
-  const auto value = fn(lhs, rhs);
+  const auto value = x87_with_rounding(ctx.state, [&] { return fn(lhs, rhs); });
   const auto exceptions = static_cast<std::uint16_t>(x87_classify_result(value, lhs, rhs) | x87_precision_from_binary(lhs, rhs, value));
   if (exceptions != 0) {
     auto result = x87_exception(ctx, exceptions);
@@ -177,7 +209,7 @@ inline ExecutionResult x87_binary_mem_int_st0_with_status(ExecutionContext& ctx,
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (ctx.state.x87_is_empty(0)) return x87_stack_underflow_into(ctx, 0);
-  const auto [value, exceptions] = fn(ctx.state.x87_get(0), rhs);
+  const auto [value, exceptions] = x87_with_rounding(ctx.state, [&] { return fn(ctx.state.x87_get(0), rhs); });
   const auto lhs = ctx.state.x87_get(0);
   const auto classified = static_cast<std::uint16_t>(x87_classify_result(value, lhs, rhs) | x87_precision_from_binary(lhs, rhs, value));
   if ((exceptions | classified) != 0) {
@@ -207,7 +239,7 @@ inline ExecutionResult x87_binary_st_indices(ExecutionContext& ctx, std::size_t 
   if (ctx.state.x87_is_empty(dst_idx) || ctx.state.x87_is_empty(src_idx)) return x87_stack_underflow_into(ctx, dst_idx);
   const auto lhs = ctx.state.x87_get(dst_idx);
   const auto rhs = ctx.state.x87_get(src_idx);
-  const auto value = fn(lhs, rhs);
+  const auto value = x87_with_rounding(ctx.state, [&] { return fn(lhs, rhs); });
   const auto exceptions = static_cast<std::uint16_t>(x87_classify_result(value, lhs, rhs) | x87_precision_from_binary(lhs, rhs, value));
   if (exceptions != 0) {
     auto result = x87_exception(ctx, exceptions);
@@ -241,7 +273,7 @@ inline ExecutionResult x87_binary_st_regs_with_status(ExecutionContext& ctx, std
   if (ctx.state.x87_is_empty(dst_idx) || ctx.state.x87_is_empty(src_idx)) return x87_stack_underflow_into(ctx, dst_idx);
   const auto lhs = ctx.state.x87_get(dst_idx);
   const auto rhs = ctx.state.x87_get(src_idx);
-  const auto [value, exceptions] = fn(lhs, rhs);
+  const auto [value, exceptions] = x87_with_rounding(ctx.state, [&] { return fn(lhs, rhs); });
   const auto classified = static_cast<std::uint16_t>(x87_classify_result(value, lhs, rhs) | x87_precision_from_binary(lhs, rhs, value));
   if ((exceptions | classified) != 0) {
     auto result = x87_exception(ctx, static_cast<std::uint16_t>(exceptions | classified));
@@ -252,8 +284,15 @@ inline ExecutionResult x87_binary_st_regs_with_status(ExecutionContext& ctx, std
 }
 
 inline ExecutionResult x87_store_mem(ExecutionContext& ctx, std::size_t width, bool pop) {
-  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow(ctx);
-  const auto value = ctx.state.x87_get(0);
+  bool underflowed = false;
+  if (ctx.state.x87_is_empty(0)) {
+    auto fault = x87_stack_underflow(ctx);
+    if (!fault.ok()) return fault;
+    underflowed = true;
+  }
+  // Masked, the store still happens; it just stores the indefinite. Narrowing it to m32 or m64 gives
+  // that format's own indefinite, so there is nothing to special-case below.
+  const auto value = underflowed ? x87_indefinite() : ctx.state.x87_get(0);
   ExecutionResult result = {};
   if (width == 4) {
     result = detail::write_memory_checked(ctx, detail::memory_address(ctx), static_cast<float>(value));
@@ -271,7 +310,10 @@ inline ExecutionResult x87_store_mem(ExecutionContext& ctx, std::size_t width, b
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (!result.ok()) return result;
-  if (pop && !ctx.state.x87_pop()) return x87_stack_underflow(ctx);
+  if (pop) {
+    if (underflowed) x87_underflow_pop(ctx.state);
+    else if (!ctx.state.x87_pop()) return x87_stack_underflow(ctx);
+  }
   return {};
 }
 
@@ -305,13 +347,6 @@ inline ExecutionResult x87_store_to_memory(ExecutionContext& ctx, std::size_t wi
 }
 
 inline ExecutionResult x87_store_integer(ExecutionContext& ctx, std::size_t width, bool pop, bool truncate_only) {
-  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow(ctx);
-  const auto value = ctx.state.x87_get(0);
-  const auto rounded = truncate_only ? seven::trunc(value) : x87_round_to_control(ctx.state, value);
-  std::uint16_t exceptions = 0;
-  if (rounded != value) {
-    exceptions |= kX87ExceptionPrecision;
-  }
   X87Scalar lower = 0;
   X87Scalar upper = 0;
   if (width == 2) {
@@ -326,11 +361,37 @@ inline ExecutionResult x87_store_integer(ExecutionContext& ctx, std::size_t widt
   } else {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
-  X87Scalar stored = rounded;
-  if (seven::isnan(rounded) || seven::isinf(rounded) || rounded < lower || rounded > upper) {
-    exceptions |= kX87ExceptionInvalid;
-    stored = lower;
+
+  // These forms store the INTEGER indefinite, which is the most negative value of the destination
+  // width and not the floating-point one -- and `lower` already is it.
+  bool underflowed = false;
+  if (ctx.state.x87_is_empty(0)) {
+    auto fault = x87_stack_underflow(ctx);
+    if (!fault.ok()) return fault;
+    underflowed = true;
   }
+
+  std::uint16_t exceptions = 0;
+  X87Scalar stored = lower;
+  if (!underflowed) {
+    const auto value = ctx.state.x87_get(0);
+    const auto rounded = truncate_only ? seven::trunc(value) : x87_round_to_control(ctx.state, value);
+    if (rounded != value) {
+      exceptions |= kX87ExceptionPrecision;
+    }
+    stored = rounded;
+    if (seven::isnan(rounded) || seven::isinf(rounded) || rounded < lower || rounded > upper) {
+      exceptions |= kX87ExceptionInvalid;
+      stored = lower;
+    }
+    // An unmasked exception means the instruction faults, and a faulting instruction must not have
+    // touched its destination. This used to write first and report afterwards.
+    if (exceptions != 0) {
+      auto result = x87_exception(ctx, exceptions);
+      if (!result.ok()) return result;
+    }
+  }
+
   const std::int64_t out = static_cast<std::int64_t>(stored);
   if (width == 2) {
     const std::int16_t v = static_cast<std::int16_t>(out);
@@ -338,17 +399,14 @@ inline ExecutionResult x87_store_integer(ExecutionContext& ctx, std::size_t widt
   } else if (width == 4) {
     const std::int32_t v = static_cast<std::int32_t>(out);
     if (!ctx.memory.write(detail::memory_address(ctx), &v, 4)) return detail::memory_fault(ctx, detail::memory_address(ctx));
-  } else if (width == 8) {
-    const std::int64_t v = static_cast<std::int64_t>(out);
-    if (!ctx.memory.write(detail::memory_address(ctx), &v, 8)) return detail::memory_fault(ctx, detail::memory_address(ctx));
   } else {
-    return detail::memory_fault(ctx, detail::memory_address(ctx));
+    const std::int64_t v = out;
+    if (!ctx.memory.write(detail::memory_address(ctx), &v, 8)) return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
-  if (exceptions != 0) {
-    auto result = x87_exception(ctx, exceptions);
-    if (!result.ok()) return result;
+  if (pop) {
+    if (underflowed) x87_underflow_pop(ctx.state);
+    else if (!ctx.state.x87_pop()) return x87_stack_underflow(ctx);
   }
-  if (pop && !ctx.state.x87_pop()) return x87_stack_underflow(ctx);
   return {};
 }
 
@@ -394,7 +452,9 @@ inline X87Scalar x87_round_to_control(const CpuState& state, X87Scalar value) {
 
 inline int x87_cmp(X87Scalar a, X87Scalar b, bool quiet, std::uint16_t& exceptions) {
   if (seven::isnan(a) || seven::isnan(b)) {
-    if (!quiet) {
+    // "Quiet" is FUCOM, and it is only quiet about quiet NaNs. A signalling operand raises #IA on
+    // both forms; the flag used to suppress it for either kind.
+    if (!quiet || seven::issnan(a) || seven::issnan(b)) {
       exceptions |= kX87ExceptionInvalid;
     }
     return -2;
@@ -564,7 +624,23 @@ inline ExecutionResult x87_load_bcd(ExecutionContext& ctx) {
 
 inline ExecutionResult x87_store_bcd(ExecutionContext& ctx) {
   const auto base = detail::memory_address(ctx);
-  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow(ctx);
+  if (ctx.state.x87_is_empty(0)) {
+    auto fault = x87_stack_underflow(ctx);
+    if (!fault.ok()) return fault;
+    // Packed decimal has an indefinite of its own, FFFFC000_00000000_0000, and it is not any of the
+    // digit encodings this function can produce, so it is written out byte by byte.
+    std::array<std::uint8_t, 10> raw{};
+    raw[7] = 0xC0u;
+    raw[8] = 0xFFu;
+    raw[9] = 0xFFu;
+    for (std::size_t i = 0; i < raw.size(); ++i) {
+      if (!ctx.memory.write(base + i, &raw[i], 1)) return detail::memory_fault(ctx, base + i);
+    }
+    // FBSTP is the only caller and it pops in its own handler, so leave ST(0) holding the indefinite
+    // for that pop to consume rather than popping here.
+    ctx.state.x87_set(0, x87_indefinite());
+    return {};
+  }
   X87Scalar value = ctx.state.x87_get(0);
   const bool neg = value < 0;
   if (neg) value = -value;
@@ -586,7 +662,13 @@ inline ExecutionResult x87_store_st0_to_sti(ExecutionContext& ctx, bool pop) {
   // the stack -- wrote to ST(7) and left it tagged valid.
   if (!x87_operand_is_st(ctx, 0)) return detail::memory_fault(ctx, detail::memory_address(ctx));
   const auto idx = x87_st_index(ctx.instr.op_register(0));
-  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow(ctx);
+  if (ctx.state.x87_is_empty(0)) {
+    auto fault = x87_stack_underflow(ctx);
+    if (!fault.ok()) return fault;
+    ctx.state.x87_set(idx, x87_indefinite());
+    if (pop) x87_underflow_pop(ctx.state);
+    return {};
+  }
   ctx.state.x87_set(idx, ctx.state.x87_get(0));
   if (pop && !ctx.state.x87_pop()) return x87_stack_underflow(ctx);
   return {};
@@ -602,19 +684,33 @@ inline ExecutionResult x87_free_sti(ExecutionContext& ctx, bool pop) {
 
 inline ExecutionResult x87_fstp_m80fp(ExecutionContext& ctx) {
   const auto base = detail::memory_address(ctx);
-  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow(ctx);
+  bool underflowed = false;
+  if (ctx.state.x87_is_empty(0)) {
+    auto fault = x87_stack_underflow(ctx);
+    if (!fault.ok()) return fault;
+    underflowed = true;
+  }
   std::array<std::uint8_t, 10> raw{};
-  x87_encoding::encode_ext80(ctx.state.x87_get(0), raw.data());
+  x87_encoding::encode_ext80(underflowed ? x87_indefinite() : ctx.state.x87_get(0), raw.data());
   for (std::size_t i = 0; i < raw.size(); ++i) {
     if (!ctx.memory.write(base + i, &raw[i], 1)) return detail::memory_fault(ctx, base + i);
   }
-  if (!ctx.state.x87_pop()) return x87_stack_underflow(ctx);
+  if (underflowed) {
+    x87_underflow_pop(ctx.state);
+  } else if (!ctx.state.x87_pop()) {
+    return x87_stack_underflow(ctx);
+  }
   return {};
 }
 
 inline std::uint16_t x87_fxam_class_bits(const X87Scalar& value, bool empty) {
   if (empty) {
     return static_cast<std::uint16_t>(0x4100u);
+  }
+  // C3 = C2 = C0 = 0 is the "unsupported" answer. It has to come first: an unnormal reads as an
+  // ordinary normal by value, and a pseudo-NaN reads as a NaN, so either would be claimed below.
+  if (seven::isunsupported(value)) {
+    return static_cast<std::uint16_t>(0x0000u);
   }
   if (seven::isnan(value)) {
     return static_cast<std::uint16_t>(0x0100u);
@@ -637,12 +733,24 @@ inline bool x87_exceptions_masked(const CpuState& state, std::uint16_t exception
   return (exceptions & ~state.get_x87_control_word() & kX87ExceptionMask) == 0;
 }
 
+// Reading the exceptions off the result alone gets two whole classes of ordinary arithmetic wrong,
+// so both tests below ask what the operands were as well.
 inline std::uint16_t x87_classify_result(const X87Scalar& result, const X87Scalar& lhs, const X87Scalar& rhs) {
   std::uint16_t exceptions = 0;
   if (seven::isnan(result)) {
-    exceptions |= kX87ExceptionInvalid;
+    // A NaN that walked in as an operand propagates quietly: QNaN + 1 is a QNaN and raises nothing.
+    // #IA belongs to the operations that MADE one -- a signalling operand being quieted, or a form
+    // with no answer at all like inf - inf, whose operands are not NaNs to begin with.
+    const bool propagated = seven::isnan(lhs) || seven::isnan(rhs);
+    if (!propagated || seven::issnan(lhs) || seven::issnan(rhs)) {
+      exceptions |= kX87ExceptionInvalid;
+    }
   }
-  if (seven::isinf(result)) {
+  // Overflow means the exact answer was finite and too large to represent. An infinity handed in as
+  // an operand is not that (inf + 1 is inf, quietly), and neither is the infinity a division by zero
+  // produces -- that is #Z, which the divide helper reports itself. A zero operand is what separates
+  // the second case from a real overflow, since none of add, sub or mul can overflow through one.
+  if (seven::isinf(result) && !seven::isinf(lhs) && !seven::isinf(rhs) && lhs != 0 && rhs != 0) {
     exceptions |= kX87ExceptionOverflow;
   }
   const X87Scalar abs_result = seven::abs(result);
@@ -732,7 +840,12 @@ inline void x87_set_fxam_flags(ExecutionContext& ctx, const X87Scalar& value, bo
   auto sw = ctx.state.get_x87_status_word();
   sw &= static_cast<std::uint16_t>(~0x4700u);
   sw |= x87_fxam_class_bits(value, empty);
-  if (seven::signbit(value)) {
+  // C1 is the register's sign bit whatever the class, empty included: FXAM reports on the register,
+  // not on a value. An empty caller has no value to hand over, so read the sign out of the physical
+  // register the instruction is looking at.
+  const bool negative = empty ? seven::signbit(ctx.state.x87_stack[ctx.state.x87_phys_index(0)])
+                              : seven::signbit(value);
+  if (negative) {
     sw |= static_cast<std::uint16_t>(0x0200u);
   }
   ctx.state.set_x87_status_word(sw);

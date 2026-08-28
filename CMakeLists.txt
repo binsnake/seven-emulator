@@ -87,6 +87,17 @@ if(NOT softfloat_POPULATED)
   # the field order of extFloat80M on it, so a consumer compiling without it disagrees with the
   # library about where signif and signExp live and reads both from the wrong offset.
   target_compile_definitions(softfloat PUBLIC SOFTFLOAT_FAST_INT64 LITTLEENDIAN=1)
+  # softfloat's headers fall back to an empty THREAD_LOCAL if nobody defines one, which makes
+  # softfloat_roundingMode, softfloat_exceptionFlags and extF80_roundingPrecision process-wide
+  # globals. The x87 handlers set the rounding mode around each operation and restore it after, so
+  # one Executor is safe on its own, but two on separate host threads can interleave a save and a
+  # restore and strand a guest's rounding mode in the host's library state for good. PUBLIC for the
+  # same reason LITTLEENDIAN is: the declaration consumers see has to match the definition.
+  if(MSVC)
+    target_compile_definitions(softfloat PUBLIC "THREAD_LOCAL=__declspec(thread)")
+  else()
+    target_compile_definitions(softfloat PUBLIC "THREAD_LOCAL=_Thread_local")
+  endif()
   if(MSVC)
     target_compile_options(softfloat PRIVATE /WX- /wd4146 /wd4244 /wd4267)
   endif()
