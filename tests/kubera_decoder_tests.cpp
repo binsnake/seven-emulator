@@ -465,3 +465,31 @@ TEST(KuberaDecoder, EveryModrmForTheVexAndEvexOpcodesDecodesSafely) {
     }
   }
 }
+
+// EVEX encodes a disp8 as a count of operand-sized units, not bytes, so the decoder has to scale it
+// back by N. N comes from the instruction's tuple type paired with the broadcast bit, and the
+// decoder was multiplying by the raw TupleType enum value instead -- which is an index, not a size,
+// so an N16 form scaled by 4 and an N64 form by 6. Every EVEX memory operand written with a disp8
+// therefore resolved to an address the guest never asked for, and did it quietly: the result was
+// still a plausible displacement, just the wrong one. Found by the fuzzer's new EVEX lane, as six
+// aligned-move divergences against hardware that all turned out to be this.
+TEST(KuberaDecoder, EvexDisp8IsScaledByTheTupleTypeNotItsEnumValue) {
+  struct Case { const char* name; const char* bytes; std::uint64_t expected; bool broadcast; };
+  const Case cases[] = {
+      // vmovdqa32 xmm2, [rdi+disp8]: full vector, so N is the operand width.
+      {"xmm, N=16", "62 F1 7D 08 6F 57 59", 0x59ull * 16, false},
+      {"ymm, N=32", "62 F1 7D 28 6F 57 59", 0x59ull * 32, false},
+      {"zmm, N=64", "62 F1 7D 48 6F 57 59", 0x59ull * 64, false},
+      // The same two bytes but for EVEX.b. vpaddd's tuple type is N16B4, so the broadcast form
+      // scales by the element size and the plain one by the whole vector. Nothing else about the
+      // encoding changes, which is what makes the pair worth asserting together.
+      {"vpaddd xmm, no broadcast, N=16", "62 F1 75 08 FE 4F 02", 0x2ull * 16, false},
+      {"vpaddd xmm, {1to4}, N=4", "62 F1 75 18 FE 4F 02", 0x2ull * 4, true},
+  };
+  for (const auto& c : cases) {
+    const auto instr = decode(c.bytes);
+    EXPECT_EQ(instr.memory_displ_size(), 1u) << c.name << " (" << c.bytes << ")";
+    EXPECT_EQ(instr.is_broadcast(), c.broadcast) << c.name << " (" << c.bytes << ")";
+    EXPECT_EQ(instr.memory_displacement64(), c.expected) << c.name << " (" << c.bytes << ")";
+  }
+}
