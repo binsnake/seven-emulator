@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include <iced_x86/memory_size_info.hpp>
+
 #include "seven/handler_helpers.hpp"
 
 namespace seven::handlers {
@@ -95,6 +97,28 @@ big_uint read_operand(ExecutionContext& ctx, std::uint32_t operand_index, std::s
     return read_vec(ctx.state, reg) & mask(width);
   }
   if (kind == iced_x86::OpKind::MEMORY) {
+    // An EVEX memory source can carry {1toN}: one element is read and repeated across the whole
+    // operand. The element size has to come from the raw MemorySize's element_size, not from
+    // memory_size() -- that has already collapsed to the full operand width, and feeding the byte
+    // count back through the size table looks up an unrelated entry (64 comes back as 16), so a
+    // dword broadcast would read 16 bytes of guest memory and lay down the wrong lane count. Same
+    // reasoning, and the same fix, as simd_int.cpp's copy of this function.
+    if (ctx.instr.is_broadcast()) {
+      const auto element_width = iced_x86::memory_size_ext::get_element_size(ctx.instr.memory_size_enum());
+      if (element_width == 0 || element_width > width) {
+        if (ok) *ok = false;
+        return 0;
+      }
+      const auto element = read_mem(ctx, detail::memory_address(ctx), element_width, ok);
+      if (ok && !*ok) return 0;
+      big_uint out = 0;
+      const auto lane_value = element & mask(element_width);
+      for (std::size_t lane = 0; lane < width; lane += element_width) {
+        out |= lane_value << (lane * 8);
+      }
+      if (ok) *ok = true;
+      return out;
+    }
     return read_mem(ctx, detail::memory_address(ctx), width, ok);
   }
   if (ok) *ok = false;
@@ -631,7 +655,7 @@ ExecutionResult handle_code_EVEX_VPACKSSWB_XMM_K1Z_XMM_XMMM128(ExecutionContext&
   });
 }
 
-ExecutionResult handle_code_EVEX_VPACKSSDW_XMM_K1Z_XMM_XMMM128(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VPACKSSDW_XMM_K1Z_XMM_XMMM128B32(ExecutionContext& ctx) {
   return vex_pack<std::int16_t, std::int32_t>(ctx, [](const auto& lhs, const auto& rhs) {
     return std::array<std::int16_t, 8>{
       sat_pack_signed<std::int16_t>(lhs[0]), sat_pack_signed<std::int16_t>(lhs[1]),
@@ -709,7 +733,7 @@ ExecutionResult handle_code_EVEX_VPUNPCKHWD_XMM_K1Z_XMM_XMMM128(ExecutionContext
   });
 }
 
-ExecutionResult handle_code_EVEX_VPUNPCKLDQ_XMM_K1Z_XMM_XMMM128(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VPUNPCKLDQ_XMM_K1Z_XMM_XMMM128B32(ExecutionContext& ctx) {
   return vex_unpack<std::uint32_t>(ctx, [](const auto& lhs, const auto& rhs, std::size_t lane) {
     big_uint out = 0;
     for (std::size_t i = 0; i < 2; ++i) {
@@ -722,7 +746,7 @@ ExecutionResult handle_code_EVEX_VPUNPCKLDQ_XMM_K1Z_XMM_XMMM128(ExecutionContext
   });
 }
 
-ExecutionResult handle_code_EVEX_VPUNPCKHDQ_XMM_K1Z_XMM_XMMM128(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VPUNPCKHDQ_XMM_K1Z_XMM_XMMM128B32(ExecutionContext& ctx) {
   return vex_unpack<std::uint32_t>(ctx, [](const auto& lhs, const auto& rhs, std::size_t lane) {
     big_uint out = 0;
     for (std::size_t i = 0; i < 2; ++i) {
@@ -750,7 +774,7 @@ ExecutionResult handle_code_EVEX_VPACKSSWB_YMM_K1Z_YMM_YMMM256(ExecutionContext&
   });
 }
 
-ExecutionResult handle_code_EVEX_VPACKSSDW_YMM_K1Z_YMM_YMMM256(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VPACKSSDW_YMM_K1Z_YMM_YMMM256B32(ExecutionContext& ctx) {
   return vex_pack<std::int16_t, std::int32_t>(ctx, [](const auto& lhs, const auto& rhs) {
     return std::array<std::int16_t, 8>{
       sat_pack_signed<std::int16_t>(lhs[0]), sat_pack_signed<std::int16_t>(lhs[1]),
@@ -828,7 +852,7 @@ ExecutionResult handle_code_EVEX_VPUNPCKHWD_YMM_K1Z_YMM_YMMM256(ExecutionContext
   });
 }
 
-ExecutionResult handle_code_EVEX_VPUNPCKLDQ_YMM_K1Z_YMM_YMMM256(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VPUNPCKLDQ_YMM_K1Z_YMM_YMMM256B32(ExecutionContext& ctx) {
   return vex_unpack<std::uint32_t>(ctx, [](const auto& lhs, const auto& rhs, std::size_t lane) {
     big_uint out = 0;
     for (std::size_t i = 0; i < 2; ++i) {
@@ -841,7 +865,7 @@ ExecutionResult handle_code_EVEX_VPUNPCKLDQ_YMM_K1Z_YMM_YMMM256(ExecutionContext
   });
 }
 
-ExecutionResult handle_code_EVEX_VPUNPCKHDQ_YMM_K1Z_YMM_YMMM256(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VPUNPCKHDQ_YMM_K1Z_YMM_YMMM256B32(ExecutionContext& ctx) {
   return vex_unpack<std::uint32_t>(ctx, [](const auto& lhs, const auto& rhs, std::size_t lane) {
     big_uint out = 0;
     for (std::size_t i = 0; i < 2; ++i) {
@@ -868,7 +892,7 @@ ExecutionResult handle_code_EVEX_VPACKSSWB_ZMM_K1Z_ZMM_ZMMM512(ExecutionContext&
   });
 }
 
-ExecutionResult handle_code_EVEX_VPACKSSDW_ZMM_K1Z_ZMM_ZMMM512(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VPACKSSDW_ZMM_K1Z_ZMM_ZMMM512B32(ExecutionContext& ctx) {
   return vex_pack<std::int16_t, std::int32_t>(ctx, [](const auto& lhs, const auto& rhs) {
     return std::array<std::int16_t, 8>{
       sat_pack_signed<std::int16_t>(lhs[0]), sat_pack_signed<std::int16_t>(lhs[1]),
@@ -946,7 +970,7 @@ ExecutionResult handle_code_EVEX_VPUNPCKHWD_ZMM_K1Z_ZMM_ZMMM512(ExecutionContext
   });
 }
 
-ExecutionResult handle_code_EVEX_VPUNPCKLDQ_ZMM_K1Z_ZMM_ZMMM512(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VPUNPCKLDQ_ZMM_K1Z_ZMM_ZMMM512B32(ExecutionContext& ctx) {
   return vex_unpack<std::uint32_t>(ctx, [](const auto& lhs, const auto& rhs, std::size_t lane) {
     big_uint out = 0;
     for (std::size_t i = 0; i < 2; ++i) {
@@ -959,7 +983,7 @@ ExecutionResult handle_code_EVEX_VPUNPCKLDQ_ZMM_K1Z_ZMM_ZMMM512(ExecutionContext
   });
 }
 
-ExecutionResult handle_code_EVEX_VPUNPCKHDQ_ZMM_K1Z_ZMM_ZMMM512(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VPUNPCKHDQ_ZMM_K1Z_ZMM_ZMMM512B32(ExecutionContext& ctx) {
   return vex_unpack<std::uint32_t>(ctx, [](const auto& lhs, const auto& rhs, std::size_t lane) {
     big_uint out = 0;
     for (std::size_t i = 0; i < 2; ++i) {

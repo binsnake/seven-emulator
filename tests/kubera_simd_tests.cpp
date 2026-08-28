@@ -933,3 +933,87 @@ TEST(KuberaSimd, VexNonTemporalStoreRequiresAnAlignedMemoryOperand) {
 
   EXPECT_EQ(executor.step(state, memory).reason, seven::StopReason::general_protection);
 }
+
+// Every EVEX form in simd_shuffle.cpp and simd_pack.cpp was written, compiled and then never
+// reachable: each carried a function name that no Code enum value matches (a spurious source
+// operand on the three duplicating moves, a missing B32/B64 broadcast suffix on the rest), so none
+// of them was ever registered and every one of these instructions stopped as
+// unsupported_instruction with a working handler sitting behind the wrong name.
+TEST(KuberaSimd, TheEvexShuffleAndPackFormsAreReachableAndNotJustImplemented) {
+  if (!kProfileHasAvx512) GTEST_SKIP() << "EVEX is off in this SIMD profile";
+
+  // 62 F1 6C 08 C6 CB 1B -- vshufps xmm1, xmm2, xmm3, 0x1B.
+  // imm 0x1B selects lhs[3], lhs[2], rhs[1], rhs[0].
+  run_single(seven::parse_hex_bytes("62 F1 6C 08 C6 CB 1B"),
+             [](seven::CpuState& state, seven::Memory&) {
+               set_xmm_u64(state, 2, 0x2222'2222'1111'1111ull, 0x4444'4444'3333'3333ull);
+               set_xmm_u64(state, 3, 0xBBBB'BBBB'AAAA'AAAAull, 0xDDDD'DDDD'CCCC'CCCCull);
+             },
+             [](const seven::ExecutionResult& result, const seven::CpuState& state, const seven::Memory&) {
+               EXPECT_EQ(result.reason, seven::StopReason::none);
+               EXPECT_EQ(xmm_u64(state, 1, 0), 0x3333'3333'4444'4444ull);
+               EXPECT_EQ(xmm_u64(state, 1, 1), 0xAAAA'AAAA'BBBB'BBBBull);
+             });
+
+  // 62 F1 6C 08 14 CB -- vunpcklps xmm1, xmm2, xmm3: interleaves the low two dwords of each.
+  run_single(seven::parse_hex_bytes("62 F1 6C 08 14 CB"),
+             [](seven::CpuState& state, seven::Memory&) {
+               set_xmm_u64(state, 2, 0x2222'2222'1111'1111ull, 0x4444'4444'3333'3333ull);
+               set_xmm_u64(state, 3, 0xBBBB'BBBB'AAAA'AAAAull, 0xDDDD'DDDD'CCCC'CCCCull);
+             },
+             [](const seven::ExecutionResult& result, const seven::CpuState& state, const seven::Memory&) {
+               EXPECT_EQ(result.reason, seven::StopReason::none);
+               EXPECT_EQ(xmm_u64(state, 1, 0), 0xAAAA'AAAA'1111'1111ull);
+               EXPECT_EQ(xmm_u64(state, 1, 1), 0xBBBB'BBBB'2222'2222ull);
+             });
+
+  // 62 F1 7E 08 12 CA -- vmovsldup xmm1, xmm2. The two-operand form whose handler used to be named
+  // as if it took three.
+  run_single(seven::parse_hex_bytes("62 F1 7E 08 12 CA"),
+             [](seven::CpuState& state, seven::Memory&) {
+               set_xmm_u64(state, 2, 0x2222'2222'1111'1111ull, 0x4444'4444'3333'3333ull);
+             },
+             [](const seven::ExecutionResult& result, const seven::CpuState& state, const seven::Memory&) {
+               EXPECT_EQ(result.reason, seven::StopReason::none);
+               EXPECT_EQ(xmm_u64(state, 1, 0), 0x1111'1111'1111'1111ull);
+               EXPECT_EQ(xmm_u64(state, 1, 1), 0x3333'3333'3333'3333ull);
+             });
+
+  // 62 F1 6D 08 62 CB -- vpunpckldq xmm1, xmm2, xmm3, the same shape over in simd_pack.cpp.
+  run_single(seven::parse_hex_bytes("62 F1 6D 08 62 CB"),
+             [](seven::CpuState& state, seven::Memory&) {
+               set_xmm_u64(state, 2, 0x2222'2222'1111'1111ull, 0x4444'4444'3333'3333ull);
+               set_xmm_u64(state, 3, 0xBBBB'BBBB'AAAA'AAAAull, 0xDDDD'DDDD'CCCC'CCCCull);
+             },
+             [](const seven::ExecutionResult& result, const seven::CpuState& state, const seven::Memory&) {
+               EXPECT_EQ(result.reason, seven::StopReason::none);
+               EXPECT_EQ(xmm_u64(state, 1, 0), 0xAAAA'AAAA'1111'1111ull);
+               EXPECT_EQ(xmm_u64(state, 1, 1), 0xBBBB'BBBB'2222'2222ull);
+             });
+}
+
+// The other half of why these were held back: both files read a memory operand without ever asking
+// whether EVEX.b was set, so a {1toN} source read the full operand width instead of one element.
+TEST(KuberaSimd, TheEvexShuffleBroadcastReadsOneElementNotTheWholeOperand) {
+  if (!kProfileHasAvx512) GTEST_SKIP() << "EVEX is off in this SIMD profile";
+  constexpr std::uint64_t kData = 0x4000;
+
+  // 62 F1 6C 18 C6 8F 00 00 00 00 90 -- vshufps xmm1, xmm2, dword ptr [rdi]{1to4}, 0x90.
+  // imm 0x90 takes lhs[0], lhs[0], rhs[1], rhs[2]. Reading one dword and repeating it makes both
+  // rhs lanes the first dword; reading all sixteen bytes would take the second and third instead,
+  // which is what the four distinct values in memory are there to expose.
+  run_single(seven::parse_hex_bytes("62 F1 6C 18 C6 8F 00 00 00 00 90"),
+             [kData](seven::CpuState& state, seven::Memory& memory) {
+               memory.map(kData, 0x1000);
+               state.gpr[7] = kData;
+               set_xmm_u64(state, 2, 0x2222'2222'1111'1111ull, 0x4444'4444'3333'3333ull);
+               static constexpr std::uint32_t kWords[4] = {0xAAAA'AAAAu, 0xBBBB'BBBBu, 0xCCCC'CCCCu, 0xDDDD'DDDDu};
+               ASSERT_TRUE(memory.write(kData, kWords, sizeof(kWords)));
+             },
+             [](const seven::ExecutionResult& result, const seven::CpuState& state, const seven::Memory&) {
+               EXPECT_EQ(result.reason, seven::StopReason::none);
+               EXPECT_EQ(xmm_u64(state, 1, 0), 0x1111'1111'1111'1111ull);
+               EXPECT_EQ(xmm_u64(state, 1, 1), 0xAAAA'AAAA'AAAA'AAAAull)
+                   << "both lanes are the broadcast element, not the second and third dwords";
+             });
+}
