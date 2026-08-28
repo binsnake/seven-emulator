@@ -605,3 +605,32 @@ TEST(KuberaLiveness, RepneScasKeepsTheZeroFlagItLoopsOn) {
   EXPECT_EQ(state.gpr[1], 0u) << "the scan stopped early on a zero flag that was masked away";
   EXPECT_EQ(state.gpr[7], kData + 16) << "rdi must have walked the whole buffer";
 }
+
+// AAM is the third divide-error source after DIV and IDIV -- `aam 0` divides AL by zero -- but it
+// was the only one missing from can_fault(), so nothing forced an earlier flag write to stay live
+// across it. Its flags entry declares an unconditional CF/AF/ZF/SF/PF write, which is what lets
+// liveness mask the add below, and on the #DE path the handler returns before writing any of them.
+// Same shape as MaskedWriteSurvivesMidBlockFaultViaRun, reached through the divide-error path
+// instead of a page fault. compat32 because AAM does not decode in long mode at all.
+TEST(KuberaLiveness, MaskedWriteSurvivesAamDivideErrorViaRun) {
+  seven::CpuState state{};
+  seven::Memory memory{};
+  seven::Executor executor{};
+  state.mode = seven::ExecutionMode::compat32;
+  state.rip = kBase;
+  state.gpr[4] = kStackTop;
+  memory.map(0x4000, 0x2000);
+  // add al, bl ; aam 0
+  write_bytes(memory, kBase, {0x00, 0xD8, 0xD4, 0x00});
+  state.gpr[0] = 0xFFull;  // AL
+  state.gpr[3] = 0x01ull;  // BL
+  state.rflags = 0x202;    // CF/ZF/PF/AF all clear on entry, so a stale read is unambiguous
+
+  const auto result = executor.run(state, memory, 100);
+  ASSERT_EQ(result.reason, seven::StopReason::divide_error);
+  EXPECT_EQ(state.gpr[0] & 0xFFull, 0u) << "the add itself must have retired";
+  EXPECT_NE(state.rflags & seven::kFlagCF, 0u) << "add al,bl carried out of bit 7";
+  EXPECT_NE(state.rflags & seven::kFlagZF, 0u) << "add al,bl produced zero";
+  EXPECT_NE(state.rflags & seven::kFlagPF, 0u) << "add al,bl produced even parity";
+  EXPECT_NE(state.rflags & seven::kFlagAF, 0u) << "add al,bl carried out of bit 3";
+}

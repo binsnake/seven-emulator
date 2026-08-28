@@ -308,6 +308,12 @@ bool can_fault(const iced_x86::Instruction& instr) noexcept {
     case iced_x86::Code::DIV_RM32: case iced_x86::Code::DIV_RM64:
     case iced_x86::Code::IDIV_RM8: case iced_x86::Code::IDIV_RM16:
     case iced_x86::Code::IDIV_RM32: case iced_x86::Code::IDIV_RM64:
+    // AAM divides AL by its immediate and raises #DE when that immediate is zero (see aam.cpp),
+    // which makes it the third divide-error source and the only one that was missing here. Its
+    // flags entry claims it writes CF/AF/ZF/SF/PF unconditionally, so liveness happily masked an
+    // earlier instruction's write to those five as covered -- and on `aam 0` the handler returns
+    // before setting any of them, leaving the guest's #DE handler reading the pre-write values.
+    case iced_x86::Code::AAM_IMM8:
       return true;  // divide error is a property of the VALUE, independent of operand kind
 
     // CALL/RET push/pop the return address on the stack as an implicit side effect -- the operand
