@@ -99,6 +99,26 @@ inline bool isunsupported(Float80 x) noexcept {
     return (x.val.signif & 0x8000000000000000ULL) == 0u;
 }
 
+// The architectural tag is not a note of what a writer intended: hardware derives it from the
+// register's own bits every time, so anything that is not a plain normalized number reads back as
+// SPECIAL. Deriving it from the value here rather than from `value == 0` also keeps softfloat's
+// exception-flag global out of a path that has nothing to do with arithmetic.
+// 0 = valid, 1 = zero, 2 = special, 3 = empty.
+inline std::uint8_t x87_tag_of(Float80 x) noexcept {
+    const std::uint16_t exp = x.val.signExp & 0x7FFFu;
+    if (exp == 0x7FFFu) return 2;                        // infinity, NaN, pseudo-NaN, pseudo-infinity
+    if (exp == 0) return x.val.signif == 0 ? 1 : 2;      // zero, else (pseudo-)denormal
+    return (x.val.signif >> 63) != 0 ? 0 : 2;            // clear integer bit under a live exponent = unnormal
+}
+
+// Quieting a signalling NaN sets the top fraction bit and keeps the rest of the payload. Hardware
+// hands that back rather than a fresh indefinite, so the guest can still see which NaN it was.
+inline Float80 quiet(Float80 x) noexcept {
+    extFloat80_t r = x.val;
+    r.signif |= 0x4000000000000000ULL;
+    return Float80(r);
+}
+
 inline Float80 abs(Float80 x) noexcept {
     extFloat80_t r = x.val;
     r.signExp &= 0x7FFFu;
@@ -162,6 +182,20 @@ inline auto with_exception_flags(Fn&& fn) {
     ExceptionFlagGuard guard;
     auto value = fn();
     return Flagged<decltype(value)>{value, guard.raised()};
+}
+
+// The narrow formats are widened by softfloat rather than by the host, because the host quietens a
+// signalling NaN on the way through float/double and there is then nothing left to raise #IA about.
+inline Float80 from_f32_bits(std::uint32_t bits) noexcept {
+    return Float80(f32_to_extF80(std::bit_cast<float32_t>(bits)));
+}
+
+inline Float80 from_f64_bits(std::uint64_t bits) noexcept {
+    return Float80(f64_to_extF80(std::bit_cast<float64_t>(bits)));
+}
+
+inline Float80 round_near_even(Float80 x) noexcept {
+    return Float80(extF80_roundToInt(x.val, softfloat_round_near_even, false));
 }
 
 inline Float80 trunc(Float80 x) noexcept {

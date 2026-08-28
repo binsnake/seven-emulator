@@ -47,6 +47,26 @@ inline X87Scalar x87_indefinite() {
   return X87Scalar(v);
 }
 
+// FLDPI and its neighbours load an irrational, so the 64-bit significand is always a rounding of a
+// value with infinitely many bits left over, and hardware does that rounding under the guest's RC
+// rather than baking one answer in. Measured on this machine: every one of the five matches the
+// correctly-rounded result for all four RC settings, so the table below carries the truncated
+// significand plus the single bit that says which way round-to-nearest goes (none of them is a tie).
+// The old code went through Float80(double), which threw away 11 bits before RC could matter.
+inline X87Scalar x87_constant(const CpuState& state, std::uint16_t biased_exp, std::uint64_t truncated,
+                              bool nearest_rounds_up) {
+  bool increment = false;
+  switch ((state.get_x87_control_word() >> 10) & 0x3u) {
+    case 0: increment = nearest_rounds_up; break;
+    case 2: increment = true; break;   // toward +inf, and all five constants are positive
+    default: increment = false; break; // toward -inf and toward zero both truncate here
+  }
+  extFloat80_t v;
+  v.signExp = biased_exp;
+  v.signif = truncated + (increment ? 1u : 0u);
+  return X87Scalar(v);
+}
+
 inline std::size_t x87_st_index(iced_x86::Register reg) {
   return static_cast<std::size_t>(static_cast<std::uint32_t>(reg) - static_cast<std::uint32_t>(iced_x86::Register::ST0));
 }
@@ -58,6 +78,16 @@ inline std::size_t x87_st_index(iced_x86::Register reg) {
 inline void x87_underflow_pop(CpuState& state) {
   state.x87_set(0, x87_indefinite());
   (void)state.x87_pop();
+}
+
+// A masked stack underflow still retires whatever pop the instruction asked for. x87_pop() refuses
+// to move TOP over an empty ST(0), which is what everything else wants.
+inline void x87_forced_pop(CpuState& state) {
+  if (state.x87_is_empty(0)) {
+    x87_underflow_pop(state);
+  } else {
+    (void)state.x87_pop();
+  }
 }
 
 inline uint_fast8_t x87_softfloat_rounding_mode(const CpuState& state) {
@@ -91,20 +121,116 @@ inline bool x87_is_denormal_operand(const X87Scalar& value) {
 // The exceptions that are decided by what walked in rather than by what came out: #D, and the #IA
 // that an encoding contradicting its own exponent raises before any arithmetic happens.
 inline std::uint16_t x87_operand_exceptions(const X87Scalar& lhs, const X87Scalar& rhs) {
-  std::uint16_t exceptions = 0;
   if (seven::isunsupported(lhs) || seven::isunsupported(rhs)) {
-    exceptions |= kX87ExceptionInvalid;
+    return kX87ExceptionInvalid;
+  }
+  // A NaN operand settles the answer by itself and hardware does not go on to report #D about the
+  // other one: the denormal never takes part in an operation, so there is nothing to complain about.
+  if (seven::isnan(lhs) || seven::isnan(rhs)) {
+    return 0;
   }
   if (x87_is_denormal_operand(lhs) || x87_is_denormal_operand(rhs)) {
-    exceptions |= kX87ExceptionDenormal;
+    return kX87ExceptionDenormal;
   }
-  return exceptions;
+  return 0;
+}
+
+// The answer every x87 operation gives to the operand shapes it cannot compute with, decided before
+// it ever looks at the value: an encoding the format does not support is #IA with the indefinite, a
+// signalling NaN is #IA with that same NaN quietened, and a quiet NaN passes straight through
+// raising nothing. Only the last of the three used to happen outside the softfloat-backed
+// arithmetic, so FSCALE of a signalling NaN handed the guest back a signalling NaN and FYL2X of an
+// unnormal computed a logarithm of it. Returns true when `out` holds the answer.
+inline bool x87_special_result(const X87Scalar& value, X87Scalar& out, std::uint16_t& exceptions) {
+  if (seven::isunsupported(value)) {
+    exceptions |= kX87ExceptionInvalid;
+    out = x87_indefinite();
+    return true;
+  }
+  if (seven::issnan(value)) {
+    exceptions |= kX87ExceptionInvalid;
+    out = seven::quiet(value);
+    return true;
+  }
+  if (seven::isnan(value)) {
+    out = value;
+    return true;
+  }
+  return false;
+}
+
+// Same question for the two-operand forms. When both are quiet NaNs the x87 keeps the one with the
+// larger significand, which is what makes the choice deterministic rather than operand-order luck.
+inline bool x87_special_result(const X87Scalar& a, const X87Scalar& b, X87Scalar& out,
+                               std::uint16_t& exceptions) {
+  if (seven::isunsupported(a) || seven::isunsupported(b)) {
+    exceptions |= kX87ExceptionInvalid;
+    out = x87_indefinite();
+    return true;
+  }
+  if (seven::issnan(a) || seven::issnan(b)) {
+    exceptions |= kX87ExceptionInvalid;
+    out = seven::quiet(seven::issnan(a) ? a : b);
+    return true;
+  }
+  if (seven::isnan(a) && seven::isnan(b)) {
+    out = (a.val.signif >= b.val.signif) ? a : b;
+    return true;
+  }
+  if (seven::isnan(a) || seven::isnan(b)) {
+    out = seven::isnan(a) ? a : b;
+    return true;
+  }
+  return false;
+}
+
+// C1 is not something an instruction may leave alone. Every x87 operation with a defined C1 writes
+// it, and the meanings never overlap: 1 for a stack overflow, 0 for a stack underflow, and otherwise
+// "the rounding moved the result away from zero", which only says anything when #P fired. Everything
+// else clears it. seven wrote C1 from the compares and the stack faults and nowhere else, so an
+// ordinary FADD left whatever the guest happened to be carrying.
+inline void x87_set_c1(ExecutionContext& ctx, bool value) {
+  auto sw = ctx.state.get_x87_status_word();
+  sw = value ? static_cast<std::uint16_t>(sw | 0x0200u) : static_cast<std::uint16_t>(sw & ~0x0200u);
+  ctx.state.set_x87_status_word(sw);
 }
 
 struct X87Computed {
   X87Scalar value;
   std::uint16_t exceptions;
+  bool rounded_up = false;
 };
+
+struct X87MemOperand {
+  X87Scalar value;
+  std::uint16_t exceptions;
+};
+
+// A single- or double-precision operand has to be classified in ITS OWN format, before widening: an
+// m32 denormal is a perfectly ordinary 80-bit normal once it arrives, so asking the widened value
+// afterwards can never see the #D hardware raises. The same widening used to go through the host's
+// float/double, which quietens a signalling NaN before anything can report the #IA.
+inline X87MemOperand x87_operand_from_f32(std::uint32_t bits) {
+  std::uint16_t exceptions = 0;
+  const std::uint32_t exponent = (bits >> 23) & 0xFFu;
+  const std::uint32_t fraction = bits & 0x7FFFFFu;
+  if (exponent == 0u && fraction != 0u) exceptions |= kX87ExceptionDenormal;
+  if (exponent == 0xFFu && fraction != 0u && (fraction & 0x400000u) == 0u) exceptions |= kX87ExceptionInvalid;
+  seven::ExceptionFlagGuard contained;
+  return {seven::from_f32_bits(bits), exceptions};
+}
+
+inline X87MemOperand x87_operand_from_f64(std::uint64_t bits) {
+  std::uint16_t exceptions = 0;
+  const std::uint64_t exponent = (bits >> 52) & 0x7FFull;
+  const std::uint64_t fraction = bits & 0xFFFFFFFFFFFFFull;
+  if (exponent == 0u && fraction != 0u) exceptions |= kX87ExceptionDenormal;
+  if (exponent == 0x7FFull && fraction != 0u && (fraction & 0x8000000000000ull) == 0u) {
+    exceptions |= kX87ExceptionInvalid;
+  }
+  seven::ExceptionFlagGuard contained;
+  return {seven::from_f64_bits(bits), exceptions};
+}
 
 // One x87 operation, run under the guest's rounding control, with the exceptions read off softfloat
 // rather than inferred from the answer afterwards. SoftFloat takes both the rounding mode and the
@@ -119,8 +245,19 @@ inline X87Computed x87_evaluate(const CpuState& state, const X87Scalar& lhs, con
   }
   seven::RoundingGuard rounding(x87_softfloat_rounding_mode(state));
   const auto computed = seven::with_exception_flags([&] { return fn(lhs, rhs); });
-  return {computed.value,
-          static_cast<std::uint16_t>(operands | x87_exceptions_from_softfloat(computed.flags))};
+  const auto exceptions =
+      static_cast<std::uint16_t>(operands | x87_exceptions_from_softfloat(computed.flags));
+  bool rounded_up = false;
+  if ((exceptions & kX87ExceptionPrecision) != 0) {
+    // softfloat says the answer was inexact but not which way it went, and C1 wants the direction.
+    // Running it again with rounding truncated gives the neighbour on the toward-zero side; the two
+    // differ exactly when the guest's mode pushed the result away from zero.
+    seven::RoundingGuard truncating(softfloat_round_minMag);
+    const auto toward_zero = seven::with_exception_flags([&] { return fn(lhs, rhs); });
+    rounded_up = toward_zero.value.val.signExp != computed.value.val.signExp ||
+                 toward_zero.value.val.signif != computed.value.val.signif;
+  }
+  return {computed.value, exceptions, rounded_up};
 }
 
 // Common tail for the forms whose destination is a stack register. A masked exception does not stop
@@ -128,6 +265,7 @@ inline X87Computed x87_evaluate(const CpuState& state, const X87Scalar& lhs, con
 // deliver to the handler as a result with the exponent biased back into range, rather than leaving
 // the destination holding whatever was there before.
 inline ExecutionResult x87_finish(ExecutionContext& ctx, std::size_t dst_index, const X87Computed& computed) {
+  x87_set_c1(ctx, computed.rounded_up);
   if (computed.exceptions != 0) {
     auto result = x87_exception(ctx, computed.exceptions);
     if (!result.ok()) {
@@ -145,14 +283,27 @@ inline ExecutionResult x87_finish(ExecutionContext& ctx, std::size_t dst_index, 
 // FST/FSTP m32 and m64 round an 80-bit value into a format that cannot hold it, and that rounding is
 // where their #P, #O and #U come from. None of it used to be computed.
 template <typename Narrow>
-inline std::pair<Narrow, std::uint16_t> x87_narrow(const CpuState& state, const X87Scalar& value) {
+struct X87Narrowed {
+  Narrow value;
+  std::uint16_t exceptions;
+  bool rounded_up;
+};
+
+template <typename Narrow>
+inline X87Narrowed<Narrow> x87_narrow(const CpuState& state, const X87Scalar& value) {
   const bool unsupported = seven::isunsupported(value);
   const X87Scalar source = unsupported ? x87_indefinite() : value;
   seven::RoundingGuard rounding(x87_softfloat_rounding_mode(state));
   const auto narrowed = seven::with_exception_flags([&] { return static_cast<Narrow>(source); });
   auto exceptions = x87_exceptions_from_softfloat(narrowed.flags);
   if (unsupported) exceptions |= kX87ExceptionInvalid;
-  return {narrowed.value, exceptions};
+  bool rounded_up = false;
+  if ((exceptions & kX87ExceptionPrecision) != 0) {
+    seven::RoundingGuard truncating(softfloat_round_minMag);
+    const auto toward_zero = seven::with_exception_flags([&] { return static_cast<Narrow>(source); });
+    rounded_up = std::memcmp(&toward_zero.value, &narrowed.value, sizeof(Narrow)) != 0;
+  }
+  return {narrowed.value, exceptions, rounded_up};
 }
 
 // FCHS and FABS are the only callers and both are pure sign-bit edits, which is why the SDM gives
@@ -161,12 +312,14 @@ inline std::pair<Narrow, std::uint16_t> x87_narrow(const CpuState& state, const 
 // underflow.
 template <typename Fn>
 inline ExecutionResult x87_unary_st0(ExecutionContext& ctx, Fn&& fn) {
+  x87_set_c1(ctx, false);
   if (ctx.state.x87_is_empty(0)) return x87_stack_underflow_into(ctx, 0);
   ctx.state.x87_set(0, fn(ctx.state.x87_get(0)));
   return {};
 }
 
 inline ExecutionResult x87_fxch(ExecutionContext& ctx) {
+  x87_set_c1(ctx, false);
   if (ctx.instr.op_kind(1) != iced_x86::OpKind::REGISTER) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
@@ -189,21 +342,23 @@ inline ExecutionResult x87_fxch(ExecutionContext& ctx) {
 
 template <typename Fn>
 inline ExecutionResult x87_binary_mem_st0(ExecutionContext& ctx, std::size_t width, Fn&& fn) {
-  X87Scalar rhs = 0;
+  X87MemOperand rhs{};
   if (width == 4) {
-    float v = 0.0f;
+    std::uint32_t v = 0;
     if (!ctx.memory.read(detail::memory_address(ctx), &v, 4)) return detail::memory_fault(ctx, detail::memory_address(ctx));
-    rhs = static_cast<X87Scalar>(v);
+    rhs = x87_operand_from_f32(v);
   } else if (width == 8) {
-    double v = 0.0;
+    std::uint64_t v = 0;
     if (!ctx.memory.read(detail::memory_address(ctx), &v, 8)) return detail::memory_fault(ctx, detail::memory_address(ctx));
-    rhs = static_cast<X87Scalar>(v);
+    rhs = x87_operand_from_f64(v);
   } else {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if (ctx.state.x87_is_empty(0)) return x87_stack_underflow_into(ctx, 0);
   const auto lhs = ctx.state.x87_get(0);
-  return x87_finish(ctx, 0, x87_evaluate(ctx.state, lhs, rhs, std::forward<Fn>(fn)));
+  auto computed = x87_evaluate(ctx.state, lhs, rhs.value, std::forward<Fn>(fn));
+  computed.exceptions |= rhs.exceptions;
+  return x87_finish(ctx, 0, computed);
 }
 
 template <typename Fn>
@@ -261,6 +416,7 @@ inline ExecutionResult x87_binary_st_regs(ExecutionContext& ctx, std::uint32_t d
 }
 
 inline ExecutionResult x87_store_mem(ExecutionContext& ctx, std::size_t width, bool pop) {
+  x87_set_c1(ctx, false);
   bool underflowed = false;
   if (ctx.state.x87_is_empty(0)) {
     auto fault = x87_stack_underflow(ctx);
@@ -272,19 +428,21 @@ inline ExecutionResult x87_store_mem(ExecutionContext& ctx, std::size_t width, b
   const auto value = underflowed ? x87_indefinite() : ctx.state.x87_get(0);
   ExecutionResult result = {};
   if (width == 4) {
-    const auto [narrowed, exceptions] = x87_narrow<float>(ctx.state, value);
-    if (exceptions != 0) {
-      auto fault = x87_exception(ctx, exceptions);
+    const auto narrowed = x87_narrow<float>(ctx.state, value);
+    x87_set_c1(ctx, narrowed.rounded_up);
+    if (narrowed.exceptions != 0) {
+      auto fault = x87_exception(ctx, narrowed.exceptions);
       if (!fault.ok()) return fault;
     }
-    result = detail::write_memory_checked(ctx, detail::memory_address(ctx), narrowed);
+    result = detail::write_memory_checked(ctx, detail::memory_address(ctx), narrowed.value);
   } else if (width == 8) {
-    const auto [narrowed, exceptions] = x87_narrow<double>(ctx.state, value);
-    if (exceptions != 0) {
-      auto fault = x87_exception(ctx, exceptions);
+    const auto narrowed = x87_narrow<double>(ctx.state, value);
+    x87_set_c1(ctx, narrowed.rounded_up);
+    if (narrowed.exceptions != 0) {
+      auto fault = x87_exception(ctx, narrowed.exceptions);
       if (!fault.ok()) return fault;
     }
-    result = detail::write_memory_checked(ctx, detail::memory_address(ctx), narrowed);
+    result = detail::write_memory_checked(ctx, detail::memory_address(ctx), narrowed.value);
   } else if (width == 10) {
     std::array<std::uint8_t, 16> raw{};
     x87_encoding::encode_ext80(value, raw.data());
@@ -305,7 +463,9 @@ inline ExecutionResult x87_store_mem(ExecutionContext& ctx, std::size_t width, b
 }
 
 inline ExecutionResult x87_push_from_memory(ExecutionContext& ctx, std::size_t width) {
+  x87_set_c1(ctx, false);
   X87Scalar value = 0;
+  std::uint16_t exceptions = 0;
   if (width == 10) {
     std::array<std::uint8_t, 16> raw{};
     if (!ctx.memory.read(detail::memory_address(ctx), raw.data(), 10)) {
@@ -313,15 +473,23 @@ inline ExecutionResult x87_push_from_memory(ExecutionContext& ctx, std::size_t w
     }
     value = x87_encoding::decode_ext80(raw.data());
   } else if (width == 4) {
-    float v = 0.0f;
+    std::uint32_t v = 0;
     if (!ctx.memory.read(detail::memory_address(ctx), &v, 4)) return detail::memory_fault(ctx, detail::memory_address(ctx));
-    value = static_cast<X87Scalar>(v);
+    const auto operand = x87_operand_from_f32(v);
+    value = operand.value;
+    exceptions = operand.exceptions;
   } else if (width == 8) {
-    double v = 0.0;
+    std::uint64_t v = 0;
     if (!ctx.memory.read(detail::memory_address(ctx), &v, 8)) return detail::memory_fault(ctx, detail::memory_address(ctx));
-    value = static_cast<X87Scalar>(v);
+    const auto operand = x87_operand_from_f64(v);
+    value = operand.value;
+    exceptions = operand.exceptions;
   } else {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
+  }
+  if (exceptions != 0) {
+    auto result = x87_exception(ctx, exceptions);
+    if (!result.ok()) return result;
   }
   if (!ctx.state.x87_push(value)) {
     return x87_stack_overflow(ctx);
@@ -351,6 +519,7 @@ inline ExecutionResult x87_store_integer(ExecutionContext& ctx, std::size_t widt
 
   // These forms store the INTEGER indefinite, which is the most negative value of the destination
   // width and not the floating-point one -- and `lower` already is it.
+  x87_set_c1(ctx, false);
   bool underflowed = false;
   if (ctx.state.x87_is_empty(0)) {
     auto fault = x87_stack_underflow(ctx);
@@ -362,14 +531,24 @@ inline ExecutionResult x87_store_integer(ExecutionContext& ctx, std::size_t widt
   X87Scalar stored = lower;
   if (!underflowed) {
     const auto value = ctx.state.x87_get(0);
-    const auto rounded = truncate_only ? seven::trunc(value) : x87_round_to_control(ctx.state, value);
-    if (rounded != value) {
-      exceptions |= kX87ExceptionPrecision;
-    }
-    stored = rounded;
-    if (seven::isnan(rounded) || seven::isinf(rounded) || rounded < lower || rounded > upper) {
+    // A NaN, an infinity and an unnormal have no integer at all, so hardware raises #IA, stores the
+    // integer indefinite and stops. It does not also report #P: nothing was rounded. seven used to
+    // round the NaN first, which set #P and could set C1 with it.
+    if (seven::isnan(value) || seven::isinf(value) || seven::isunsupported(value)) {
       exceptions |= kX87ExceptionInvalid;
-      stored = lower;
+    } else {
+      const auto truncated = seven::trunc(value);
+      const auto rounded = truncate_only ? truncated : x87_round_to_control(ctx.state, value);
+      if (rounded != value) {
+        exceptions |= kX87ExceptionPrecision;
+        // Rounded away from zero exactly when the answer is not the toward-zero neighbour.
+        x87_set_c1(ctx, rounded != truncated);
+      }
+      stored = rounded;
+      if (rounded < lower || rounded > upper) {
+        exceptions |= kX87ExceptionInvalid;
+        stored = lower;
+      }
     }
     // An unmasked exception means the instruction faults, and a faulting instruction must not have
     // touched its destination. This used to write first and report afterwards.
@@ -398,6 +577,7 @@ inline ExecutionResult x87_store_integer(ExecutionContext& ctx, std::size_t widt
 }
 
 inline ExecutionResult x87_load_integer(ExecutionContext& ctx, std::size_t width) {
+  x87_set_c1(ctx, false);
   X87Scalar value = 0;
   if (width == 2) {
     std::int16_t v = 0;
@@ -419,13 +599,7 @@ inline ExecutionResult x87_load_integer(ExecutionContext& ctx, std::size_t width
 }
 
 inline X87Scalar x87_round_half_even(X87Scalar value) {
-  const X87Scalar flo = seven::floor(value);
-  const X87Scalar frac = value - flo;
-  const X87Scalar half = X87Scalar(0.5);
-  if (frac < half) return flo;
-  if (frac > half) return flo + 1;
-  const X87Scalar parity = seven::fmod(seven::abs(flo), X87Scalar(2));
-  return parity == 0 ? flo : flo + 1;
+  return seven::round_near_even(value);
 }
 
 inline X87Scalar x87_round_to_control(const CpuState& state, X87Scalar value) {
@@ -438,6 +612,12 @@ inline X87Scalar x87_round_to_control(const CpuState& state, X87Scalar value) {
 }
 
 inline int x87_cmp(X87Scalar a, X87Scalar b, bool quiet, std::uint16_t& exceptions) {
+  // A compare looks at its operands' encodings the same way arithmetic does: an unnormal has no
+  // ordering and raises #IA, a denormal orders fine but still raises #D. Neither used to be asked.
+  exceptions |= x87_operand_exceptions(a, b);
+  if (seven::isunsupported(a) || seven::isunsupported(b)) {
+    return -2;
+  }
   if (seven::isnan(a) || seven::isnan(b)) {
     // "Quiet" is FUCOM, and it is only quiet about quiet NaNs. A signalling operand raises #IA on
     // both forms; the flag used to suppress it for either kind.
@@ -485,6 +665,52 @@ inline bool x87_trig_argument_out_of_range(const X87Scalar& value) {
   return (value.val.signExp & 0x7FFFu) >= 0x403Eu;
 }
 
+// ln 2 to the format's full width, correctly rounded. Used where a series collapses to its first
+// term, so the double round-trip the transcendentals otherwise take would lose the whole answer.
+inline X87Scalar x87_ln2() {
+  extFloat80_t v;
+  v.signExp = 0x3FFEu;
+  v.signif = 0xB17217F7D1CF79ACull;
+  return X87Scalar(v);
+}
+
+// Below 2^-64 the first term of a Taylor series is the whole answer at this width: sin x and tan x
+// are x, cos x is 1, and 2^x - 1 is x ln 2. Worth special-casing because the host double these are
+// otherwise computed through cannot hold an operand that small at all, so it answered zero or one
+// for an entire denormal range that hardware fills in properly.
+inline bool x87_tiny_argument(const X87Scalar& value) {
+  if (value == X87Scalar(0) || seven::isnan(value) || seven::isinf(value)) return false;
+  return (value.val.signExp & 0x7FFFu) < (0x3FFFu - 64u);
+}
+
+// The prologue every one-operand transcendental shares. Returns an engaged result when the operand
+// was a shape the operation cannot compute with, in which case the answer has already been written.
+inline std::optional<ExecutionResult> x87_reject_operand(ExecutionContext& ctx, const X87Scalar& value) {
+  X87Scalar answer{};
+  std::uint16_t exceptions = 0;
+  if (!x87_special_result(value, answer, exceptions)) return std::nullopt;
+  if (exceptions != 0) {
+    auto result = x87_exception(ctx, exceptions);
+    if (!result.ok()) return result;
+  }
+  ctx.state.x87_set(0, answer);
+  return ExecutionResult{};
+}
+
+// Same, for the two forms that leave a second register behind. Hardware puts the same answer in both.
+inline std::optional<ExecutionResult> x87_reject_operand_and_push(ExecutionContext& ctx, const X87Scalar& value) {
+  X87Scalar answer{};
+  std::uint16_t exceptions = 0;
+  if (!x87_special_result(value, answer, exceptions)) return std::nullopt;
+  if (exceptions != 0) {
+    auto result = x87_exception(ctx, exceptions);
+    if (!result.ok()) return result;
+  }
+  ctx.state.x87_set(0, answer);
+  if (!ctx.state.x87_push(answer)) return x87_stack_overflow(ctx);
+  return ExecutionResult{};
+}
+
 inline void x87_set_eflags_cmp(ExecutionContext& ctx, int relation) {
   auto sw = ctx.state.get_x87_status_word();
   sw &= static_cast<std::uint16_t>(~0x0200u);
@@ -492,10 +718,14 @@ inline void x87_set_eflags_cmp(ExecutionContext& ctx, int relation) {
   detail::set_flag(ctx.state.rflags, kFlagCF, relation == -2 || relation < 0);
   detail::set_flag(ctx.state.rflags, kFlagPF, relation == -2);
   detail::set_flag(ctx.state.rflags, kFlagZF, relation == -2 || relation == 0);
+  // The FCOMI family writes all six status flags, not just the three it has answers for. Leaving
+  // OF, SF and AF alone let whatever the guest happened to be carrying survive the compare.
+  ctx.state.rflags &= ~(kFlagOF | kFlagSF | kFlagAF);
 }
 
 inline ExecutionResult x87_move_if(ExecutionContext& ctx, bool take) {
   if (!take) return {};
+  x87_set_c1(ctx, false);
   if (ctx.instr.op_kind(1) != iced_x86::OpKind::REGISTER) return detail::memory_fault(ctx, detail::memory_address(ctx));
   const auto src = ctx.instr.op_register(1);
   if (src < iced_x86::Register::ST0 || src > iced_x86::Register::ST7) return detail::memory_fault(ctx, detail::memory_address(ctx));
@@ -509,22 +739,30 @@ inline ExecutionResult x87_compare_mem(ExecutionContext& ctx, std::size_t width,
   X87Scalar rhs = 0;
   std::uint16_t exceptions = 0;
   if (width == 4) {
-    float v = 0.0f;
+    std::uint32_t v = 0;
     if (!ctx.memory.read(detail::memory_address(ctx), &v, 4)) return detail::memory_fault(ctx, detail::memory_address(ctx));
-    rhs = static_cast<X87Scalar>(v);
+    const auto operand = x87_operand_from_f32(v);
+    rhs = operand.value;
+    exceptions |= operand.exceptions;
   } else if (width == 8) {
-    double v = 0.0;
+    std::uint64_t v = 0;
     if (!ctx.memory.read(detail::memory_address(ctx), &v, 8)) return detail::memory_fault(ctx, detail::memory_address(ctx));
-    rhs = static_cast<X87Scalar>(v);
+    const auto operand = x87_operand_from_f64(v);
+    rhs = operand.value;
+    exceptions |= operand.exceptions;
   } else {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
+  // An empty operand has nothing to compare, so the unordered answer above IS the answer: falling
+  // through to x87_cmp overwrote it with an ordinary comparison of whatever stale bits were still
+  // in the register. It is also #IS, not a bare #IA, so SF has to be set with it.
   if (ctx.state.x87_is_empty(0)) {
-    exceptions |= kX87ExceptionInvalid;
     if (eflags) x87_set_eflags_cmp(ctx, -2);
     else x87_set_cmp_flags(ctx, -2);
-    auto result = x87_exception(ctx, exceptions);
+    auto result = x87_stack_underflow(ctx);
     if (!result.ok()) return result;
+    if (pop) x87_forced_pop(ctx.state);
+    return {};
   }
   const int rel = x87_cmp(ctx.state.x87_get(0), rhs, quiet, exceptions);
   if (eflags) x87_set_eflags_cmp(ctx, rel);
@@ -540,11 +778,13 @@ inline ExecutionResult x87_compare_mem(ExecutionContext& ctx, std::size_t width,
 inline ExecutionResult x87_compare_indices(ExecutionContext& ctx, std::size_t lhs_idx, std::size_t rhs_idx, bool pop_lhs, bool pop_rhs, bool eflags, bool quiet = false) {
   std::uint16_t exceptions = 0;
   if (ctx.state.x87_is_empty(lhs_idx) || ctx.state.x87_is_empty(rhs_idx)) {
-    exceptions |= kX87ExceptionInvalid;
     if (eflags) x87_set_eflags_cmp(ctx, -2);
     else x87_set_cmp_flags(ctx, -2);
-    auto result = x87_exception(ctx, exceptions);
+    auto result = x87_stack_underflow(ctx);
     if (!result.ok()) return result;
+    if (pop_rhs) x87_forced_pop(ctx.state);
+    if (pop_lhs) x87_forced_pop(ctx.state);
+    return {};
   }
   const int rel = x87_cmp(ctx.state.x87_get(lhs_idx), ctx.state.x87_get(rhs_idx), quiet, exceptions);
   if (eflags) x87_set_eflags_cmp(ctx, rel);
@@ -572,11 +812,12 @@ inline ExecutionResult x87_compare_st0_sti(ExecutionContext& ctx, std::uint32_t 
   const auto src_idx = x87_st_index(src_reg);
   std::uint16_t exceptions = 0;
   if (ctx.state.x87_is_empty(0) || ctx.state.x87_is_empty(src_idx)) {
-    exceptions |= kX87ExceptionInvalid;
     if (eflags) x87_set_eflags_cmp(ctx, -2);
     else x87_set_cmp_flags(ctx, -2);
-    auto result = x87_exception(ctx, exceptions);
+    auto result = x87_stack_underflow(ctx);
     if (!result.ok()) return result;
+    if (pop_st0) x87_forced_pop(ctx.state);
+    return {};
   }
   const int rel = x87_cmp(ctx.state.x87_get(0), ctx.state.x87_get(src_idx), quiet, exceptions);
   if (eflags) x87_set_eflags_cmp(ctx, rel);
@@ -590,6 +831,7 @@ inline ExecutionResult x87_compare_st0_sti(ExecutionContext& ctx, std::uint32_t 
 }
 
 inline ExecutionResult x87_load_bcd(ExecutionContext& ctx) {
+  x87_set_c1(ctx, false);
   const auto base = detail::memory_address(ctx);
   std::uint64_t magnitude = 0;
   std::uint64_t mul = 1;
@@ -610,6 +852,7 @@ inline ExecutionResult x87_load_bcd(ExecutionContext& ctx) {
 }
 
 inline ExecutionResult x87_store_bcd(ExecutionContext& ctx) {
+  x87_set_c1(ctx, false);
   const auto base = detail::memory_address(ctx);
   if (ctx.state.x87_is_empty(0)) {
     auto fault = x87_stack_underflow(ctx);
@@ -644,6 +887,7 @@ inline ExecutionResult x87_store_bcd(ExecutionContext& ctx) {
 }
 
 inline ExecutionResult x87_store_st0_to_sti(ExecutionContext& ctx, bool pop) {
+  x87_set_c1(ctx, false);
   // FSTP ST(i) and friends carry exactly one operand, the destination. Reading operand 1 here got
   // Register::NONE for every one of them, so `fstp st(0)` -- the ordinary way to drop the top of
   // the stack -- wrote to ST(7) and left it tagged valid.
@@ -662,14 +906,21 @@ inline ExecutionResult x87_store_st0_to_sti(ExecutionContext& ctx, bool pop) {
 }
 
 inline ExecutionResult x87_free_sti(ExecutionContext& ctx, bool pop) {
+  x87_set_c1(ctx, false);
   if (!x87_operand_is_st(ctx, 0)) return detail::memory_fault(ctx, detail::memory_address(ctx));
   const auto reg = ctx.instr.op_register(0);
   ctx.state.x87_mark_empty(x87_st_index(reg));
-  if (pop && !ctx.state.x87_pop()) return x87_stack_underflow(ctx);
+  // FFREEP marks a register empty and then advances TOP, and neither half asks whether anything was
+  // there. Going through x87_pop() meant `ffreep st(0)` freed ST(0), found it empty, and reported a
+  // stack underflow that hardware never raises.
+  if (pop) {
+    ctx.state.set_x87_top(static_cast<std::uint8_t>((ctx.state.get_x87_top() + 1) & 0x7));
+  }
   return {};
 }
 
 inline ExecutionResult x87_fstp_m80fp(ExecutionContext& ctx) {
+  x87_set_c1(ctx, false);
   const auto base = detail::memory_address(ctx);
   bool underflowed = false;
   if (ctx.state.x87_is_empty(0)) {
@@ -795,7 +1046,7 @@ inline ExecutionResult x87_stack_overflow(ExecutionContext& ctx) {
   const auto top = static_cast<std::uint8_t>((ctx.state.get_x87_top() + 7) & 0x7);
   ctx.state.set_x87_top(top);
   ctx.state.x87_stack[top] = x87_indefinite();
-  ctx.state.x87_tags[top] = 0x0;
+  ctx.state.x87_tags[top] = seven::x87_tag_of(x87_indefinite());
   return {};
 }
 

@@ -25,7 +25,23 @@ ExecutionResult x87_partial_remainder(ExecutionContext& ctx, bool round_to_neare
   const X87Scalar a = ctx.state.x87_get(0);
   const X87Scalar b = ctx.state.x87_get(1);
 
-  if (seven::isnan(a) || seven::isnan(b) || seven::isinf(a) || b == X87Scalar(0)) {
+  // A quiet NaN operand is not an invalid operation: it propagates, and the partial remainder is
+  // simply not finished with it. Only the shapes that have no answer at all -- a signalling NaN, an
+  // unsupported encoding, an infinite dividend, a zero divisor -- raise #IA.
+  {
+    X87Scalar answer{};
+    std::uint16_t special = 0;
+    if (x87_special_result(a, b, answer, special)) {
+      x87_set_c2(ctx, false);
+      if (special != 0) {
+        auto result = x87_exception(ctx, special);
+        if (!result.ok()) return result;
+      }
+      ctx.state.x87_set(0, answer);
+      return {};
+    }
+  }
+  if (seven::isinf(a) || b == X87Scalar(0)) {
     x87_set_c2(ctx, false);
     auto result = x87_exception(ctx, kX87ExceptionInvalid);
     if (!result.ok()) return result;

@@ -158,7 +158,7 @@ struct CpuState {
   void x87_set(std::size_t st_index, X87Scalar value) noexcept {
     const auto idx = x87_phys_index(st_index);
     x87_stack[idx] = value;
-    x87_tags[idx] = (value == 0) ? 0x1 : 0x0;
+    x87_tags[idx] = seven::x87_tag_of(value);
   }
 
   void x87_mark_empty(std::size_t st_index) noexcept {
@@ -206,7 +206,7 @@ struct CpuState {
     }
     x87_top = new_top;
     x87_stack[new_top] = value;
-    x87_tags[new_top] = (value == 0) ? 0x1 : 0x0;
+    x87_tags[new_top] = seven::x87_tag_of(value);
     set_x87_top(x87_top);
     return true;
   }
