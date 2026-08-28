@@ -96,8 +96,13 @@ ExecutionResult handle_code_POPFQ(ExecutionContext& ctx) {
   return {};
 }
 
+// HLT is CPL0-only. A ring-3 guest reaching this was halting the machine instead of faulting,
+// which is the one privileged instruction where the wrong answer stops execution outright.
 ExecutionResult handle_code_HLT(ExecutionContext& ctx) {
-  (void)ctx;
+  if ((ctx.state.sreg[1] & 0x3u) != 0) {
+    return {StopReason::general_protection, 0,
+            ExceptionInfo{StopReason::general_protection, ctx.state.rip, 0}, ctx.instr.code()};
+  }
   return {StopReason::halted, 0, std::nullopt, std::nullopt};
 }
 

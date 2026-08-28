@@ -376,6 +376,10 @@ bool can_fault(const iced_x86::Instruction& instr) noexcept {
     // write before it as covered, and a #GP at CPL>0 means that cover never happens.
     case iced_x86::Code::SYSRETD: case iced_x86::Code::SYSRETQ:
     case iced_x86::Code::SYSEXITD: case iced_x86::Code::SYSEXITQ:
+    // The three cache/halt instructions that kept their unconditional bodies the longest. Their
+    // effects are not modelled, so the CPL check is the only thing they do, which makes it the
+    // only reason they can fault.
+    case iced_x86::Code::INVD: case iced_x86::Code::WBINVD: case iced_x86::Code::HLT:
       return true;
     default:
       return false;

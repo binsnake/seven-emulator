@@ -102,7 +102,9 @@ TEST(KuberaLiveness, TrapFlagDisablesMaskingViaRun) {
   write_bytes(memory, kBase, {0x48, 0x01, 0xD8, 0x48, 0x01, 0xD1});
   const std::uint8_t hlt[] = {0xF4};
   (void)memory.write(kDbHandler, hlt, sizeof(hlt));
-  write_idt_gate64(memory, kIdtBase, 1, 0x33, kDbHandler);
+  // Ring-0 gate selector, unlike the 0x33 the other IDT tests use, because the gate's selector
+  // becomes the handler's CPL and HLT is CPL0-only. A real exception gate points at ring 0 anyway.
+  write_idt_gate64(memory, kIdtBase, 1, 0x08, kDbHandler);
   state.gpr[0] = 0xFFFFFFFFFFFFFFFFull;  // rax
   state.gpr[3] = 1ull;                   // rbx
 
@@ -183,6 +185,54 @@ TEST(KuberaLiveness, MaskedWriteSurvivesCliGpFaultViaRun) {
   EXPECT_EQ(state.gpr[0], 0u);
   EXPECT_NE(state.rflags & seven::kFlagCF, 0u);
   EXPECT_NE(state.rflags & seven::kFlagZF, 0u);
+}
+
+// INVD, WBINVD and HLT were the last three CPL0-only instructions with no privilege check. Their
+// bodies did nothing observable so it read as a fidelity gap, but the fuzzer's hardware oracle
+// disagrees loudly once its lanes run at the ring 3 they actually execute at: 159 divergences in
+// 20k iterations, all three of these. Same can_fault() requirement as the rest, since none of them
+// has a memory operand to be recognized by.
+TEST(KuberaLiveness, MaskedWriteSurvivesInvdGpFaultViaRun) {
+  const std::vector<std::pair<std::vector<std::uint8_t>, const char*>> cases = {
+      {{0x0F, 0x08}, "invd"},
+      {{0x0F, 0x09}, "wbinvd"},
+      {{0xF4}, "hlt"},
+  };
+  for (const auto& [tail, name] : cases) {
+    seven::CpuState state{};
+    seven::Memory memory{};
+    seven::Executor executor{};
+    state.mode = seven::ExecutionMode::long64;
+    state.rip = kBase;
+    state.gpr[4] = kStackTop;
+    state.sreg[1] = 0x2B;  // CPL 3
+    std::vector<std::uint8_t> code = {0x48, 0x01, 0xD8};  // add rax,rbx
+    code.insert(code.end(), tail.begin(), tail.end());
+    write_bytes(memory, kBase, code);
+    state.gpr[0] = 0xFFFFFFFFFFFFFFFFull;
+    state.gpr[3] = 1ull;
+
+    const auto result = executor.run(state, memory, 100);
+    ASSERT_EQ(result.reason, seven::StopReason::general_protection) << name << " must #GP at CPL 3";
+    EXPECT_EQ(state.gpr[0], 0u) << name;
+    EXPECT_NE(state.rflags & seven::kFlagCF, 0u) << name << " must not lose the covering flag write";
+    EXPECT_NE(state.rflags & seven::kFlagZF, 0u) << name;
+  }
+}
+
+TEST(KuberaLiveness, TheCpl0OnlyCacheInstructionsStillRunAtRing0) {
+  // The other half of the gate: the check is on privilege, not a blanket refusal.
+  for (const std::vector<std::uint8_t> code : {std::vector<std::uint8_t>{0x0F, 0x08},
+                                               std::vector<std::uint8_t>{0x0F, 0x09}}) {
+    seven::CpuState state{};
+    seven::Memory memory{};
+    seven::Executor executor{};
+    state.mode = seven::ExecutionMode::long64;
+    state.rip = kBase;
+    state.gpr[4] = kStackTop;
+    write_bytes(memory, kBase, code);
+    EXPECT_EQ(executor.step(state, memory).reason, seven::StopReason::none);
+  }
 }
 
 TEST(KuberaLiveness, JitBypassEligibleReflectsHooksAndTrapState) {
