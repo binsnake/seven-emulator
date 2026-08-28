@@ -1438,6 +1438,208 @@ TEST(KuberaScalar, DividingByZeroIsNotAlsoAnOverflow) {
   EXPECT_EQ(f.status() & 0x0008u, 0u) << "and not #O as well";
 }
 
+// #P used to come out of x87_precision_from_binary's algebraic probes instead of the arithmetic.
+// 1 + 2^-65 rounds back to 1, and the probe reads (result - rhs == lhs) as proof that nothing was
+// lost, so the one addition here that is inexact by construction reported itself exact.
+TEST(KuberaScalar, PrecisionComesFromTheRealInexactFlagNotAnAlgebraicProbe) {
+  X87Fixture f;
+  f.state.gpr[1] = kX87Data + 64;
+  const std::uint64_t quarter_ulp = 0x3BE0000000000000ull;  // 2^-65
+  ASSERT_TRUE(f.memory.write(kX87Data + 64, &quarter_ulp, sizeof(quarter_ulp)));
+  f.load_code("D9 E8 DC 01");  // fld1 ; fadd qword [rcx]
+  softfloat_exceptionFlags = 0;
+  f.run(2);
+
+  EXPECT_EQ(f.state.x87_get(0).val.signif, 0x8000000000000000ull) << "the sum rounds back to 1.0";
+  EXPECT_EQ(f.state.x87_get(0).val.signExp, 0x3FFFu);
+  EXPECT_EQ(f.status() & 0x0020u, 0x0020u) << "#P: a quarter of an ulp went missing";
+  EXPECT_EQ(softfloat_exceptionFlags, 0u)
+      << "the flags are a global too, so reading them means putting them back";
+}
+
+// #U was raised for any denormal result at all. The architecture wants tininess AND inexactness,
+// and 2^-16382 halved is a denormal that lost nothing on the way there.
+TEST(KuberaScalar, AnExactDenormalResultIsNeitherAnUnderflowNorInexact) {
+  X87Fixture f;
+  f.state.gpr[1] = kX87Data + 64;
+  write_extf80(f.memory, kX87Data, 0x8000000000000000ull, 0x0001);  // 2^-16382, smallest normal
+  const std::uint64_t two = 0x4000000000000000ull;
+  ASSERT_TRUE(f.memory.write(kX87Data + 64, &two, sizeof(two)));
+  f.load_code("DB 2B DC 31");  // fld tbyte [rbx] ; fdiv qword [rcx]
+  f.run(2);
+
+  EXPECT_EQ(f.state.x87_get(0).val.signExp, 0x0000u) << "2^-16383, a denormal";
+  EXPECT_EQ(f.state.x87_get(0).val.signif, 0x4000000000000000ull);
+  EXPECT_EQ(f.status() & 0x0010u, 0u) << "#U also needs the result to be inexact";
+  EXPECT_EQ(f.status() & 0x0020u, 0u) << "and nothing was lost, so no #P either";
+}
+
+// #D says an OPERAND was denormal. It was being read off the result, so ordinary arithmetic on two
+// normal numbers reported a denormal operand it never had.
+TEST(KuberaScalar, DenormalIsAnOperandConditionNotAResultCondition) {
+  {
+    X87Fixture f;
+    f.state.gpr[1] = kX87Data + 64;
+    write_extf80(f.memory, kX87Data, 0x8000000000000003ull, 0x0001);  // normal, low bits set
+    const std::uint64_t four = 0x4010000000000000ull;
+    ASSERT_TRUE(f.memory.write(kX87Data + 64, &four, sizeof(four)));
+    f.load_code("DB 2B DC 31");  // fld tbyte [rbx] ; fdiv qword [rcx]
+    f.run(2);
+
+    EXPECT_EQ(f.state.x87_get(0).val.signExp, 0x0000u) << "a denormal, and an inexact one";
+    EXPECT_EQ(f.status() & 0x0030u, 0x0030u) << "#U and #P are both real here";
+    EXPECT_EQ(f.status() & 0x0002u, 0u) << "but neither operand was denormal";
+  }
+  {
+    // The operand side still reports, which is the half that was always right.
+    X87Fixture f;
+    f.state.gpr[1] = kX87Data + 64;
+    write_extf80(f.memory, kX87Data, 0x4000000000000000ull, 0x0000);  // a denormal operand
+    const double one = 1.0;
+    ASSERT_TRUE(f.memory.write(kX87Data + 64, &one, sizeof(one)));
+    f.load_code("DB 2B DC 01");  // fld tbyte [rbx] ; fadd qword [rcx]
+    f.run(2);
+
+    EXPECT_EQ(f.status() & 0x0002u, 0x0002u) << "#D";
+  }
+}
+
+// Arithmetic on an encoding that contradicts its own exponent has no answer. seven only knew about
+// those in FXAM, so an unnormal walked into extF80_add and came back out as an ordinary number.
+TEST(KuberaScalar, AnUnsupportedOperandRaisesInvalidAndYieldsTheIndefinite) {
+  X87Fixture f;
+  f.state.gpr[1] = kX87Data + 64;
+  write_extf80(f.memory, kX87Data, 0x4000000000000000ull, 0x4000);  // unnormal
+  const double one = 1.0;
+  ASSERT_TRUE(f.memory.write(kX87Data + 64, &one, sizeof(one)));
+  f.load_code("DB 2B DC 01");  // fld tbyte [rbx] ; fadd qword [rcx]
+  f.run(2);
+
+  EXPECT_EQ(f.status() & 0x0001u, 0x0001u) << "#IA";
+  EXPECT_EQ(f.state.x87_get(0).val.signExp, 0xFFFFu) << "and the masked answer is the indefinite";
+  EXPECT_EQ(f.state.x87_get(0).val.signif, 0xC000000000000000ull);
+}
+
+// FST/FSTP to m32 and m64 narrow an 80-bit value and computed no exceptions at all, so a value that
+// did not fit the destination was stored rounded, or as an infinity, with a clean status word.
+TEST(KuberaScalar, NarrowingStoresReportWhatTheConversionCost) {
+  {
+    X87Fixture f;
+    f.state.gpr[1] = kX87Data + 64;
+    write_extf80(f.memory, kX87Data, 0x8000000000000001ull, 0x3FFF);  // 1 + 2^-63
+    f.load_code("DB 2B D9 19");  // fld tbyte [rbx] ; fstp dword [rcx]
+    f.run(2);
+
+    std::uint32_t stored = 0;
+    ASSERT_TRUE(f.memory.read(kX87Data + 64, &stored, sizeof(stored)));
+    EXPECT_EQ(stored, 0x3F800000u) << "1.0f, everything below it rounded away";
+    EXPECT_EQ(f.status() & 0x0020u, 0x0020u) << "#P";
+    EXPECT_EQ(f.status() & 0x0008u, 0u) << "and it is not an overflow";
+  }
+  {
+    X87Fixture f;
+    f.state.gpr[1] = kX87Data + 64;
+    write_extf80(f.memory, kX87Data, 0x8000000000000000ull, 0x40C7);  // 2^200
+    f.load_code("DB 2B D9 19");  // fld tbyte [rbx] ; fstp dword [rcx]
+    f.run(2);
+
+    std::uint32_t stored = 0;
+    ASSERT_TRUE(f.memory.read(kX87Data + 64, &stored, sizeof(stored)));
+    EXPECT_EQ(stored, 0x7F800000u) << "the masked #O answer is an infinity";
+    EXPECT_EQ(f.status() & 0x0028u, 0x0028u) << "#O and #P";
+  }
+  {
+    X87Fixture f;
+    f.state.gpr[1] = kX87Data + 64;
+    write_extf80(f.memory, kX87Data, 0x8000000000000000ull, 0x382F);  // 2^-2000
+    f.load_code("DB 2B DD 19");  // fld tbyte [rbx] ; fstp qword [rcx]
+    f.run(2);
+
+    std::uint64_t stored = 0;
+    ASSERT_TRUE(f.memory.read(kX87Data + 64, &stored, sizeof(stored)));
+    EXPECT_EQ(stored, 0u) << "too small for a double subnormal";
+    EXPECT_EQ(f.status() & 0x0030u, 0x0030u) << "#U and #P";
+  }
+}
+
+// FSQRT asked whether sqrt(x) differed from x and called that a precision loss, which is true of
+// almost every square root there is. Its own negative-operand check also reported #IA and returned
+// without leaving the masked answer behind, so ST(0) kept the operand.
+TEST(KuberaScalar, FsqrtReportsSoftFloatsExactnessAndTheMaskedInvalidAnswer) {
+  {
+    X87Fixture f;
+    write_extf80(f.memory, kX87Data, 0x8000000000000000ull, 0x4001);  // 4.0
+    f.load_code("DB 2B D9 FA");  // fld tbyte [rbx] ; fsqrt
+    f.run(2);
+
+    EXPECT_EQ(f.state.x87_get(0).val.signExp, 0x4000u) << "2.0";
+    EXPECT_EQ(f.status() & 0x0020u, 0u) << "an exact root is not a precision loss";
+  }
+  {
+    X87Fixture f;
+    write_extf80(f.memory, kX87Data, 0x8000000000000000ull, 0x4000);  // 2.0
+    f.load_code("DB 2B D9 FA");
+    f.run(2);
+    EXPECT_EQ(f.status() & 0x0020u, 0x0020u) << "sqrt(2) does not fit, so #P";
+  }
+  {
+    X87Fixture f;
+    write_extf80(f.memory, kX87Data, 0x8000000000000000ull, 0xBFFF);  // -1.0
+    f.load_code("DB 2B D9 FA");
+    f.run(2);
+
+    EXPECT_EQ(f.status() & 0x0001u, 0x0001u) << "#IA";
+    EXPECT_EQ(f.state.x87_get(0).val.signExp, 0xFFFFu) << "and the masked answer is the indefinite";
+    EXPECT_EQ(f.state.x87_get(0).val.signif, 0xC000000000000000ull);
+  }
+}
+
+// FCHS and FABS edit the sign bit and nothing else. The SDM gives them #IS and no other exception,
+// signalling NaNs and unsupported encodings included, but they went through the same result-reading
+// classifier as the arithmetic and so reported a denormal operand as an underflow.
+TEST(KuberaScalar, FabsAndFchsRaiseNothingAtAll) {
+  for (const auto* code : {"DB 2B D9 E1", "DB 2B D9 E0"}) {  // fld tbyte [rbx] ; fabs / fchs
+    X87Fixture f;
+    write_extf80(f.memory, kX87Data, 0x4000000000000000ull, 0x0000);  // a denormal
+    f.load_code(code);
+    f.run(2);
+
+    EXPECT_EQ(f.status() & 0x003Fu, 0u) << code << " is a sign-bit edit, not arithmetic";
+    EXPECT_EQ(f.state.x87_get(0).val.signif, 0x4000000000000000ull) << "and it keeps the value";
+  }
+}
+
+// IEEE 754 7.5 and SDM 4.9.1.5 both hand an enabled underflow trap a result whose exponent has been
+// biased back into range rather than leaving the destination stale. The fault used to be reported
+// with ST(0) still holding the dividend.
+TEST(KuberaScalar, AnUnmaskedUnderflowDeliversTheBiasedResult) {
+  const auto divide_by_four = [](std::uint16_t control_word, X87Fixture& f) {
+    f.state.gpr[1] = kX87Data + 64;
+    write_extf80(f.memory, kX87Data, 0x8000000000000003ull, 0x0001);
+    const std::uint64_t four = 0x4010000000000000ull;
+    ASSERT_TRUE(f.memory.write(kX87Data + 64, &four, sizeof(four)));
+    ASSERT_TRUE(f.memory.write(kX87Data + 32, &control_word, sizeof(control_word)));
+    // fldcw [rbx+0x20] ; fld tbyte [rbx] ; fdiv qword [rcx]
+    f.load_code("D9 6B 20 DB 2B DC 31");
+  };
+
+  X87Fixture masked;
+  divide_by_four(0x037F, masked);
+  masked.run(3);
+  const auto gradual = masked.state.x87_get(0);
+  ASSERT_EQ(gradual.val.signExp, 0x0000u) << "the masked response is the denormal";
+
+  X87Fixture trapped;
+  divide_by_four(0x036F, trapped);  // #U unmasked
+  trapped.run(2);
+  EXPECT_EQ(trapped.executor.step(trapped.state, trapped.memory).reason,
+            seven::StopReason::floating_point_exception);
+
+  const auto expected = seven::ldexp(gradual, 24576);
+  EXPECT_EQ(trapped.state.x87_get(0).val.signExp, expected.val.signExp);
+  EXPECT_EQ(trapped.state.x87_get(0).val.signif, expected.val.signif);
+}
+
 // FUCOM is quiet about quiet NaNs only. The flag used to suppress #IA for signalling ones too.
 TEST(KuberaScalar, FucompIsQuietForAQuietNanButNotForASignallingOne) {
   const auto run_with = [](std::uint64_t significand) {

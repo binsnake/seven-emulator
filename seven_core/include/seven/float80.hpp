@@ -13,7 +13,7 @@ namespace seven {
 
 class Float80 {
 public:
-    extFloat80_t val{};  // zero-initialised → +0.0
+    extFloat80_t val{};  // zero-initialised -> +0.0
 
     Float80() = default;
     explicit Float80(extFloat80_t v) noexcept : val(v) {}
@@ -65,7 +65,7 @@ public:
     explicit operator int()         const noexcept { return static_cast<int>(static_cast<std::int64_t>(*this)); }
 };
 
-// ── bit-level helpers ────────────────────────────────────────────────────────
+// -- bit-level helpers --------------------------------------------------------
 
 inline bool isnan(Float80 x) noexcept {
     return (x.val.signExp & 0x7FFFu) == 0x7FFFu &&
@@ -105,16 +105,16 @@ inline Float80 abs(Float80 x) noexcept {
     return Float80(r);
 }
 
-// ── rounding ─────────────────────────────────────────────────────────────────
+// -- rounding -----------------------------------------------------------------
 
 // SoftFloat takes the rounding mode for add/sub/mul/div/sqrt from a mutable global instead of an
 // argument, so honouring the guest's FCW.RC means writing that global around the call. Every write
 // is paired with a restore on the same scope exit, and the guard writes nothing at all when the
 // mode already matches, which covers every guest that leaves RC at round-to-nearest.
 //
-// The global is not thread-local in this build: softfloat's generated platform.h leaves THREAD_LOCAL
-// empty, so two guests running on separate host threads can interleave a save/restore pair and
-// strand the loser's mode. Defining THREAD_LOCAL for the softfloat target is what makes that safe.
+// The build defines THREAD_LOCAL for the softfloat target, so the global is per-thread and two
+// guests on separate host threads cannot interleave a save/restore pair and strand each other's
+// mode. Without that definition softfloat's headers fall back to an empty macro and they can.
 class RoundingGuard {
 public:
     explicit RoundingGuard(uint_fast8_t mode) noexcept
@@ -132,6 +132,38 @@ private:
     bool changed_;
 };
 
+// The exceptions an operation raised come out of a second global, and softfloat only ever ORs into
+// it, so a reading means nothing unless it was cleared first. Same discipline as RoundingGuard: own
+// the global for the length of one operation, then put back whatever the caller had accumulated so
+// nothing outside the scope sees it move. raised() has to be read before the guard goes out of
+// scope, which is why with_exception_flags below is the way most callers reach it.
+class ExceptionFlagGuard {
+public:
+    ExceptionFlagGuard() noexcept : saved_(softfloat_exceptionFlags) { softfloat_exceptionFlags = 0; }
+    ~ExceptionFlagGuard() noexcept { softfloat_exceptionFlags = saved_; }
+    ExceptionFlagGuard(const ExceptionFlagGuard&) = delete;
+    ExceptionFlagGuard& operator=(const ExceptionFlagGuard&) = delete;
+
+    [[nodiscard]] uint_fast8_t raised() const noexcept { return softfloat_exceptionFlags; }
+
+private:
+    uint_fast8_t saved_;
+};
+
+template <typename T>
+struct Flagged {
+    T value;
+    uint_fast8_t flags;
+};
+
+// Runs fn() with the exception flags cleared and hands back both its result and what it raised.
+template <typename Fn>
+inline auto with_exception_flags(Fn&& fn) {
+    ExceptionFlagGuard guard;
+    auto value = fn();
+    return Flagged<decltype(value)>{value, guard.raised()};
+}
+
 inline Float80 trunc(Float80 x) noexcept {
     return Float80(extF80_roundToInt(x.val, softfloat_round_minMag, false));
 }
@@ -144,7 +176,7 @@ inline Float80 ceil(Float80 x) noexcept {
     return Float80(extF80_roundToInt(x.val, softfloat_round_max, false));
 }
 
-// ── remainder ────────────────────────────────────────────────────────────────
+// -- remainder ----------------------------------------------------------------
 
 inline Float80 remainder(Float80 a, Float80 b) noexcept {
     return Float80(extF80_rem(a.val, b.val));
@@ -169,7 +201,7 @@ inline Float80 fmod(Float80 a, Float80 b) noexcept {
     return signbit(a) ? (r - abs(b)) : (r + abs(b));
 }
 
-// ── exponent manipulation (exact, no precision loss) ─────────────────────────
+// -- exponent manipulation (exact, no precision loss) -------------------------
 
 // Entirely in the exponent/significand domain, with a 64-bit accumulator. The previous version
 // added `int n` to the biased exponent as an int, which overflows for a large n (FSCALE hands this
@@ -247,13 +279,13 @@ inline Float80 frexp(Float80 x, int* exp) noexcept {
     return Float80(r);
 }
 
-// ── sqrt (exact via SoftFloat) ────────────────────────────────────────────────
+// -- sqrt (exact via SoftFloat) ------------------------------------------------
 
 inline Float80 sqrt(Float80 x) noexcept {
     return Float80(extF80_sqrt(x.val));
 }
 
-// ── transcendentals via double round-trip ────────────────────────────────────
+// -- transcendentals via double round-trip ------------------------------------
 // x87 transcendentals are not required to be correctly rounded, so double
 // precision (53-bit mantissa) is acceptable for FSIN/FCOS/FTAN/FATAN2/FYL2X.
 
@@ -284,7 +316,7 @@ inline Float80 log2(Float80 x) noexcept {
 
 }  // namespace seven
 
-// ── std::numeric_limits specialisation ───────────────────────────────────────
+// -- std::numeric_limits specialisation ---------------------------------------
 
 namespace std {
 
@@ -326,7 +358,7 @@ public:
         return seven::Float80(r);
     }
 
-    // smallest positive normal: biased_exp=1 → actual=-16382
+    // smallest positive normal: biased_exp=1 -> actual=-16382
     static seven::Float80 min() noexcept {
         extFloat80_t r;
         r.signExp = 1u;

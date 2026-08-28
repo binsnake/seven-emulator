@@ -473,22 +473,15 @@ ExecutionResult handle_code_FABS(ExecutionContext& ctx) {
   return x87_unary_st0(ctx, [](X87Scalar v) { return seven::abs(v); });
 }
 
+// extF80_sqrt raises #IA on a negative operand itself and reports its own inexactness, so none of
+// this needs guessing. The old version asked whether sqrt(x) differed from x and called that a
+// precision loss, which is true of almost every square root there is.
 ExecutionResult handle_code_FSQRT(ExecutionContext& ctx) {
   if (ctx.state.x87_is_empty(0)) return x87_stack_underflow_into(ctx, 0);
   const X87Scalar value = ctx.state.x87_get(0);
-  if (value < 0) return x87_exception(ctx, kX87ExceptionInvalid);
-  const X87Scalar result = x87_with_rounding(ctx.state, [&] { return seven::sqrt(value); });
-  if (value != 0 && result == 0) {
-    auto r = x87_exception(ctx, static_cast<std::uint16_t>(kX87ExceptionUnderflow | kX87ExceptionPrecision));
-    if (!r.ok()) return r;
-  }
-  if (const auto exceptions = x87_classify_result(result, value, 0); exceptions != 0) {
-    auto r = x87_exception(ctx, exceptions);
-    if (!r.ok()) return r;
-  }
-  if (auto r = x87_precision_if_changed(ctx, value, result); !r.ok()) return r;
-  ctx.state.x87_set(0, result);
-  return {};
+  return x87_finish(ctx, 0, x87_evaluate(ctx.state, value, 0, [](X87Scalar v, X87Scalar) {
+                      return seven::sqrt(v);
+                    }));
 }
 
 ExecutionResult handle_code_FRNDINT(ExecutionContext& ctx) {
