@@ -282,7 +282,11 @@ struct DebugMemoryAccess {
 }  // namespace
 
 constexpr std::size_t Executor::stop_reason_to_index(StopReason reason) noexcept {
-  return static_cast<std::size_t>(reason);
+  // stop_reason_counts_ is sized from the last enumerator, but two of the reasons this indexes with
+  // come straight out of an embedder hook's ExecutionResult, so the value is not guaranteed to be
+  // one of them. Bucket anything outside the enum at `none` rather than write past the vector.
+  const auto index = static_cast<std::size_t>(reason);
+  return index < kStopReasonCount ? index : 0;
 }
 
 void Executor::reset_stats() {
@@ -473,6 +477,13 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
     return fallback;
   };
 
+  // RF and the SS-load shadow are spent at the top of an attempt, but an instruction that faults
+  // never ran, so a fault hook asking for a retry has to get them back. Without that the second
+  // attempt fires the very execute breakpoint they exist to suppress, and the guest's #DB handler
+  // irets straight back onto the same faulting instruction.
+  bool rf_consumed = false;
+  std::uint8_t debug_suppression_consumed = 0;
+
   for (std::size_t attempt = 0; attempt < kMaxFaultRetries; ++attempt) {
     const auto try_recover_fault = [&](const ExecutionResult& fault, std::uint64_t fault_address) -> bool {
       const auto action = run_fault_hooks(FaultHookEvent{state, memory, fault, instruction_start_rip, fault_address});
@@ -485,15 +496,22 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
             static_cast<unsigned long long>(fault_address),
             static_cast<unsigned>(action));
       }
-      if (action == FaultHookAction::retry) {
-        return true;
+      if (action != FaultHookAction::retry && action != FaultHookAction::restart_instruction) {
+        return false;
+      }
+      if (rf_consumed) {
+        state.rflags |= kFlagRF;
+        rf_consumed = false;
+      }
+      if (debug_suppression_consumed != 0) {
+        state.debug_suppression = debug_suppression_consumed;
+        debug_suppression_consumed = 0;
       }
       if (action == FaultHookAction::restart_instruction) {
         state.rip = instruction_start_rip;
         state.gpr[4] = mask_stack_pointer(state, state.gpr[4]);
-        return true;
       }
-      return false;
+      return true;
     };
 
     // memory_fault() applies this to data references, but the fetch path builds its faults inline
@@ -798,9 +816,11 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
     const bool rf_suppressed = (state.rflags & kFlagRF) != 0;
     if (rf_suppressed) {
       state.rflags &= ~kFlagRF;
+      rf_consumed = true;
     }
     const bool debug_suppressed = state.debug_suppression != 0;
     if (debug_suppressed) {
+      debug_suppression_consumed = state.debug_suppression;
       state.debug_suppression = 0;
     }
     const bool tf_active = (state.rflags & kFlagTF) != 0;
@@ -809,7 +829,11 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
       if (exec_hit_bits != 0) {
         state.dr[6] |= exec_hit_bits;
         ExecutionContext db_ctx{state, memory, instr, next_rip, false};
-        const auto db_result = detail::dispatch_interrupt(db_ctx, 1u, instruction_start_rip);
+        // An instruction breakpoint is a fault, so the frame carries the breakpointed instruction's
+        // own rip and the handler's iret lands right back on it. RF in the saved rflags image is the
+        // only thing that stops the breakpoint firing again on that return -- without it the guest
+        // never retires the instruction.
+        const auto db_result = detail::dispatch_interrupt(db_ctx, 1u, instruction_start_rip, std::nullopt, true);
         if (db_result.reason != StopReason::none) {
           if (try_recover_fault(db_result, fault_address_of(db_result, state.rip))) {
             continue;

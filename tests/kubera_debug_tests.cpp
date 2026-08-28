@@ -877,3 +877,161 @@ TEST(KuberaDebug, PushfqCannotStepPastADataWatchpointOnItsOwnStackSlot) {
   EXPECT_NE(state.dr[6] & 0x1u, 0u) << "the push slipped past the watchpoint";
   EXPECT_EQ(state.rip, kDbHandler);
 }
+
+// An instruction breakpoint is a fault, not a trap: the frame carries the breakpointed
+// instruction's own rip, so the handler's iret lands right back on it. RF in the saved rflags image
+// is the only thing that stops the same breakpoint firing again on that return, and the frame went
+// out without it. Any guest that arms DR0 on an instruction and whose #DB handler simply irets
+// never retires that instruction -- it re-delivers on every step, forever.
+TEST(KuberaDebug, ExecuteBreakpointFrameSetsRfSoTheIretMakesProgress) {
+  seven::CpuState state{};
+  seven::Memory memory{};
+  seven::Executor executor{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.gpr[4] = kStackTop;
+  state.sreg[1] = 0x33;
+  state.rflags = 0x202;
+  state.idtr.base = kIdtBase;
+  state.idtr.limit = 0x1000 - 1;
+  memory.map(kIdtBase, 0x1000);
+  memory.map(kDbHandler, 0x1000);
+  memory.map(0x4000, 0x2000);
+  write_bytes(memory, kBase, {0x90, 0x90});
+  const std::uint8_t iretq[] = {0x48, 0xCF};
+  (void)memory.write(kDbHandler, iretq, sizeof(iretq));
+  write_idt_gate64(memory, kIdtBase, 1, 0x33, kDbHandler);
+  state.dr[0] = kBase;
+  state.dr[7] = 0x1;
+
+  const auto r1 = executor.step(state, memory);
+  ASSERT_EQ(r1.reason, seven::StopReason::none);
+  ASSERT_EQ(state.rip, kDbHandler);
+
+  // rip (8) then cs (2) sit below it, so the pushed rflags image is at rsp + 10.
+  std::uint64_t frame_rflags = 0;
+  ASSERT_TRUE(memory.read(state.gpr[4] + 10, &frame_rflags, sizeof(frame_rflags)));
+  EXPECT_NE(frame_rflags & seven::kFlagRF, 0u) << "the frame's rflags image has no RF";
+
+  const auto r2 = executor.step(state, memory);
+  ASSERT_EQ(r2.reason, seven::StopReason::none);
+  ASSERT_EQ(state.rip, kBase);
+  EXPECT_NE(state.rflags & seven::kFlagRF, 0u) << "the iret restored no RF";
+
+  const auto r3 = executor.step(state, memory);
+  ASSERT_EQ(r3.reason, seven::StopReason::none);
+  EXPECT_EQ(state.rip, kBase + 1) << "the breakpoint re-delivered instead of retiring the nop";
+}
+
+// RF and the SS-load shadow are consumed at the top of the instruction, but an instruction that
+// faults never ran. A fault hook asking for a retry re-entered with both already spent, so the
+// second attempt fired the very execute breakpoint they exist to suppress -- and the guest's #DB
+// handler then irets back onto the same faulting instruction.
+TEST(KuberaDebug, AFaultRetryKeepsRfSuppressingTheExecuteBreakpoint) {
+  seven::CpuState state{};
+  seven::Memory memory{};
+  seven::Executor executor{};
+  constexpr std::uint64_t kDataPage = 0x70000;
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.gpr[4] = kStackTop;
+  state.gpr[3] = kDataPage;
+  state.sreg[1] = 0x33;
+  state.rflags = 0x202 | seven::kFlagRF;
+  state.idtr.base = kIdtBase;
+  state.idtr.limit = 0x1000 - 1;
+  memory.map(kIdtBase, 0x1000);
+  memory.map(kDbHandler, 0x1000);
+  memory.map(0x4000, 0x2000);
+  write_bytes(memory, kBase, {0x8B, 0x03});  // mov eax, [rbx]
+  write_idt_gate64(memory, kIdtBase, 1, 0x33, kDbHandler);
+  state.dr[0] = kBase;
+  state.dr[7] = 0x1;
+
+  int hook_calls = 0;
+  const auto id = executor.add_fault_hook([&](const seven::FaultHookEvent& event) {
+    if (++hook_calls > 1) {
+      return seven::FaultHookAction::stop;
+    }
+    event.memory.map(kDataPage, 0x1000);
+    return seven::FaultHookAction::restart_instruction;
+  });
+  ASSERT_NE(id, 0u);
+
+  const auto result = executor.step(state, memory);
+  ASSERT_EQ(result.reason, seven::StopReason::none);
+  EXPECT_EQ(hook_calls, 1);
+  EXPECT_EQ(state.rip, kBase + 2) << "the retry lost RF and took the execute breakpoint";
+  EXPECT_EQ(state.dr[6] & 0x1u, 0u);
+}
+
+TEST(KuberaDebug, AFaultRetryKeepsTheSsShadowSuppressingTheExecuteBreakpoint) {
+  seven::CpuState state{};
+  seven::Memory memory{};
+  seven::Executor executor{};
+  constexpr std::uint64_t kDataPage = 0x70000;
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.gpr[4] = kStackTop;
+  state.gpr[0] = 0x2Bull;
+  state.gpr[3] = kDataPage;
+  state.sreg[1] = 0x33;
+  state.rflags = 0x202;
+  state.idtr.base = kIdtBase;
+  state.idtr.limit = 0x1000 - 1;
+  memory.map(kIdtBase, 0x1000);
+  memory.map(kDbHandler, 0x1000);
+  memory.map(0x4000, 0x2000);
+  write_bytes(memory, kBase, {0x8E, 0xD0, 0x8B, 0x03});  // mov ss, ax; mov eax, [rbx]
+  write_idt_gate64(memory, kIdtBase, 1, 0x33, kDbHandler);
+  state.dr[0] = kBase + 2;
+  state.dr[7] = 0x1;
+
+  int hook_calls = 0;
+  const auto id = executor.add_fault_hook([&](const seven::FaultHookEvent& event) {
+    if (++hook_calls > 1) {
+      return seven::FaultHookAction::stop;
+    }
+    event.memory.map(kDataPage, 0x1000);
+    return seven::FaultHookAction::restart_instruction;
+  });
+  ASSERT_NE(id, 0u);
+
+  const auto r1 = executor.step(state, memory);
+  ASSERT_EQ(r1.reason, seven::StopReason::none);
+  ASSERT_EQ(state.rip, kBase + 2);
+
+  const auto r2 = executor.step(state, memory);
+  ASSERT_EQ(r2.reason, seven::StopReason::none);
+  EXPECT_EQ(hook_calls, 1);
+  EXPECT_EQ(state.rip, kBase + 4) << "the retry lost the SS shadow and took the execute breakpoint";
+  EXPECT_EQ(state.dr[6] & 0x1u, 0u);
+}
+
+// stop_reason_counts_ is sized from the last enumerator, and every fault path indexes it with the
+// reason it is about to report. Two of those reasons come straight out of an embedder hook's
+// ExecutionResult, so a value outside the enum walked off the end of the vector.
+TEST(KuberaDebug, AnOutOfRangeStopReasonFromAHookStaysInsideTheCountsVector) {
+  seven::CpuState state{};
+  seven::Memory memory{};
+  seven::Executor executor{};
+  state.mode = seven::ExecutionMode::long64;
+  state.rip = kBase;
+  state.gpr[4] = kStackTop;
+  state.rflags = 0x202;
+  memory.map(0x4000, 0x2000);
+  write_bytes(memory, kBase, {0x90});
+
+  const auto id = executor.add_instruction_hook([&](seven::InstructionHookContext&) {
+    seven::InstructionHookResult hook_result{};
+    hook_result.action = seven::InstructionHookAction::stop;
+    hook_result.stop_result = seven::ExecutionResult{static_cast<seven::StopReason>(200), 0, std::nullopt, std::nullopt};
+    return hook_result;
+  });
+  ASSERT_NE(id, 0u);
+
+  const auto before = executor.stop_reason_counts()[0];
+  const auto result = executor.step(state, memory);
+  EXPECT_EQ(static_cast<unsigned>(result.reason), 200u);
+  EXPECT_EQ(executor.stop_reason_counts()[0], before + 1) << "the count landed outside the vector";
+}
