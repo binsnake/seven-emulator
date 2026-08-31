@@ -230,15 +230,11 @@ TEST(KuberaDecoder, VectorLengthDoesNotPromoteScalarOperands) {
   }
 }
 
-// iced carries a per-Code operand table describing how each Code is encoded, and the decoder is
-// supposed to agree with it. Where a Code's table says an operand is register-only -- either a
-// register field outright, or the r/m field restricted to mod == 3 -- that operand must never come
-// back as memory. When it does, the decoder handed out the wrong Code for the encoding, and the
-// handler that Code dispatches to reads a register slot the decoder never filled in.
-//
-// Two ways that happened here. The serialized tables store one Code per group and count the rest
-// off from it, which lands on an unrelated instruction wherever the enum is not contiguous; and a
-// register-only handler read a memory operand instead of rejecting mod != 3.
+// Where a Code's operand table says register-only, the decoder must never hand back memory: when it
+// does, the Code is wrong for the encoding and its handler reads a register slot never filled in.
+// Two causes here -- the serialized tables count Codes off a group base, which lands on an unrelated
+// instruction wherever the enum is not contiguous, and a handler that read memory instead of
+// rejecting mod != 3.
 namespace {
 
 [[nodiscard]] bool operand_kind_is_register_only(iced_x86::OpCodeOperandKind kind) {

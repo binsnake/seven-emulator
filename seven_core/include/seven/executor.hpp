@@ -62,16 +62,11 @@ class Executor {
   // host stack. Legitimate nesting is a couple of frames (a device callback inside a fault handler
   // inside a step is three).
   static constexpr std::size_t kMaxStepDepth = 8;
-  // Counting levels is not by itself a bound on what has to fit, which is bytes, and the two only
-  // agree if the per-level cost is known. It is not small: one re-entry cycle (a step_impl frame
-  // plus the handler and Memory frames under it) measures about 105 KB optimized, so the level cap
-  // alone permits roughly 950 KB and leaves a default 1 MB stack nothing for the embedder's own
-  // hook body. A build that pads locals, such as a sanitizer one, runs out partway through the cap
-  // instead, which is the crash the cap exists to prevent. So re-entry is bounded by how far the
-  // stack has actually descended since the outermost step as well as by how many levels deep it is.
-  // Overshoots by the one frame already entered when the check runs, which the budget leaves room
-  // for. Sized to still admit the three legitimate levels described above at the measured cost,
-  // while capping the worst case near a third of a 1 MB stack instead of very nearly all of it.
+  // Counting levels does not bound bytes unless the per-level cost is known, and it is not small:
+  // one re-entry cycle measures about 105 KB optimized, so the level cap alone permits roughly
+  // 950 KB of a 1 MB stack. Re-entry is therefore also bounded by how far the stack has actually
+  // descended since the outermost step. Sized to still admit the three legitimate levels above while
+  // capping the worst case near a third of the stack.
   static constexpr std::size_t kMaxStepStackBytes = 256u * 1024u;
   // The fault path step() runs, for an execution engine (see seven_jit) that raised the fault in its
   // own generated code instead of going through step(). state.rip must already point at the faulting

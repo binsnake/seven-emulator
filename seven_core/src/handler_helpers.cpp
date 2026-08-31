@@ -130,18 +130,11 @@ std::uint64_t sign_extend(std::uint64_t value, std::size_t width) {
 }
 
 ExecutionResult memory_fault(ExecutionContext& ctx, std::uint64_t address) {
-  // A non-canonical linear address always faults #GP(0) on real hardware, checked before any page
-  // walk even happens -- never a #PF, regardless of whether the underlying page would otherwise be
-  // mapped. Confirmed against real hardware via a standalone probe -- this is what seven-fuzzer's
-  // BT/BTS/BTR/BTC findings turned out to be (a huge, fuzzer-random register bit index extends the
-  // effective address per the SDM, routinely landing non-canonical), fixed here since bt.cpp/
-  // bts.cpp/btr.cpp/btc.cpp's memory-destination path calls into this via
-  // read_memory_checked/write_memory_checked. NOTE: this is NOT a universal fix -- most ALU/data
-  // handlers (mov_base.cpp, add.cpp, sub.cpp, and dozens more) construct their own inline
-  // {StopReason::page_fault, ...} result instead of calling this function, so they still don't get
-  // this check. Making that universal would mean replacing ~400 inline call sites across ~35 files
-  // with calls to this function -- a real, high-value follow-up, deliberately not attempted in this
-  // pass (too large a mechanical refactor to rush without reviewing every site individually).
+  // A non-canonical linear address always faults #GP(0), checked before any page walk, never #PF.
+  // Confirmed against real hardware with a standalone probe; this is what seven-fuzzer's BT/BTS/BTR/
+  // BTC findings turned out to be, since a huge register bit index extends the effective address per
+  // the SDM and routinely lands non-canonical. The inline {StopReason::page_fault} sites that used
+  // to bypass this were later swept across every handler, so the check is universal now.
   if (!is_canonical_address(address)) {
     return {StopReason::general_protection, 0, ExceptionInfo{StopReason::general_protection, address, 0}, ctx.instr.code()};
   }

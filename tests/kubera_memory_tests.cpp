@@ -112,15 +112,10 @@ TEST(KuberaMemory, NonWrappingAccessStillReachesMmioCallback) {
   EXPECT_EQ(buffer[0], 0x42u);
 }
 
-// Same overflow shape as find_mmio_region, in Memory::access_allowed()'s range-scoped hook
-// overlap check: it computed access_end = event.address + event.size with no wraparound guard.
-// A guest picking an address near ~0ull can wrap access_end back down past zero, which a plain
-// non-wrapping interval test then wrongly reads as "no overlap" against a hook's registered
-// range -- even though the access's real (wrapping) span may well touch it. For a write hook
-// specifically this matters more than a missed notification: access_allowed() runs BEFORE the
-// underlying page write in Memory::write(), so a hook skipped this way never gets the chance to
-// veto (its callback returning false is what blocks the write) -- a real bypass of whatever the
-// hook enforces, reachable purely by a guest choosing a wraparound address.
+// Same overflow shape as find_mmio_region, here in access_allowed()'s hook overlap check: an
+// address near ~0ull wraps address + size back past zero and the interval test reads it as no
+// overlap. This runs before the page write, so a skipped write hook never gets to veto -- a real
+// bypass reachable purely by choosing a wraparound address.
 TEST(KuberaMemory, WraparoundWriteStillInvokesRangeScopedAccessHook) {
   seven::Memory memory{};
 
@@ -1394,15 +1389,9 @@ TEST(KuberaMemory, ReentrantStepCostsABoundedNumberOfStackBytesPerLevel) {
 }
 
 #if defined(_MSC_VER)
-// The guarded build's whole claim is that an access one byte past a guest page stops in hardware.
-// Nothing else in the suite can check that: every other test goes through Memory's own bounds
-// checks, and the accesses this is meant to catch are the ones that skip those -- the JIT's fast
-// path stores through the raw pointer page_data() hands out, from code it emitted itself, which no
-// sanitizer and no bounds check ever sees.
-//
-// So this test takes that exact pointer and walks off the end of it. It has to fail in the default
-// build for the guarded build's pass to mean anything, which is why the two halves assert opposite
-// things rather than the disabled half quietly passing.
+// Takes the raw page_data() pointer the JIT's fast path stores through -- which no bounds check or
+// sanitizer sees -- and walks off the end of it. The two halves assert opposite things on purpose:
+// this has to fail in the default build for the guarded build's pass to mean anything.
 TEST(KuberaMemory, GuardedBuildFaultsOnAnAccessOneBytePastAGuestPage) {
   if (!seven::kGuardedPagesEnabled) {
     GTEST_SKIP() << "built without SEVEN_GUARDED_PAGES, so there is no guard page to hit";

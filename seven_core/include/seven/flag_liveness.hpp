@@ -16,16 +16,13 @@ struct FlagLivenessInstr {
   std::uint64_t dead_flags_mask = 0;
 };
 
-// Standard backward liveness dataflow over the six ALU status flags (CF/PF/AF/ZF/SF/OF), treating
-// each bit as an independent "variable". `insts` is in program order (the order the block will
-// execute in), and every entry's `dead_flags_mask` is overwritten in place.
+// Backward liveness dataflow over the six ALU status flags, each treated as an independent
+// variable. `insts` is in program order and every dead_flags_mask is overwritten in place.
 //
-// This only ever *skips* a write that is provably unobservable -- it never changes what value a
-// flag ends up holding when that value is actually read. Callers are responsible for only invoking
-// this when it's sound to skip writes at all: instruction/code hooks and memory-access hooks can
-// observe rflags at points iced's per-instruction read/write tables don't know about (mid-block,
-// via ExecutionContext), so this must not be used while any of those are registered. Trap and
-// (address-)execution hooks don't have that problem, and don't need to gate this.
+// This only ever skips a provably unobservable write, never changing a value that is actually read.
+// The caller decides whether skipping writes is sound at all: instruction, code and memory-access
+// hooks can observe rflags mid-block through ExecutionContext, so this must not run while any are
+// registered. Trap and execution hooks do not have that problem.
 void compute_flag_liveness(std::span<FlagLivenessInstr> insts) noexcept;
 
 // Whether this decoded instruction can fault (memory operand, DIV/IDIV, or implicit stack access

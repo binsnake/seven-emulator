@@ -368,16 +368,10 @@ TEST(KuberaSimd, LegacyMovntpsFaultsOnMisalignedMemoryOperand) {
 }
 
 TEST(KuberaSimd, VexVshufpsSelectsCorrectLanesFromBothSources) {
-  // Regression for a real orphaned-handler gap: this handler existed and was correct, but was
-  // registered under the wrong name (missing the trailing _IMM8 the real Code enum value has),
-  // so real VSHUFPS/VEX_VSHUFPS_..._IMM8 hit unsupported_instruction until it was renamed and
-  // wired into handled_codes.def.
-  //
-  // Hand-encoded (InstructionFactory can't produce an IMMEDIATE8 operand here -- iced_x86's
-  // get_immediate_op_kind() is a stub that always returns UNKNOWN_OP_KIND, so every with3/with4
-  // int32_t-immediate overload falls back to IMMEDIATE32, which the real encoder then rejects
-  // for an instruction whose Code value expects IMMEDIATE8; see iced_x86_rflags_stub notes).
-  // vshufps xmm0, xmm1, xmm2, 0xE4 -- VEX.128.0F.WIG C6 /r ib.
+  // Regression for an orphaned handler: correct, but registered without the trailing _IMM8 the real
+  // Code has, so VSHUFPS hit unsupported_instruction until it was wired into handled_codes.def.
+  // Hand-encoded because get_immediate_op_kind() is a stub, so the factory produces an IMMEDIATE32
+  // the encoder then rejects. vshufps xmm0, xmm1, xmm2, 0xE4 -- VEX.128.0F.WIG C6 /r ib.
   const auto bytes = seven::parse_hex_bytes("C5 F0 C6 C2 E4");
 
   run_single(bytes,

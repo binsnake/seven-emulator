@@ -14,19 +14,14 @@ namespace detail {
 
 void set_flag(std::uint64_t& rflags, std::uint64_t bit, bool value);
 
-// Flag-write elimination for the block liveness pass (see seven/ir.hpp). set_flag() silently
-// drops a write to any bit set in the current mask instead of touching rflags at all -- callers
-// must only ever mark a bit dead when nothing between this write and the next write to that same
-// bit (or the end of the translated block) can observe it. Scoped to just the six ALU status bits
-// (CF/PF/AF/ZF/SF/OF); every other rflags bit (IF/TF/DF/...) is never masked. Defaults to 0 (mask
-// nothing, i.e. identical to pre-liveness behavior) so every existing call site is unaffected
-// unless the block lifter explicitly opts in for the instruction currently dispatching.
-// AVX-512 writemasking is implemented in exactly one place, simd_int.cpp's apply_masked_lanes.
-// Everywhere else an EVEX form that names a mask register would write every lane regardless, which
-// is a silently wrong answer rather than a missing feature. Handlers that cannot honour a mask ask
-// this first and stop cleanly instead, the same way the EVEX forms with no handler at all already
-// do. K0 and NONE both mean no masking, and both are the common case for the shared helpers these
-// guards sit in, which also serve the legacy and VEX encodings.
+// Flag-write elimination for the block liveness pass: set_flag() drops a write to any bit in the
+// current mask. A bit may only be marked dead when nothing between it and the next write to the same
+// bit can observe it. Scoped to the six ALU status bits, and defaults to masking nothing.
+
+// AVX-512 writemasking exists in exactly one place, simd_int.cpp's apply_masked_lanes. Elsewhere an
+// EVEX form naming a mask register would write every lane regardless, which is silently wrong rather
+// than missing, so handlers that cannot honour a mask ask this first and stop cleanly. K0 and NONE
+// both mean no masking, the common case for these shared helpers.
 [[nodiscard]] inline bool has_active_opmask(const iced_x86::Instruction& instr) noexcept {
   const auto opmask = instr.op_mask();
   return opmask != iced_x86::Register::NONE && opmask != iced_x86::Register::K0;
@@ -143,16 +138,14 @@ ExecutionResult divide_fault(ExecutionContext& ctx);
   return {};
 }
 
-// How wide the index and count registers are for a string instruction. An address-size prefix is
-// the only thing that changes it, and iced records that nowhere in the Code -- STOSB is one code
-// for all three sizes -- only in the operand kind, so this is the one place it can be read from.
-// Masking the pointers and the count on the way in and after every step is all it takes: writing a
-// masked value back to a 64-bit register zero-extends it, which is what a 32-bit register write
-// does anyway.
-// A string instruction's DS:rSI source accepts a segment override; its ES:rDI destination does not,
-// which is why only the source-reading handlers ask for this. FS and GS are the two with a live
-// base in 64-bit mode, same as memory_address(). The override applies to the linear address only,
-// so rSI itself still steps and wraps within the address size on its own.
+// How wide a string instruction's index and count registers are. Only an address-size prefix
+// changes it, and iced records that in the operand kind rather than the Code (STOSB is one Code for
+// all three sizes), so this is the only place to read it from. Masking on entry and after every step
+// is enough, since writing back to a 64-bit register zero-extends anyway.
+
+// A string instruction's DS:rSI source takes a segment override; its ES:rDI destination does not,
+// which is why only the source-reading handlers ask. The override applies to the linear address
+// only, so rSI still steps and wraps within the address size on its own.
 [[nodiscard]] inline std::uint64_t string_source_segment_base(const CpuState& state,
                                                               const iced_x86::Instruction& instr) noexcept {
   if (instr.segment_prefix() == iced_x86::Register::FS) return state.fs_base;

@@ -675,15 +675,10 @@ TEST(KuberaDebug, DelayedDebugAfterMovSsEntersSoftwareInterruptHandlerFirst) {
   EXPECT_EQ(state.rip, kBase + 3);
 }
 
-// Regression test for an integer-overflow bug in debug_data_breakpoint_hits' range-overlap check
-// (handler_helpers.cpp): it computed the access's one-past-the-end address as address + size with
-// no wraparound guard. address is fully guest-controlled (any register value), and size can be up
-// to 64 bytes for a real instruction (a ZMM memory operand) -- picking an address near the top of
-// the 64-bit address space wraps that sum back down past zero, which the old non-wrapping interval
-// test then read as "no overlap" even when the access's real (wrapping) span does touch a watched
-// byte range. That silently let a guest evade a hardware data breakpoint just by choosing where it
-// writes, no different in spirit from choosing where NOT to write to dodge a watchpoint -- except
-// this let it write exactly where a debugger/anti-tamper tool was watching and still not be seen.
+// Integer overflow in debug_data_breakpoint_hits' overlap check: address is guest-controlled and
+// size reaches 64 bytes, so address + size wraps past zero near the top of the address space and the
+// non-wrapping interval test reads it as no overlap. That let a guest write exactly where a
+// watchpoint was set and not be seen.
 TEST(KuberaDebug, DataBreakpointStillFiresOnWraparoundAccess) {
   seven::CpuState state{};
   // DR0 watches [0x8, 0x10): L0 enabled (bit 0), R/W0 = read-or-write (0b11 at bits 16-17), LEN0 =

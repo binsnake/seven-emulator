@@ -81,16 +81,12 @@ class Memory {
     MemoryPermissionMask permissions = kMemoryPermissionAll;
   };
 
-  // JIT-visible fast-path memory TLB: a small, direct-mapped, PUBLIC cache a JIT consumer's
-  // generated code can read and populate directly via offsetof-computed addressing, entirely
-  // separate from Memory's own PRIVATE tlb_ (which only ever serves read()/write()/is_mapped()
-  // internally and is never touched by anything outside this class). Lets compiled code do a
-  // bounds+permission-checked load/store straight against host memory, skipping a trampoline call
-  // entirely on a hit. Memory's own methods never read or populate this -- keeping it coherent
-  // (invalidating it whenever a cached host_data pointer could go stale, gating it off whenever a
-  // hook/MMIO/passthrough could legitimately want to intercept an access) is entirely this class's
-  // job internally (see unmap()/reprotect()/restore_pages() and the hook/mmio/passthrough setters),
-  // but USING it is entirely the JIT layer's responsibility -- Memory itself never reads jit_tlb.
+  // A public, direct-mapped TLB that a JIT consumer's generated code reads and populates itself via
+  // offsetof addressing, separate from Memory's private tlb_. It lets compiled code do a checked
+  // load/store straight against host memory with no trampoline call on a hit.
+  //
+  // Keeping it coherent is this class's job (see unmap/reprotect/restore_pages and the hook, mmio
+  // and passthrough setters); using it is the JIT layer's. Memory itself never reads it.
   struct JitTlbSlot {
     std::uint64_t guest_page = ~0ull;  // ~0 is never a valid page index (address space is 2^64/kPageSize wide, but a page this high is unreachable in long/legacy mode); doubles as "empty"
     std::byte* host_data = nullptr;    // this page's raw byte array iff guest_page matches; nullptr otherwise
@@ -355,20 +351,14 @@ class Memory {
   std::unordered_map<std::uint64_t, PageEntry, std::hash<std::uint64_t>, std::equal_to<std::uint64_t>,
                      PageMapAllocator<std::pair<const std::uint64_t, PageEntry>>>
       pages_;
-  // Which Memory the two caches below were filled for, by instance_id() rather than by address.
-  // Copying a Memory deep-copies pages_ into fresh PageEntry objects, but tlb_ and jit_tlb come
-  // across holding raw pointers into the SOURCE object's pages -- so without noticing, the copy
-  // would read and write straight through to the original, and keep doing so after the original is
-  // gone. Neither cache holds anything worth keeping, so a mismatch here just drops both and they
-  // refill on the next access.
+  // Which Memory the caches below were filled for, by instance_id() rather than address, since a
+  // copy brings tlb_/jit_tlb across still pointing into the SOURCE object's pages. A mismatch just
+  // drops both and they refill.
   //
-  // An address cannot be the tag, for exactly the reason instance_id() itself exists: addresses come
-  // back around. Assigning a Memory from a copy of ITSELF hands the destination its own address back
-  // and the check matched, keeping a table naming the storage that assignment had just freed; two
-  // Memories in sequence at one stack slot or heap block did the same thing across objects. Instance
-  // numbers only ever go up, so the copy's number can never collide with the destination's fresh
-  // one, and a move (which does keep its number, since an unordered_map move relocates the map and
-  // not its nodes) still keeps the caches it is entitled to.
+  // An address cannot be the tag because addresses come back around: assigning a Memory from a copy
+  // of itself handed the destination its own address back, so the check matched and kept a table
+  // naming storage the assignment had just freed. Instance numbers only go up, and a move keeps its
+  // number, which is correct since a map move relocates the map and not its nodes.
   mutable std::uint64_t cache_owner_id_ = 0;  // 0 is never a real instance number, so a fresh Memory refills once
   mutable std::array<TlbSlot, kTlbSize> tlb_{};
   std::uint64_t tlb_epoch_ = 1;

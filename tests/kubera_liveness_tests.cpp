@@ -266,18 +266,12 @@ TEST(KuberaLiveness, JitBypassEligibleReflectsHooksAndTrapState) {
   EXPECT_TRUE(executor.jit_bypass_eligible(state, memory));
 }
 
-// The whole cross-instruction masking argument rests on "a branch is always the LAST instruction in
-// a lifted span," which step_impl enforces by stopping the lift at the first instruction whose
-// flow_control() isn't NEXT. But this fork's flow_control() is a hand-rolled stub (see
-// instruction_info.cpp) that only knows Jcc/JMP/CALL/RET/INT3 -- LOOP, LOOPE/LOOPNE and
-// JCXZ/JECXZ/JRCXZ all fall through to NEXT. flag_liveness.cpp separately models plain
-// LOOP/JECXZ/JRCXZ as reading and writing nothing, so they're fully transparent to the backward
-// pass too. Together that let a span run straight THROUGH a branch: an instruction after the branch
-// could "cover" a flag write before it, and when the branch is actually taken that covering
-// instruction never executes, leaving the guest looking at a stale flag.
+// Cross-instruction masking rests on a branch always being the last instruction in a lifted span,
+// which the lifter enforces off flow_control(). That is a stub reporting NEXT for LOOP and JCXZ, so
+// a span could run straight through a branch and an instruction after it could cover a flag write
+// before it -- when the branch is taken the cover never runs and the guest reads a stale flag.
 //
-// jrcxz with rcx==0 jumps over the cmp, so the cmp can never be the thing that writes ZF here --
-// only the add's own (elided) write could have.
+// jrcxz with rcx==0 jumps over the cmp, so only the add's elided write could have set ZF here.
 TEST(KuberaLiveness, TakenJrcxzIsABlockBoundarySoEarlierFlagWriteIsNotElided) {
   seven::Executor executor{};
   seven::CpuState state{};
@@ -413,15 +407,10 @@ TEST(KuberaLiveness, ANestedRunFromAnMmioCallbackDoesNotClobberTheOuterMask) {
       << "the nested run left its own mask installed for the rest of the outer handler";
 }
 
-// The fault-capable case exists so that nothing after a possible fault can be used to justify
-// dropping a flag write before it. It used to apply that only to writes made EARLIER in the block:
-// the boost was folded into `live` for the next iteration, while the current instruction's own
-// dead mask had already been computed against the unboosted value.
-//
-// That leaves the faulting instruction's own write unprotected, and it is observable. seven_core's
-// handlers commit flags before attempting the write-back, so a store that faults still updates the
-// flags, and the instruction that was supposed to overwrite them never runs. A JIT-vs-interpreter
-// fuzz lane caught this as the two engines reporting different flags after the same faulting store.
+// The fault-capable boost used to apply only to writes made EARLIER in the block, leaving the
+// faulting instruction's own write unprotected. That is observable: handlers commit flags before
+// the write-back, so a faulting store still updates them and the instruction meant to overwrite
+// them never runs. A fuzz lane caught it as the two engines disagreeing after the same store.
 TEST(KuberaLiveness, AFaultCapableInstructionKeepsItsOwnFlagWrite) {
   // xor [rbp+0x26], edx then sar rdi, 1. The sar overwrites every flag the xor writes, which is
   // exactly the reasoning that used to mark the xor's write dead.

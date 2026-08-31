@@ -4,20 +4,12 @@ namespace seven::handlers {
 
 namespace {
 
-// A rep-prefixed string instruction's whole count executes inside one C++ loop, in one call to
-// this handler, with no other opportunity for the caller (Executor::run(), a watchdog thread's
-// Executor::request_stop(), a JitExecutor budget check) to interject -- ExecutionContext carries
-// no reference back to the Executor at all, so a handler genuinely cannot poll for a cooperative
-// stop request mid-loop. A guest setting RCX to a huge value before a single `rep movsb`-family
-// instruction, with enough mapped memory to sustain it, can make step_impl's underlying call hang
-// for as long as that span takes to walk -- with zero chance for any cooperative-cancellation
-// mechanism elsewhere in this project (the exact contract JitExecutor::run() and seven-fuzzer's
-// watchdog thread already depend on) to fire. Real hardware avoids this by checking for pending
-// interrupts BETWEEN each iteration of a rep-prefixed instruction specifically so a long-running
-// one stays preemptible -- capping iterations per call and yielding back to the caller (leaving
-// rip pointing at this same instruction, so it re-enters and continues exactly where it left off)
-// reproduces that same interruptibility without any guest-visible effect: RCX/RSI/RDI already
-// reflect real partial progress, and nothing about the guest's own execution state changes.
+// A rep-prefixed string op runs its whole count in one handler call, and ExecutionContext has no
+// way back to the Executor, so nothing can poll for a cooperative stop mid-loop. A huge guest RCX
+// therefore hangs step_impl with no chance for request_stop() or a watchdog to fire. Hardware stays
+// preemptible by checking interrupts between iterations; capping iterations per call and yielding
+// with rip unchanged reproduces that, and is guest-invisible since RCX/RSI/RDI already reflect the
+// partial progress.
 constexpr std::uint64_t kMaxRepIterationsPerCall = 4096;
 
 // A single-stepping guest sees a #DB after every iteration of a rep, not one after the whole loop.

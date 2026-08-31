@@ -1,23 +1,15 @@
 #pragma once
 
-// A hardware oracle for out-of-bounds accesses to guest page bytes.
+// A hardware oracle for out-of-bounds accesses to guest page bytes, for the accesses no sanitizer
+// can see: the JIT reaches guest memory from code it emitted itself, so an emitted access running
+// off the end of a page silently hits whatever the allocator put next.
 //
-// AddressSanitizer cannot see the accesses that matter most here: it instruments compiled C++, and
-// the JIT's fast path reaches guest memory from code it emitted itself, which no sanitizer touches.
-// A page's bytes live inside a PageEntry inside an unordered_map node, so an emitted access that
-// runs off the end of a page lands in whatever the allocator put next and reads or writes it
-// silently.
+// This reserves one page more than each map node needs, commits all but the last, and positions the
+// node so its final byte sits against the reserved page. PageEntry keeps its bytes last (there is a
+// static_assert in memory.hpp), so one past the end of a page IS the guard and the access faults.
 //
-// This allocator puts an unmapped page there instead. It reserves the node's pages plus one more,
-// commits everything but that last page, and hands back a pointer positioned so the object's final
-// byte sits directly against it. PageEntry keeps its byte array as its last member (there is a
-// static_assert in memory.hpp holding that), so "one past the end of the page bytes" and "first
-// byte of the guard page" are the same address, and the access faults in hardware no matter who
-// issued it.
-//
-// Off by default: with SEVEN_GUARDED_PAGES undefined this is std::allocator and the page map is
-// byte-for-byte the container it was before. The guarded build costs a page of address space per
-// mapped guest page and is meant for tests and fuzzing, not production.
+// Off by default, where this is plain std::allocator. The guarded build costs a page of address
+// space per guest page and is meant for tests and fuzzing.
 
 #include <cstddef>
 #include <cstdint>

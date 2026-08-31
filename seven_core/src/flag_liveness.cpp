@@ -9,20 +9,13 @@ namespace seven {
 
 namespace {
 
-// Per-instruction ALU status flag read/written sets, hand-verified against seven's own handler
-// source (not iced_x86's InstructionExtensions::rflags_read/rflags_written/rflags_modified --
-// those are stub placeholders in this vendored fork).
+// Per-instruction ALU flag read/written sets, hand-verified against seven's own handlers, since
+// iced_x86's rflags_read/rflags_written are stubs in this fork.
 //
-// Methodology (see below for the full
-// reasoning): `written` may only include a bit that is GUARANTEED written whenever the handler
-// completes normally -- never a bit that's conditionally written depending on runtime operand
-// values (e.g. shift/rotate-by-CL/IMM8 forms, which skip all flag writes when the masked count is
-// zero, must be modeled as written=none, not written=all). `read` is safe to overclaim -- any bit
-// that MIGHT be consulted as an input is included even if only true on some path. Anything not
-// covered by this table (including every SIMD/x87/segment/system instruction, and a handful of
-// rarer integer families not yet audited) defaults to the fully conservative
-// {read=kAluStatusFlagsMask, written=0} via FlagsInfo's default member initializers -- safe, just
-// not optimized.
+// `written` may only list a bit GUARANTEED written when the handler completes normally, never a
+// conditionally written one -- shift/rotate by CL or imm8 skip every flag write at a masked count of
+// zero, so they are written=none. `read` is safe to overclaim. Anything absent defaults to fully
+// conservative {read=all, written=0}.
 struct FlagsInfo {
   std::uint64_t read = kAluStatusFlagsMask;
   std::uint64_t written = 0;
@@ -276,20 +269,13 @@ struct FlagsInfo {
 
 }  // namespace
 
-// Whether this specific decoded instruction can fault (page fault on a memory operand, or a
-// data-dependent divide error). This matters for liveness beyond just read/write sets: a masked
-// write is only safe if the instruction that "covers" it is guaranteed to actually run. A fault
-// partway through the covering span breaks that guarantee -- the fault path (a fault hook, or a
-// caller inspecting state after a returned fault) can observe rflags before the cover happens.
-// This is not hypothetical: guard pages and SEH-driven control flow routinely trigger page
-// faults as a normal part of execution, and exception handlers commonly inspect the
-// full CONTEXT record, including EFlags.
+// Whether this decoded instruction can fault. A masked write is only safe if the instruction
+// covering it is guaranteed to run, and a fault partway through the span breaks that -- a fault
+// hook or the caller can observe rflags first, which is routine given guard pages and SEH.
 //
-// Register-only forms cannot fault in this implementation -- read_register/write_register have no
-// fallible path (see handler_helpers.cpp) -- so this only needs to check for a memory operand plus
-// the explicit divide-error sources. Checking the actual decoded instruction (not just its Code)
-// is what makes this precise: an RM-form instruction only faults on the specific encodings that
-// actually resolved to memory, not on every RM-form Code value.
+// Register-only forms have no fallible path here, so this only checks for a memory operand plus the
+// explicit divide-error sources. Checking the decoded instruction rather than the Code is what makes
+// it precise: an RM form only faults on the encodings that actually resolved to memory.
 bool can_fault(const iced_x86::Instruction& instr) noexcept {
   const auto op_count = instr.op_count();
   for (std::uint32_t i = 0; i < op_count; ++i) {
@@ -392,19 +378,13 @@ bool can_fault(const iced_x86::Instruction& instr) noexcept {
   }
 }
 
-// Whether a fault can strike AFTER this instruction has written its flags, which is what makes
-// that write observable even though something later in the block would have overwritten it.
+// Whether a fault can strike AFTER this instruction wrote its flags, which is what makes that write
+// observable despite something later overwriting it. Handlers set flags before writing the result,
+// so this is only true when the destination is memory -- a fault on a memory SOURCE never reaches
+// the flag computation, which matters since register-destination is the common shape.
 //
-// Handlers read their operands, set the flags, then write the result (add.cpp's
-// handle_code_ADD_RM8_R8 calls set_add_flags before write_operand's fault check), so the answer is
-// only yes when the result goes to memory. An instruction that faults on a memory SOURCE never
-// reaches the flag computation at all, and its flags stay masked as before -- which matters,
-// because a register destination with a memory source is the common shape by far.
-//
-// Operand 0 is the destination for every flag-writing memory form: the read-modify-write ALU ops,
-// INC/DEC/NEG/NOT, the shifts and rotates, BT variants, CMPXCHG and XADD. CMP against memory is
-// caught too and does not write anything, which costs a mask and is harmless. No string
-// instruction both writes memory and writes flags, so none of them need to be listed here.
+// Operand 0 is the destination for every flag-writing memory form. No string instruction both writes
+// memory and writes flags, so none need listing.
 [[nodiscard]] bool faults_after_writing_flags(const iced_x86::Instruction& instr) noexcept {
   return instr.op_count() > 0 && instr.op_kind(0) >= iced_x86::OpKind::MEMORY_SEG_SI;
 }

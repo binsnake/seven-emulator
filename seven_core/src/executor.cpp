@@ -94,18 +94,12 @@ constexpr std::size_t kZmmWidth = 64;
   }
 }
 
-// Instructions that can redirect control flow (or stop it) but that this fork's hand-rolled
-// InstructionExtensions::flow_control() stub still reports as FlowControl::NEXT -- it only knows
-// Jcc/JMP/CALL/RET/INT3. The block lifter below uses flow_control() to decide where a liveness span
-// ends, and the entire cross-instruction masking argument depends on a branch being the LAST
-// instruction of any span. LOOP/LOOPcc and JCXZ/JECXZ/JRCXZ slipping through as NEXT let a span run
-// straight past a branch, so an instruction after it could "cover" a flag write before it and then
-// never actually execute once the branch was taken -- leaving a stale flag visible to the guest.
-// flag_liveness.cpp separately models plain LOOP/JECXZ/JRCXZ as touching no flags at all, so they
-// were transparent to the backward pass too, with nothing else to stop the propagation.
-//
-// Kept as a supplement here rather than a change to the vendored stub: this is the consumer that
-// actually depends on the answer, and being conservative costs nothing but a shorter lift.
+// Instructions that redirect or stop control flow but that this fork's flow_control() stub reports
+// as NEXT, since it only knows Jcc/JMP/CALL/RET/INT3. The lifter ends liveness spans on that answer,
+// and masking depends on a branch being the span's last instruction -- LOOP and JCXZ slipping
+// through let a span run past a branch, so an instruction that never executes could cover a flag
+// write and leave the guest a stale flag. Supplemented here rather than in the stub, since this is
+// the consumer that depends on the answer and being conservative only costs a shorter lift.
 [[nodiscard]] bool ends_lifted_block(const iced_x86::Instruction& instr) noexcept {
   switch (instr.code()) {
     case iced_x86::Code::LOOP_REL8_16_CX: case iced_x86::Code::LOOP_REL8_32_CX:
@@ -356,32 +350,14 @@ StopReason Executor::violation_reason() const noexcept {
   return violation_reason_;
 }
 
-// flag_liveness.cpp no longer relies on this vendored iced_x86 fork's stub
-// InstructionExtensions::rflags_read/rflags_modified -- it has its own flags_info_for_code()
-// table, hand-verified against seven's own handler source. That resolved the DATA half of the
-// blocker. Turning masking on with just that fix broke 2 tests: cross-instruction masking
-// (skipping instruction A's flag write because a *later* instruction in the same lifted block
-// unconditionally overwrites it) is only sound if that later instruction is GUARANTEED to actually
-// run before anything external -- the step() caller, a fault hook, a debugger -- can observe
-// rflags. Three separate things can break that guarantee, all now handled:
-//   1. The caller simply not calling step() again (a bare step() call, a debugger single-stepping,
-//      an external tracer). Fixed by never trusting the cache's mask on a raw step() call --
-//      only step_impl's allow_masking=true path (used exclusively by run()'s own internal loop,
-//      which really does keep advancing) may apply it.
-//   2. A FAULT partway through the covering span (page fault on a memory operand, a divide error)
-//      -- exposes state to a fault hook or the caller before the cover happens, and this is not
-//      hypothetical: guard pages and SEH-driven control flow routinely fault as normal
-//      operation, and exception handlers commonly read the full CONTEXT/EFlags. Fixed in
-//      flag_liveness.cpp: any fault-capable instruction (can_fault()) is treated as reading every
-//      flag, which forces liveness back to "everything live" at that point and makes masking
-//      across it impossible by construction.
-//   3. Runtime conditions that can interrupt a block mid-way regardless of what got lifted: the
-//      single-step trap flag (TF) and hardware execute breakpoints (DR7), plus a hook registered
-//      after the block was already cached. Fixed by re-checking all of these at every dispatch,
-//      not just at lift time -- see step_impl's masking_safe_now.
-// One narrow, accepted residual: an async request_stop() landing exactly mid-span can still
-// surface a stale masked value on that abort path. Not fixed -- treated the same as any other
-// best-effort-soon abort semantics.
+// Cross-instruction masking is only sound if the later instruction that overwrites a flag write is
+// guaranteed to run before anything external observes rflags. Three things break that, all handled:
+// a caller that never steps again (masking is only applied from run()'s own loop), a fault partway
+// through the span (can_fault() instructions are treated as reading every flag), and TF/DR7 or a
+// hook registered after caching (re-checked at every dispatch, see masking_safe_now).
+//
+// Accepted residual: an async request_stop() landing mid-span can still surface a stale masked
+// value on that abort path.
 constexpr bool kFlagLivenessTablesTrustworthy = true;
 
 bool Executor::block_liveness_eligible(const Memory& memory) const noexcept {
@@ -400,17 +376,13 @@ ExecutionResult Executor::step(CpuState& state, Memory& memory) {
 }
 
 bool Executor::jit_bypass_eligible(const CpuState& state, const Memory& memory) const noexcept {
-  // Reuses block_liveness_eligible's hook check -- it's already exactly "can something skip
-  // step_impl's normal per-instruction machinery here," which is what flag-liveness masking and an
-  // external codegen bypass both need, for an overlapping reason. Trap flag and DR7 additionally
-  // gate this the same way they gate masking_safe_now below: single-stepping (real or debug-driven)
-  // has to keep landing on every instruction boundary regardless of hooks.
-  // The context-sync callbacks are per-instruction machinery too: step_impl pulls state in before
-  // the handler and pushes it back out after, which is how examples/live_context_windows.hpp
-  // mirrors a real suspended thread's registers. A bypassing consumer calls neither, so a compiled
-  // span ran against a CpuState nobody had refreshed and discarded every register write it made --
-  // the whole bridge quietly did nothing for as long as the span lasted. Same reasoning as the hook
-  // check above; they were simply missed because they are not stored as hooks.
+  // Reuses block_liveness_eligible's hook check, which already asks whether anything can skip
+  // step_impl's per-instruction machinery. TF and DR7 gate it for the same reason they gate
+  // masking_safe_now: single-stepping has to land on every boundary regardless of hooks.
+  //
+  // Context-sync callbacks are per-instruction machinery too -- step_impl pulls state in and pushes
+  // it back out around the handler. A bypassing consumer calls neither, so a compiled span ran
+  // against a CpuState nobody refreshed and every register write it made was discarded.
   return (state.rflags & kFlagTF) == 0 && !has_enabled_breakpoints(state) && !context_read_cb_ && !context_write_cb_ &&
          block_liveness_eligible(memory);
 }
@@ -966,18 +938,11 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
     // mapping only affected the *reported* code while dispatch used the raw code, so seven executed the
     // 4-byte handler (rsp -= 4) -- corrupting the stack for any guest code that pushes an imm.
     const auto code = reported_code;
-    // The precomputed mask is only actually trustworthy right now if: (1) the caller guarantees
-    // it will keep draining through the rest of the block (allow_masking -- only run() promises
-    // this, and only with enough budget headroom left, see run() below); (2) the single-step trap
-    // flag isn't active (TF means the CPU model wants to stop after *this* instruction, same as a
-    // bare step() call -- masking across instructions that won't run yet is exactly what's
-    // unsound); (3) no debug registers are armed (conservatively -- an execute breakpoint mid-span
-    // is the same hazard as TF); (4) no hook got registered after this block was lifted (hooks are
-    // checked once at lift time in block_liveness_eligible(), but a cached block's mask persists
-    // across dispatches -- hooks added later must still disable it).
-    // The context-sync callbacks belong here for the same reason jit_bypass_eligible lists them:
-    // the write side hands the host a CpuState at every instruction boundary, so a flag write the
-    // span was going to cover later has already been observed missing by then.
+    // The mask is only trustworthy if the caller keeps draining the block (only run() promises
+    // that), TF is clear, no debug register is armed, and no hook was registered after this block
+    // was lifted -- a cached mask outlives the one lift-time check. Context-sync callbacks belong
+    // here too: the write side hands the host a CpuState at every instruction boundary, so a flag
+    // write the span meant to cover later has already been seen missing.
     const bool masking_safe_now = allow_masking && (state.rflags & kFlagTF) == 0 &&
                                    !has_enabled_breakpoints(state) && !context_read_cb_ && !context_write_cb_ &&
                                    block_liveness_eligible(memory);
