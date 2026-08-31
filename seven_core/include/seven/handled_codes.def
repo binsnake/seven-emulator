@@ -1731,62 +1731,16 @@ KUBERA_CODE(PREFETCHNTA_M8)
 KUBERA_CODE(PREFETCHT0_M8)
 KUBERA_CODE(PREFETCHT1_M8)
 
-// Orphaned handlers found by a handle_code_* vs. handled_codes.def sweep
-// (seven-fuzzer, 2026-08-24). Only entries individually confirmed against
-// iced_x86's real Code enum (iced_x86/include/iced_x86/code.hpp) are
-// registered here -- the sweep's naive function-name diff produced a much
-// longer candidate list, but most of those handler functions turn out to be
-// misnamed relative to the actual enum value they were meant to implement
-// (e.g. missing an _IMM8/_B32 suffix, or a different operand count than the
-// name implies), which only surfaces as a hard compile error if guessed at
-// blindly. Left unregistered pending per-name verification -- not attempted
-// here to avoid shipping more guesses.
+// Handlers that existed but were never registered, so they decoded and then stopped as
+// unsupported_instruction. Every name here is checked against iced's Code enum: a handler function
+// is often named for the form it was meant to implement rather than the one that exists.
 KUBERA_CODE(SHUFPS_XMM_XMMM128_IMM8)
 KUBERA_CODE(VEX_ANDN_R64_R64_RM64)
 KUBERA_CODE(PREFETCHT2_M8)
 
-// Follow-up pass on the same sweep (2026-08-25): verified and registered the
-// remaining candidates whose handler bodies turned out to be correct once
-// renamed to match the real enum value -- VEX_VSHUFPS/VSHUFPD were missing
-// their trailing _IMM8 (the imm8 shuffle-control operand was already being
-// read correctly, just not reflected in the function name), and the VEX
-// packed-shift family's count-source operand is architecturally XMM-width
-// even for the YMM destination form (SDM: the variable shift count for
-// PSLL/PSRL/PSRA always comes from the low 64 bits of a 128-bit source,
-// never a full 256-bit one) -- the handler bodies already read the count
-// generically off the real decoded operand register, so this was a pure
-// naming fix, not a behavior change. Four more candidates (FIST_M64INT,
-// LDMXCSR, STMXCSR, PUSH_IMM8, PUSH_IMM32) turned out to be dead duplicate
-// code with no real Code counterpart at all -- FIST doesn't have a 64-bit
-// integer store form on real hardware (only FISTP/FISTTP do, both already
-// registered), MXCSR save/restore's real names carry an _M32 suffix
-// (STMXCSR_M32/LDMXCSR_M32, already registered with identical bodies), and
-// PUSH-immediate's real names are width-suffixed (PUSHW_IMM8/PUSHD_IMM8/
-// PUSHD_IMM32/PUSHQ_IMM8/PUSHQ_IMM32, all five already registered) -- these
-// were deleted rather than registered, since there's no unclaimed enum name
-// to register them under.
-//
-// The EVEX shuffle/unpack/pack family, held back by the note that used to sit
-// here on the grounds that simd_shuffle.cpp had neither opmask nor broadcast
-// support. Half of that was already out of date: both files route every EVEX
-// form through vex_binary_lanewise/vex_unary_lanewise, which refuse an active
-// K1-K7 mask outright rather than quietly treating it as all-ones. The
-// broadcast half was real, and simd_shuffle.cpp and simd_pack.cpp now carry
-// the same {1toN} handling simd_int.cpp has.
-//
-// Every one of these was also misnamed, which is why registering them had to
-// wait on checking each against the Code enum rather than guessing: the three
-// duplicating moves carry an operand their real form doesn't have
-// (EVEX_VMOVDDUP_XMM_K1Z_XMM_XMMM64 for a two-operand instruction), and the
-// rest were missing the broadcast suffix the real name ends in (B32, B64, and
-// for the two shuffles a trailing _IMM8 as well). The handler bodies were
-// already correct -- they read the operands they really have and unpack per
-// 128-bit lane the way the SDM defines for the wide forms -- so this is a
-// naming and registration fix, not a behaviour change to any of them.
-//
-// Until now every one of these decoded fine and then stopped as
-// unsupported_instruction, with a working handler sitting unreachable behind
-// the name.
+// The EVEX shuffle, unpack and pack family, held back until simd_shuffle.cpp and simd_pack.cpp
+// carried the same {1toN} broadcast handling simd_int.cpp has. An active K1-K7 mask is refused
+// outright by vex_binary_lanewise rather than treated as all-ones.
 KUBERA_CODE(EVEX_VMOVDDUP_XMM_K1Z_XMMM64)
 KUBERA_CODE(EVEX_VMOVDDUP_YMM_K1Z_YMMM256)
 KUBERA_CODE(EVEX_VMOVDDUP_ZMM_K1Z_ZMMM512)
@@ -1824,7 +1778,8 @@ KUBERA_CODE(EVEX_VPUNPCKLDQ_XMM_K1Z_XMM_XMMM128B32)
 KUBERA_CODE(EVEX_VPUNPCKLDQ_YMM_K1Z_YMM_YMMM256B32)
 KUBERA_CODE(EVEX_VPUNPCKLDQ_ZMM_K1Z_ZMM_ZMMM512B32)
 
-// Registered earlier in the same sweep, kept here for context.
+// The VEX forms of the same shuffles, plus the packed shifts, whose count source is XMM-width even
+// for a YMM destination.
 KUBERA_CODE(VEX_VSHUFPS_XMM_XMM_XMMM128_IMM8)
 KUBERA_CODE(VEX_VSHUFPS_YMM_YMM_YMMM256_IMM8)
 KUBERA_CODE(VEX_VSHUFPD_XMM_XMM_XMMM128_IMM8)
@@ -1838,10 +1793,7 @@ KUBERA_CODE(VEX_VPSRLQ_YMM_YMM_XMMM128)
 KUBERA_CODE(VEX_VPSRAW_YMM_YMM_XMMM128)
 KUBERA_CODE(VEX_VPSRAD_YMM_YMM_XMMM128)
 
-// Same orphaned-handler shape, found 2026-08-26 while testing the x87 save/restore
-// fault paths. fsave() was only reachable through FSAVE_M94BYTE/FSAVE_M108BYTE, but
-// the decoder tables (iced_x86 data_legacy.hpp) only ever emit the no-wait FNSAVE_*
-// codes for DD /6 -- the FSAVE_* values exist in the Code enum but are never decoded.
-// So every real FNSAVE stopped as unsupported_instruction while fsave() sat dead.
+// The decoder only ever emits the no-wait FNSAVE_* codes for DD /6. FSAVE_M94BYTE/FSAVE_M108BYTE
+// exist in the Code enum but nothing decodes to them, so registering those alone left fsave() dead.
 KUBERA_CODE(FNSAVE_M94BYTE)
 KUBERA_CODE(FNSAVE_M108BYTE)
