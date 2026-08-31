@@ -11,9 +11,11 @@
 
 #include <iced_x86/code.hpp>
 #include <iced_x86/decoder.hpp>
+#include <iced_x86/flow_control.hpp>
 #include <iced_x86/instruction_info.hpp>
 #include <iced_x86/memory_size_info.hpp>
 
+#include "seven/flag_liveness.hpp"
 #include "seven/handler_helpers.hpp"
 #include "seven/handlers_fwd.hpp"
 
@@ -34,16 +36,16 @@ Executor::Executor()
     : code_execution_counts_(kCodeCount, 0),
       stop_reason_counts_(kStopReasonCount, 0) {
   trace_semantics_ = env_flag_set("SEVEN_TRACE_SEMANTICS");
-  trace_openkey_probe_ = env_flag_set("SEVEN_TRACE_OPENKEY");
-  trace_strrchr_ = env_flag_set("SEVEN_TRACE_STRRCHR");
   collect_code_stats_ = env_flag_set("SEVEN_COLLECT_CODE_STATS");
+  decode_cache_disabled_by_env_ = env_flag_set("SEVEN_DISABLE_DECODE_CACHE");
 }
 
 namespace {
 
 constexpr bool kEnableAvx = SEVEN_ENABLE_AVX != 0;
 constexpr bool kEnableAvx512 = SEVEN_ENABLE_AVX512 != 0;
-constexpr std::size_t kMaxFaultRetries = 8;
+constexpr std::size_t kMaxFaultRetries = Executor::kMaxFaultRetries;
+constexpr std::size_t kMaxStepDepth = Executor::kMaxStepDepth;
 
 constexpr std::size_t kVectorRegisterCount = 32;
 constexpr std::size_t kXmmWidth = 16;
@@ -59,23 +61,6 @@ constexpr std::size_t kZmmWidth = 64;
   if (value >= ymm0 && value < ymm0 + kVectorRegisterCount) return kYmmWidth;
   if (value >= xmm0 && value < xmm0 + kVectorRegisterCount) return kXmmWidth;
   return 0;
-}
-
-[[nodiscard]] bool simd_profile_allows(const iced_x86::Instruction& instr) noexcept {
-  const auto encoding = iced_x86::InstructionExtensions::encoding(instr);
-  if (encoding == iced_x86::EncodingKind::EVEX && !kEnableAvx512) {
-    return false;
-  }
-  if (encoding == iced_x86::EncodingKind::VEX && !kEnableAvx) {
-    return false;
-  }
-  for (std::uint32_t i = 0; i < instr.op_count(); ++i) {
-    if (instr.op_kind(i) == iced_x86::OpKind::REGISTER &&
-        vector_width_for_register(instr.op_register(i)) > kVectorBytes) {
-      return false;
-    }
-  }
-  return true;
 }
 
 [[nodiscard]] iced_x86::Code normalize_reported_code(iced_x86::Code code) noexcept {
@@ -109,151 +94,41 @@ constexpr std::size_t kZmmWidth = 64;
   }
 }
 
-void maybe_trace_strrchr(const CpuState& state, const Memory& memory) noexcept {
-  if (state.rip == 0x180126AF0ull) {
-    std::array<std::uint8_t, 48> s{};
-    const bool ok = memory.read(state.gpr[1], s.data(), s.size(), MemoryAccessKind::data_read);
-    std::fprintf(stderr,
-        "[seven-strrchr] enter rcx=0x%llx dl=0x%02llx ok=%u bytes=",
-        static_cast<unsigned long long>(state.gpr[1]),
-        static_cast<unsigned long long>(state.gpr[2] & 0xFFull),
-        ok ? 1u : 0u);
-    if (ok) {
-      for (std::size_t i = 0; i < s.size(); ++i) {
-        std::fprintf(stderr, "%02x", static_cast<unsigned>(s[i]));
-      }
-    }
-    std::fprintf(stderr, "\n");
-  } else if (state.rip == 0x180126BECull) {
-    std::fprintf(stderr,
-        "[seven-strrchr] exit rax=0x%llx r9=0x%llx r10=0x%llx\n",
-        static_cast<unsigned long long>(state.gpr[0]),
-        static_cast<unsigned long long>(state.gpr[9]),
-        static_cast<unsigned long long>(state.gpr[10]));
+// Control flow the flow_control() stub still reports as NEXT, since it only knows
+// Jcc/JMP/CALL/RET/INT3. Masking depends on a branch ending the span, so LOOP and JCXZ slipping
+// through let an instruction that never runs cover a flag write.
+[[nodiscard]] bool ends_lifted_block(const iced_x86::Instruction& instr) noexcept {
+  switch (instr.code()) {
+    case iced_x86::Code::LOOP_REL8_16_CX: case iced_x86::Code::LOOP_REL8_32_CX:
+    case iced_x86::Code::LOOP_REL8_16_ECX: case iced_x86::Code::LOOP_REL8_32_ECX:
+    case iced_x86::Code::LOOP_REL8_64_ECX: case iced_x86::Code::LOOP_REL8_16_RCX:
+    case iced_x86::Code::LOOP_REL8_64_RCX:
+    case iced_x86::Code::LOOPE_REL8_16_CX: case iced_x86::Code::LOOPE_REL8_32_CX:
+    case iced_x86::Code::LOOPE_REL8_16_ECX: case iced_x86::Code::LOOPE_REL8_32_ECX:
+    case iced_x86::Code::LOOPE_REL8_64_ECX: case iced_x86::Code::LOOPE_REL8_16_RCX:
+    case iced_x86::Code::LOOPE_REL8_64_RCX:
+    case iced_x86::Code::LOOPNE_REL8_16_CX: case iced_x86::Code::LOOPNE_REL8_32_CX:
+    case iced_x86::Code::LOOPNE_REL8_16_ECX: case iced_x86::Code::LOOPNE_REL8_32_ECX:
+    case iced_x86::Code::LOOPNE_REL8_64_ECX: case iced_x86::Code::LOOPNE_REL8_16_RCX:
+    case iced_x86::Code::LOOPNE_REL8_64_RCX:
+    case iced_x86::Code::JECXZ_REL8_16: case iced_x86::Code::JECXZ_REL8_32:
+    case iced_x86::Code::JECXZ_REL8_64:
+    case iced_x86::Code::JRCXZ_REL8_16: case iced_x86::Code::JRCXZ_REL8_64:
+    // Not branches, but they end the run just as hard -- execution never reaches the next
+    // sequential instruction, so nothing after them can be trusted to cover anything.
+    case iced_x86::Code::SYSENTER: case iced_x86::Code::SYSEXITD: case iced_x86::Code::SYSEXITQ:
+    case iced_x86::Code::SYSRETD: case iced_x86::Code::SYSRETQ:
+    case iced_x86::Code::IRETW: case iced_x86::Code::IRETD: case iced_x86::Code::IRETQ:
+    case iced_x86::Code::HLT:
+    case iced_x86::Code::UD0: case iced_x86::Code::UD0_R16_RM16:
+    case iced_x86::Code::UD0_R32_RM32: case iced_x86::Code::UD0_R64_RM64:
+    case iced_x86::Code::UD1_R16_RM16: case iced_x86::Code::UD1_R32_RM32:
+    case iced_x86::Code::UD1_R64_RM64: case iced_x86::Code::UD2:
+    case iced_x86::Code::XBEGIN_REL16: case iced_x86::Code::XBEGIN_REL32:
+      return true;
+    default:
+      return iced_x86::InstructionExtensions::flow_control(instr) != iced_x86::FlowControl::NEXT;
   }
-}
-
-void maybe_trace_openkey_probe(const CpuState& state, const Memory& memory) noexcept {
-  if (state.rip != 0x180161cd2ull) {
-    return;
-  }
-  const std::uint32_t sysno = static_cast<std::uint32_t>(state.gpr[0] & 0xFFFFFFFFull);
-  if (sysno != 0x12u) {
-    return;
-  }
-
-  std::uint64_t ret_addr = 0;
-  const bool have_ret = memory.read(state.gpr[4], &ret_addr, sizeof(ret_addr), MemoryAccessKind::data_read);
-  if (!have_ret || ret_addr != 0x1800ac33cull) {
-    return;
-  }
-
-  struct ObjAttrs64 {
-    std::uint32_t length;
-    std::uint32_t pad0;
-    std::uint64_t root_dir;
-    std::uint64_t object_name;
-    std::uint32_t attributes;
-    std::uint32_t pad1;
-    std::uint64_t security_descriptor;
-    std::uint64_t security_qos;
-  } attrs{};
-
-  const std::uint64_t key_handle_ptr = state.gpr[1];
-  const std::uint64_t desired_access = state.gpr[2];
-  const std::uint64_t obj_attr_ptr = state.gpr[8];
-  const bool have_attrs = memory.read(obj_attr_ptr, &attrs, sizeof(attrs), MemoryAccessKind::data_read);
-
-  struct UnicodeString64 {
-    std::uint16_t length;
-    std::uint16_t max_length;
-    std::uint32_t pad0;
-    std::uint64_t buffer;
-  } us{};
-  bool have_us = false;
-  if (have_attrs && attrs.object_name != 0) {
-    have_us = memory.read(attrs.object_name, &us, sizeof(us), MemoryAccessKind::data_read);
-  }
-
-  std::array<char16_t, 260> name_buf{};
-  std::size_t name_chars = 0;
-  bool have_name = false;
-  if (have_us && us.buffer != 0 && us.length > 0) {
-    name_chars = std::min<std::size_t>(name_buf.size() - 1, static_cast<std::size_t>(us.length / 2u));
-    have_name = memory.read(us.buffer, name_buf.data(), name_chars * sizeof(char16_t), MemoryAccessKind::data_read);
-  }
-
-  std::fprintf(stderr,
-      "[seven-openkey] rip=0x%llx ret=0x%llx rcx=0x%llx rdx=0x%llx r8=0x%llx attrs_ok=%u attrs_len=0x%x root=0x%llx name_ptr=0x%llx attrs=0x%x us_ok=%u us_len=0x%x us_max=0x%x us_buf=0x%llx\n",
-      static_cast<unsigned long long>(state.rip),
-      static_cast<unsigned long long>(ret_addr),
-      static_cast<unsigned long long>(key_handle_ptr),
-      static_cast<unsigned long long>(desired_access),
-      static_cast<unsigned long long>(obj_attr_ptr),
-      have_attrs ? 1u : 0u,
-      have_attrs ? attrs.length : 0u,
-      static_cast<unsigned long long>(have_attrs ? attrs.root_dir : 0ull),
-      static_cast<unsigned long long>(have_attrs ? attrs.object_name : 0ull),
-      have_attrs ? attrs.attributes : 0u,
-      have_us ? 1u : 0u,
-      have_us ? us.length : 0u,
-      have_us ? us.max_length : 0u,
-      static_cast<unsigned long long>(have_us ? us.buffer : 0ull));
-
-  if (have_name && name_chars != 0) {
-    std::fprintf(stderr, "[seven-openkey] name_utf16:");
-    for (std::size_t i = 0; i < name_chars; ++i) {
-      std::fprintf(stderr, " %04x", static_cast<unsigned>(name_buf[i]));
-    }
-    std::fprintf(stderr, "\n");
-  }
-}
-
-void maybe_trace_semantics(const CpuState& state, const iced_x86::Instruction& instr, const Memory& memory) noexcept {
-  constexpr std::uint64_t kCxxThrowStart = 0x1059751E0ull;
-  constexpr std::uint64_t kCxxThrowEnd = 0x105975288ull;
-  if (!(state.rip >= kCxxThrowStart && state.rip < kCxxThrowEnd)) {
-    return;
-  }
-  std::uint64_t call_target = 0;
-  const bool call_target_ok = memory.read(0x105984080ull, &call_target, sizeof(call_target), MemoryAccessKind::data_read);
-  std::uint64_t stack0 = 0;
-  std::uint64_t stack1 = 0;
-  std::uint64_t stack_c0 = 0;
-  std::uint64_t stack_c8 = 0;
-  const bool stack0_ok = memory.read(state.gpr[4], &stack0, sizeof(stack0), MemoryAccessKind::data_read);
-  const bool stack1_ok = memory.read(state.gpr[4] + 8, &stack1, sizeof(stack1), MemoryAccessKind::data_read);
-  const bool stack_c0_ok = memory.read(state.gpr[4] + 0xC0, &stack_c0, sizeof(stack_c0), MemoryAccessKind::data_read);
-  const bool stack_c8_ok = memory.read(state.gpr[4] + 0xC8, &stack_c8, sizeof(stack_c8), MemoryAccessKind::data_read);
-  std::fprintf(stderr,
-      "[seven-trace] rip=0x%llx code=%u len=%u rax=0x%llx rbx=0x%llx rcx=0x%llx rdx=0x%llx rsp=0x%llx [rsp]=%s0x%llx [rsp+8]=%s0x%llx [rsp+c0]=%s0x%llx [rsp+c8]=%s0x%llx iat=%s0x%llx rbp=0x%llx rsi=0x%llx rdi=0x%llx r8=0x%llx r9=0x%llx cf=%u zf=%u sf=%u of=%u\n",
-      static_cast<unsigned long long>(state.rip),
-      static_cast<unsigned>(instr.code()),
-      static_cast<unsigned>(instr.length()),
-      static_cast<unsigned long long>(state.gpr[0]),
-      static_cast<unsigned long long>(state.gpr[3]),
-      static_cast<unsigned long long>(state.gpr[1]),
-      static_cast<unsigned long long>(state.gpr[2]),
-      static_cast<unsigned long long>(state.gpr[4]),
-      stack0_ok ? "" : "err:",
-      static_cast<unsigned long long>(stack0),
-      stack1_ok ? "" : "err:",
-      static_cast<unsigned long long>(stack1),
-      stack_c0_ok ? "" : "err:",
-      static_cast<unsigned long long>(stack_c0),
-      stack_c8_ok ? "" : "err:",
-      static_cast<unsigned long long>(stack_c8),
-      call_target_ok ? "" : "err:",
-      static_cast<unsigned long long>(call_target),
-      static_cast<unsigned long long>(state.gpr[5]),
-      static_cast<unsigned long long>(state.gpr[6]),
-      static_cast<unsigned long long>(state.gpr[7]),
-      static_cast<unsigned long long>(state.gpr[8]),
-      static_cast<unsigned long long>(state.gpr[9]),
-      (state.rflags & kFlagCF) ? 1u : 0u,
-      (state.rflags & kFlagZF) ? 1u : 0u,
-      (state.rflags & kFlagSF) ? 1u : 0u,
-      (state.rflags & kFlagOF) ? 1u : 0u);
 }
 
 struct DebugMemoryAccess {
@@ -298,15 +173,6 @@ struct DebugMemoryAccess {
   }
 }
 
-[[nodiscard]] bool ranges_overlap(std::uint64_t a_base, std::size_t a_size, std::uint64_t b_base, std::size_t b_size) noexcept {
-  if (a_size == 0 || b_size == 0) {
-    return false;
-  }
-  const auto a_end = a_base + static_cast<std::uint64_t>(a_size - 1);
-  const auto b_end = b_base + static_cast<std::uint64_t>(b_size - 1);
-  return !(a_end < b_base || b_end < a_base);
-}
-
 [[nodiscard]] std::vector<DebugMemoryAccess> collect_debug_memory_accesses(CpuState& state, const iced_x86::Instruction& instr) {
   std::vector<DebugMemoryAccess> accesses;
   iced_x86::InstructionInfoFactory info_factory;
@@ -338,6 +204,13 @@ struct DebugMemoryAccess {
     accesses.push_back(DebugMemoryAccess{address, size, is_read, is_write});
   }
   return accesses;
+}
+
+// DR7[0:7] are the four slots' local/global enable pairs; nothing else in the register can arm a
+// breakpoint. Testing the whole register instead treats a DR7 of 0x400 -- bit 10 reads as 1 on real
+// hardware, so that is what an OS writes to mean "none armed" -- as though a breakpoint were live.
+[[nodiscard]] bool has_enabled_breakpoints(const CpuState& state) noexcept {
+  return (state.dr[7] & 0xFFu) != 0;
 }
 
 [[nodiscard]] bool has_enabled_execute_breakpoints(const CpuState& state) noexcept {
@@ -401,7 +274,10 @@ struct DebugMemoryAccess {
 }  // namespace
 
 constexpr std::size_t Executor::stop_reason_to_index(StopReason reason) noexcept {
-  return static_cast<std::size_t>(reason);
+  // Two of these reasons come straight out of an embedder hook, so the value is not guaranteed to
+  // be a real enumerator. Bucket anything outside the enum rather than write past the vector.
+  const auto index = static_cast<std::size_t>(reason);
+  return index < kStopReasonCount ? index : 0;
 }
 
 void Executor::reset_stats() {
@@ -470,7 +346,64 @@ StopReason Executor::violation_reason() const noexcept {
   return violation_reason_;
 }
 
+// Masking is sound only if the covering instruction is guaranteed to run. Three things break that,
+// all handled: a caller that never steps again, a mid-span fault, and TF/DR7 or a hook registered
+// after caching. An async request_stop() landing mid-span is the accepted residual.
+constexpr bool kFlagLivenessTablesTrustworthy = true;
+
+bool Executor::block_liveness_eligible(const Memory& memory) const noexcept {
+  // Instruction, code and access hooks see rflags mid-block at points the per-instruction tables
+  // do not know about. Trap and execution hooks cannot: one gets only an address, and the other is
+  // always block-terminal.
+  return !has_instruction_hooks_ && !has_code_hooks_ &&
+         !has_execution_hooks_ && !has_execution_address_hooks_ &&
+         !memory.has_access_hooks();
+}
+
 ExecutionResult Executor::step(CpuState& state, Memory& memory) {
+  return step_impl(state, memory, false);
+}
+
+bool Executor::jit_bypass_eligible(const CpuState& state, const Memory& memory) const noexcept {
+  // Reuses block_liveness_eligible's hook check, and the context-sync callbacks count as the same
+  // per-instruction machinery: a bypassing consumer ran against a CpuState nobody refreshed.
+  return (state.rflags & kFlagTF) == 0 && !has_enabled_breakpoints(state) && !context_read_cb_ && !context_write_cb_ &&
+         block_liveness_eligible(memory);
+}
+
+ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_masking) {
+  StepDepthScope depth_scope{*this};
+  // Each level is an embedder callback re-entering step(). Nothing bounded it, so a hook that
+  // re-enters unconditionally exhausted the host stack instead of returning something actionable.
+  if (step_depth_ > kMaxStepDepth) {
+    return {StopReason::execution_limit, 0, std::nullopt, std::nullopt};
+  }
+  // The level cap says nothing about bytes per level, so measure the descent instead. Volatile so
+  // the probe keeps an address, and compared by magnitude so it assumes no stack direction.
+  volatile char stack_probe = 0;
+  const auto probe_here = reinterpret_cast<std::uintptr_t>(const_cast<const char*>(&stack_probe));
+  if (step_depth_ == 1) {
+    step_stack_base_ = probe_here;
+  } else if (step_stack_base_ != 0) {
+    const auto descended = step_stack_base_ > probe_here ? step_stack_base_ - probe_here
+                                                         : probe_here - step_stack_base_;
+    if (descended > kMaxStepStackBytes) {
+      return {StopReason::execution_limit, 0, std::nullopt, std::nullopt};
+    }
+  }
+  // The decode cache is direct-mapped on (rip >> 1), so a nested step 0x4000 away lands on the outer
+  // frame's live slot and runs its handler against the nested operands. Nested frames get their own.
+  const bool nested = step_depth_ > 1;
+  // Nested frames use neither cache, so tagging on their behalf only mislabels what the outer frame
+  // cached: a hook re-entering with a second Memory left the tag naming it while the outer frame
+  // kept filling entries from the first, and the next step then ran the wrong guest's bytes.
+  if (!nested && cache_memory_instance_ != memory.instance_id()) [[unlikely]] {
+    // Both caches validate on (rip, page epoch, mode), and epochs come from a per-Memory counter
+    // starting near zero, so an Executor reused across two would run the first one's bytes.
+    for (auto& entry : *decode_cache_) entry.valid = false;
+    for (auto& entry : *code_page_cache_) entry.valid = false;
+    cache_memory_instance_ = memory.instance_id();
+  }
   clear_violation();
   if (collect_code_stats_) { ++total_steps_; }
   if (stop_requested_) {
@@ -479,10 +412,12 @@ ExecutionResult Executor::step(CpuState& state, Memory& memory) {
     notify_stop_hooks(state, memory, stopped, state.rip);
     return stopped;
   }
-  if (context_read_cb_) context_read_cb_(state);
+  // Copied locally like the MMIO dispatch: a callback that reinstalls itself from inside its own
+  // body would destroy the functor whose operator() is still on the stack.
+  if (auto read_cb = context_read_cb_) read_cb(state);
   struct WriteSync {
     Executor& self; CpuState& state;
-    ~WriteSync() { if (self.context_write_cb_) self.context_write_cb_(state); }
+    ~WriteSync() { if (auto write_cb = self.context_write_cb_) write_cb(state); }
   } write_sync{*this, state};
   state.rip = mask_instruction_pointer(state, state.rip);
   state.gpr[4] = mask_stack_pointer(state, state.gpr[4]);
@@ -506,6 +441,11 @@ ExecutionResult Executor::step(CpuState& state, Memory& memory) {
     return fallback;
   };
 
+  // RF and the SS-load shadow are spent per attempt, but a faulting instruction never ran, so a
+  // retry has to get them back or it fires the breakpoint they exist to suppress.
+  bool rf_consumed = false;
+  std::uint8_t debug_suppression_consumed = 0;
+
   for (std::size_t attempt = 0; attempt < kMaxFaultRetries; ++attempt) {
     const auto try_recover_fault = [&](const ExecutionResult& fault, std::uint64_t fault_address) -> bool {
       const auto action = run_fault_hooks(FaultHookEvent{state, memory, fault, instruction_start_rip, fault_address});
@@ -518,26 +458,73 @@ ExecutionResult Executor::step(CpuState& state, Memory& memory) {
             static_cast<unsigned long long>(fault_address),
             static_cast<unsigned>(action));
       }
-      if (action == FaultHookAction::retry) {
-        return true;
+      if (action != FaultHookAction::retry && action != FaultHookAction::restart_instruction) {
+        return false;
+      }
+      if (rf_consumed) {
+        state.rflags |= kFlagRF;
+        rf_consumed = false;
+      }
+      if (debug_suppression_consumed != 0) {
+        state.debug_suppression = debug_suppression_consumed;
+        debug_suppression_consumed = 0;
       }
       if (action == FaultHookAction::restart_instruction) {
         state.rip = instruction_start_rip;
         state.gpr[4] = mask_stack_pointer(state, state.gpr[4]);
-        return true;
       }
-      return false;
+      return true;
     };
 
-    const auto code_epoch = memory.code_epoch();
-    const bool can_use_decode_cache = !memory.has_fetch_access_hooks() && std::getenv("SEVEN_DISABLE_DECODE_CACHE") == nullptr;
+    // memory_fault() applies this to data references, but the fetch path builds its faults inline
+    // and never went through it, so a jump to a non-canonical address came back as a page fault at
+    // that address instead of #GP. Real hardware checks this ahead of any page walk.
+    if (!is_canonical_address(state.rip)) [[unlikely]] {
+      const ExecutionResult fault{StopReason::general_protection, 0,
+                                  ExceptionInfo{StopReason::general_protection, state.rip, 0}, std::nullopt};
+      if (try_recover_fault(fault, state.rip)) {
+        continue;
+      }
+      record_violation(fault, state.rip);
+      ++stop_reason_counts_[stop_reason_to_index(fault.reason)];
+      notify_stop_hooks(state, memory, fault, state.rip);
+      return fault;
+    }
+
+    const auto rip_page = state.rip / Memory::kPageSize;
+    const auto rip_page_epoch = memory.page_code_epoch(rip_page);
+    // Epoch of the page holding the final byte, which only differs across a boundary. `spans` is
+    // false when the instruction runs off the end of the address space, which is never cacheable.
+    const auto last_byte_epoch = [&](std::uint32_t length, bool& spans) -> std::uint64_t {
+      const auto last_byte = state.rip + (length - 1);
+      spans = last_byte >= state.rip;
+      if (!spans) {
+        return 0;
+      }
+      const auto last_page = last_byte / Memory::kPageSize;
+      return last_page == rip_page ? rip_page_epoch : memory.page_code_epoch(last_page);
+    };
+    const bool can_use_decode_cache =
+        !nested && !memory.has_fetch_access_hooks() && !decode_cache_disabled_by_env_;
     const auto cache_index = static_cast<std::size_t>((state.rip >> 1) & (kDecodeCacheSize - 1));
-    auto& cache_entry = (*decode_cache_)[cache_index];
+    const auto scratch_slot = [this]() -> DecodedInstructionCacheEntry& {
+      const auto index = step_depth_ - 2;
+      while (nested_decode_scratch_.size() <= index) {
+        nested_decode_scratch_.push_back(std::make_unique<DecodedInstructionCacheEntry>());
+      }
+      auto& slot = *nested_decode_scratch_[index];
+      slot.valid = false;  // one slot per depth, reused across calls, so never serve a stale hit
+      return slot;
+    };
+    auto& cache_entry = nested ? scratch_slot() : (*decode_cache_)[cache_index];
+    bool hit_spans_address_space = false;
     const bool cache_hit = can_use_decode_cache &&
                            cache_entry.valid &&
                            cache_entry.rip == state.rip &&
-                           cache_entry.code_epoch == code_epoch &&
-                           cache_entry.mode == state.mode;
+                           cache_entry.page_epoch == rip_page_epoch &&
+                           cache_entry.mode == state.mode &&
+                           cache_entry.last_page_epoch ==
+                               last_byte_epoch(cache_entry.instruction_length, hit_spans_address_space);
 
     if (!cache_hit) [[unlikely]] {
       std::array<std::uint8_t, iced_x86::IcedConstants::_MAX_INSTRUCTION_LENGTH> bytes{};
@@ -548,33 +535,45 @@ ExecutionResult Executor::step(CpuState& state, Memory& memory) {
         const auto page_base = state.rip & ~static_cast<std::uint64_t>(Memory::kPageSize - 1);
         const auto page_offset = static_cast<std::size_t>(state.rip - page_base);
         if (page_offset + bytes.size() <= Memory::kPageSize) {
-          auto& page_cache = (*code_page_cache_)[static_cast<std::size_t>((page_base >> 12) & (kCodePageCacheSize - 1))];
-          if (!page_cache.valid || page_cache.page_base != page_base || page_cache.code_epoch != code_epoch) {
+          const auto page_index = page_base / Memory::kPageSize;
+          const auto page_epoch = memory.page_code_epoch(page_index);
+          auto& page_cache = (*code_page_cache_)[static_cast<std::size_t>(page_index & (kCodePageCacheSize - 1))];
+          if (!page_cache.valid || page_cache.page_base != page_base || page_cache.page_epoch != page_epoch) {
             if (memory.read_code_page(page_base, page_cache.bytes.data())) {
               page_cache.page_base = page_base;
-              page_cache.code_epoch = code_epoch;
+              page_cache.page_epoch = page_epoch;
               page_cache.valid = true;
             } else {
               page_cache.valid = false;
             }
           }
-          if (page_cache.valid && page_cache.page_base == page_base && page_cache.code_epoch == code_epoch) {
+          if (page_cache.valid && page_cache.page_base == page_base && page_cache.page_epoch == page_epoch) {
             decode_bytes = page_cache.bytes.data() + page_offset;
             decode_size = Memory::kPageSize - page_offset;
             fetched = true;
           }
         }
       }
+      bool truncated_to_page = false;
       if (!fetched) {
         if (!memory.read(state.rip, bytes.data(), bytes.size(), MemoryAccessKind::instruction_fetch)) {
-          const ExecutionResult fault{StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, state.rip, 0}, std::nullopt};
-          if (try_recover_fault(fault, fault_address_of(fault, state.rip))) {
-            continue;
+          // A fetch only faults on the bytes the instruction needs. Retry with what this page holds
+          // and let the decoder say whether that was enough.
+          const auto in_page =
+              static_cast<std::size_t>(Memory::kPageSize - (state.rip % Memory::kPageSize));
+          truncated_to_page = in_page < bytes.size() &&
+                              memory.read(state.rip, bytes.data(), in_page, MemoryAccessKind::instruction_fetch);
+          if (!truncated_to_page) {
+            const ExecutionResult fault{StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, state.rip, 0}, std::nullopt};
+            if (try_recover_fault(fault, fault_address_of(fault, state.rip))) {
+              continue;
+            }
+            record_violation(fault, fault_address_of(fault, state.rip));
+            ++stop_reason_counts_[stop_reason_to_index(fault.reason)];
+            notify_stop_hooks(state, memory, fault, state.rip);
+            return fault;
           }
-          record_violation(fault, fault_address_of(fault, state.rip));
-          ++stop_reason_counts_[stop_reason_to_index(fault.reason)];
-          notify_stop_hooks(state, memory, fault, state.rip);
-          return fault;
+          decode_size = in_page;
         }
       }
 
@@ -584,6 +583,22 @@ ExecutionResult Executor::step(CpuState& state, Memory& memory) {
           state.rip,
           iced_x86::DecoderOptions::NO_INVALID_CHECK);
       const auto decoded = decoder.decode();
+      if (!decoded.has_value() && truncated_to_page &&
+          decoded.error().error == iced_x86::DecoderError::NO_MORE_BYTES) {
+        // The instruction really does run into the next page, so the suppressed fetch fault was
+        // right after all. Wraps to zero on the last page, which is #GP, not a page fault.
+        const auto next_page = (state.rip | (Memory::kPageSize - 1)) + 1;
+        const auto reason = next_page == 0 ? StopReason::general_protection : StopReason::page_fault;
+        const auto fault_rip = next_page == 0 ? state.rip : next_page;
+        const ExecutionResult fault{reason, 0, ExceptionInfo{reason, fault_rip, 0}, std::nullopt};
+        if (try_recover_fault(fault, fault_address_of(fault, fault_rip))) {
+          continue;
+        }
+        record_violation(fault, fault_address_of(fault, fault_rip));
+        ++stop_reason_counts_[stop_reason_to_index(fault.reason)];
+        notify_stop_hooks(state, memory, fault, state.rip);
+        return fault;
+      }
       if (!decoded.has_value()) {
         if (trace_semantics_) {
           if (decode_bytes != bytes.data()) {
@@ -613,7 +628,7 @@ ExecutionResult Executor::step(CpuState& state, Memory& memory) {
       }
 
       cache_entry.rip = state.rip;
-      cache_entry.code_epoch = code_epoch;
+      cache_entry.page_epoch = rip_page_epoch;
       cache_entry.mode = state.mode;
       cache_entry.instr = decoded.value();
       cache_entry.simd_allowed = simd_profile_allows(cache_entry.instr);
@@ -621,7 +636,79 @@ ExecutionResult Executor::step(CpuState& state, Memory& memory) {
       const auto trap = trap_kind_for_code(cache_entry.instr.code());
       cache_entry.trap_kind = trap.has_value() ? static_cast<std::uint8_t>(*trap) : 0xFFu;
       cache_entry.instruction_length = std::max<std::uint32_t>(1u, cache_entry.instr.length());
-      cache_entry.valid = can_use_decode_cache;
+      bool fits_in_address_space = false;
+      cache_entry.last_page_epoch = last_byte_epoch(cache_entry.instruction_length, fits_in_address_space);
+      cache_entry.valid = can_use_decode_cache && fits_in_address_space;
+      cache_entry.dead_flags_mask = 0;
+
+      // Lift the rest of the block so the backward liveness pass has more than one instruction.
+      // Only pre-populates decode entries step() would fill anyway; nothing about dispatch changes.
+      if (fetched && cache_entry.valid && cache_entry.trap_kind == 0xFFu && cache_entry.simd_allowed &&
+          !ends_lifted_block(cache_entry.instr)) {
+        std::array<std::size_t, kMaxBlockLiftLength> lifted_indices{};
+        lifted_indices[0] = cache_index;
+        std::size_t lifted_count = 1;
+        while (lifted_count < kMaxBlockLiftLength) {
+          const auto next_decoded = decoder.decode();
+          if (!next_decoded.has_value()) {
+            break;
+          }
+          const auto next_rip = next_decoded.value().ip();
+          if (has_execution_address_hooks_ && execution_address_hooks_.contains(next_rip)) {
+            break;
+          }
+          const auto next_index = static_cast<std::size_t>((next_rip >> 1) & (kDecodeCacheSize - 1));
+          // The index folds rip and rip+1 onto one slot, so a run of 1-byte instructions can
+          // collide with a slot this same lift already claimed -- including cache_entry itself,
+          // still pending dispatch below.
+          bool collides = false;
+          for (std::size_t i = 0; i < lifted_count; ++i) {
+            if (lifted_indices[i] == next_index) {
+              collides = true;
+              break;
+            }
+          }
+          if (collides) {
+            break;
+          }
+          // The lift runs off the page cache, gated on the whole fetch window fitting one page, so
+          // every instruction shares rip's epoch. Bail rather than stamp the wrong one.
+          const auto next_last_byte = next_rip + (next_decoded.value().length() - 1);
+          if (next_rip / Memory::kPageSize != rip_page || next_last_byte < next_rip ||
+              next_last_byte / Memory::kPageSize != rip_page) {
+            break;
+          }
+          auto& next_entry = (*decode_cache_)[next_index];
+          next_entry.rip = next_rip;
+          next_entry.page_epoch = rip_page_epoch;
+          next_entry.last_page_epoch = rip_page_epoch;
+          next_entry.mode = state.mode;
+          next_entry.instr = next_decoded.value();
+          next_entry.simd_allowed = simd_profile_allows(next_entry.instr);
+          next_entry.reported_code = normalize_reported_code(next_entry.instr.code());
+          const auto next_trap = trap_kind_for_code(next_entry.instr.code());
+          next_entry.trap_kind = next_trap.has_value() ? static_cast<std::uint8_t>(*next_trap) : 0xFFu;
+          next_entry.instruction_length = std::max<std::uint32_t>(1u, next_entry.instr.length());
+          next_entry.dead_flags_mask = 0;
+          next_entry.valid = true;
+          lifted_indices[lifted_count++] = next_index;
+          const bool is_boundary = !next_entry.simd_allowed || next_entry.trap_kind != 0xFFu ||
+              ends_lifted_block(next_entry.instr);
+          if (is_boundary) {
+            break;
+          }
+        }
+        if (kFlagLivenessTablesTrustworthy && lifted_count > 1 && block_liveness_eligible(memory)) {
+          std::array<FlagLivenessInstr, kMaxBlockLiftLength> liveness{};
+          for (std::size_t i = 0; i < lifted_count; ++i) {
+            liveness[i].instr = &(*decode_cache_)[lifted_indices[i]].instr;
+          }
+          compute_flag_liveness(std::span<FlagLivenessInstr>(liveness.data(), lifted_count));
+          for (std::size_t i = 0; i < lifted_count; ++i) {
+            (*decode_cache_)[lifted_indices[i]].dead_flags_mask = liveness[i].dead_flags_mask;
+          }
+        }
+      }
     }
 
     const auto& instr = cache_entry.instr;
@@ -664,10 +751,6 @@ ExecutionResult Executor::step(CpuState& state, Memory& memory) {
       return fault;
     }
 
-    if (trace_strrchr_) {
-      maybe_trace_strrchr(state, memory);
-    }
-
     if (!cache_entry.simd_allowed) {
       const ExecutionResult fault{StopReason::unsupported_instruction, 0, ExceptionInfo{StopReason::unsupported_instruction, state.rip, 0}, instr.code()};
       if (try_recover_fault(fault, fault_address_of(fault, state.rip))) {
@@ -682,9 +765,11 @@ ExecutionResult Executor::step(CpuState& state, Memory& memory) {
     const bool rf_suppressed = (state.rflags & kFlagRF) != 0;
     if (rf_suppressed) {
       state.rflags &= ~kFlagRF;
+      rf_consumed = true;
     }
     const bool debug_suppressed = state.debug_suppression != 0;
     if (debug_suppressed) {
+      debug_suppression_consumed = state.debug_suppression;
       state.debug_suppression = 0;
     }
     const bool tf_active = (state.rflags & kFlagTF) != 0;
@@ -693,7 +778,9 @@ ExecutionResult Executor::step(CpuState& state, Memory& memory) {
       if (exec_hit_bits != 0) {
         state.dr[6] |= exec_hit_bits;
         ExecutionContext db_ctx{state, memory, instr, next_rip, false};
-        const auto db_result = detail::dispatch_interrupt(db_ctx, 1u, instruction_start_rip);
+        // An instruction breakpoint is a fault, so the frame carries its own rip and the iret lands
+        // back on it. RF in the saved image is the only thing stopping it firing forever.
+        const auto db_result = detail::dispatch_interrupt(db_ctx, 1u, instruction_start_rip, std::nullopt, true);
         if (db_result.reason != StopReason::none) {
           if (try_recover_fault(db_result, fault_address_of(db_result, state.rip))) {
             continue;
@@ -711,9 +798,6 @@ ExecutionResult Executor::step(CpuState& state, Memory& memory) {
 
     if (cache_entry.trap_kind != 0xFFu) {
       const auto trap_kind = static_cast<TrapKind>(cache_entry.trap_kind);
-      if (trace_openkey_probe_) {
-        maybe_trace_openkey_probe(state, memory);
-      }
       TrapHookContext trap_ctx{state, memory, instr, next_rip, trap_kind};
       const auto trap_result = run_trap_hooks(trap_ctx);
       if (trap_result.action == TrapHookAction::handled) {
@@ -743,18 +827,24 @@ ExecutionResult Executor::step(CpuState& state, Memory& memory) {
     }
 
     ExecutionContext ctx{state, memory, instr, next_rip, false};
-    if (has_execution_hooks_) {
-      for (auto& [id, hook] : execution_hooks_) {
-        (void)id;
-        hook(state.rip);
-      }
-    }
-    if (has_execution_address_hooks_) {
-      const auto exec_addr_it = execution_address_hooks_.find(state.rip);
-      if (exec_addr_it != execution_address_hooks_.end()) {
-        for (auto& [id, hook] : exec_addr_it->second) {
+    if (has_execution_hooks_ || has_execution_address_hooks_) {
+      // One scope across both loops, since a hook in the first can remove one from the second.
+      // These were the only unguarded dispatches, so a self-removing one-shot breakpoint erased
+      // from the vector its own range-for was walking.
+      HookDispatchScope scope{*this};
+      if (has_execution_hooks_) {
+        for (auto& [id, hook] : execution_hooks_) {
           (void)id;
           hook(state.rip);
+        }
+      }
+      if (has_execution_address_hooks_) {
+        const auto exec_addr_it = execution_address_hooks_.find(state.rip);
+        if (exec_addr_it != execution_address_hooks_.end()) {
+          for (auto& [id, hook] : exec_addr_it->second) {
+            (void)id;
+            hook(state.rip);
+          }
         }
       }
     }
@@ -793,21 +883,25 @@ ExecutionResult Executor::step(CpuState& state, Memory& memory) {
     }
 
     ExecutionResult result{};
-    // Dispatch on the NORMALIZED code, not the raw iced code. iced reports `68 imm32` / `6a imm8` as
-    // PUSHD_IMM32 / PUSHD_IMM8 (dword operand size), but in 64-bit mode PUSH imm defaults to a 64-bit
-    // stack slot (rsp -= 8). normalize_reported_code maps those to the PUSHQ_* forms; previously that
-    // mapping only affected the *reported* code while dispatch used the raw code, so seven executed the
-    // 4-byte handler (rsp -= 4) -- corrupting the stack for any VMProtect VM that pushes an imm.
+    // Dispatch on the normalized code: iced reports PUSH imm as the dword form, but in 64-bit mode
+    // it takes a 64-bit stack slot. Dispatching on the raw code ran the 4-byte handler and corrupted
+    // the stack for any guest that pushes an immediate.
     const auto code = reported_code;
-    switch (code) {
-#define KUBERA_CODE(code) \
-    case iced_x86::Code::code: result = handlers::handle_code_##code(ctx); break;
-#include "seven/handled_codes.def"
-#undef KUBERA_CODE
-      default:
-        result = unsupported(ctx);
-        break;
-    }
+    // The mask is only trustworthy if the caller keeps draining the block, TF is clear, no debug
+    // register is armed, and no hook arrived after the lift -- a cached mask outlives that one
+    // check. Context-sync counts too: it hands the host a CpuState at every boundary.
+    const bool masking_safe_now = allow_masking && (state.rflags & kFlagTF) == 0 &&
+                                   !has_enabled_breakpoints(state) && !context_read_cb_ && !context_write_cb_ &&
+                                   block_liveness_eligible(memory);
+    // Saved and put back, not assigned: a handler's access can reach a device callback that
+    // re-enters run(), and the nested frame's mask would otherwise stay installed and filter
+    // everything this handler writes afterwards.
+    const struct DeadFlagsMaskScope {
+      std::uint64_t saved;
+      ~DeadFlagsMaskScope() { detail::set_dead_flags_mask(saved); }
+    } dead_flags_scope{detail::dead_flags_mask()};
+    detail::set_dead_flags_mask(masking_safe_now ? cache_entry.dead_flags_mask : 0);
+    result = dispatch_handler(ctx, code);
     result.code = reported_code;
     if (result.reason == StopReason::none) {
       if (collect_code_stats_ && static_cast<std::size_t>(code) < code_execution_counts_.size()) {
@@ -822,9 +916,10 @@ ExecutionResult Executor::step(CpuState& state, Memory& memory) {
           !state.pending_single_step && !tf_active) {
         return result;
       }
-      const auto current_data_hit_bits = ctx.debug_hit_bits != 0
-                                             ? ctx.debug_hit_bits
-                                             : collect_data_breakpoint_hits(state, debug_memory_accesses);
+      // A handler reporting its own hits (implicit stack slots, string-op source/destination) does
+      // not mean the instruction's explicit operands missed, so take both rather than either.
+      const auto current_data_hit_bits =
+          ctx.debug_hit_bits | collect_data_breakpoint_hits(state, debug_memory_accesses);
       if (current_instruction_set_shadow) {
         state.pending_debug_hit_bits |= current_data_hit_bits;
         return result;
@@ -879,7 +974,10 @@ ExecutionResult Executor::run(CpuState& state, Memory& memory, std::size_t max_i
       notify_stop_hooks(state, memory, stopped, state.rip);
       return stopped;
     }
-    last = step(state, memory);
+    // Mask only with enough budget left that any block started now finishes inside this call, so
+    // run() never returns mid-span. Near the tail it falls back to the unmasked dispatch.
+    const bool allow_masking = (max_instructions - i) >= kMaxBlockLiftLength;
+    last = step_impl(state, memory, allow_masking);
     if (last.reason != StopReason::none) {
       last.retired += i;
       return last;
@@ -1076,7 +1174,9 @@ void Executor::clear_hooks() {
 }
 
 InstructionHookAction Executor::run_instruction_hooks(InstructionHookContext& ctx, ExecutionResult& stop_result) {
-  if (!pending_hook_mutations_.empty()) {
+  // Only at depth 0: a queued emplace_back run from inside a callback reallocates the vector an
+  // outer dispatch is still walking. The outermost scope flushing on its way out is the safe point.
+  if (!dispatching_hooks_ && !pending_hook_mutations_.empty()) {
     apply_pending_hook_mutations();
   }
 
@@ -1086,19 +1186,15 @@ InstructionHookAction Executor::run_instruction_hooks(InstructionHookContext& ct
     return InstructionHookAction::continue_to_core;
   }
 
-  dispatching_hooks_ = true;
+  HookDispatchScope scope{*this};
   for (auto& [id, hook] : instruction_hooks_) {
     (void)id;
     const auto result = hook(ctx);
     if (result.action == InstructionHookAction::stop) {
-      dispatching_hooks_ = false;
-      apply_pending_hook_mutations();
       stop_result = result.stop_result.value_or(ExecutionResult{StopReason::unsupported_instruction, 0, std::nullopt, ctx.instr.code()});
       return result.action;
     }
     if (result.action == InstructionHookAction::skip_core) {
-      dispatching_hooks_ = false;
-      apply_pending_hook_mutations();
       return result.action;
     }
   }
@@ -1107,20 +1203,14 @@ InstructionHookAction Executor::run_instruction_hooks(InstructionHookContext& ct
       (void)id;
       const auto result = hook(ctx);
       if (result.action == InstructionHookAction::stop) {
-        dispatching_hooks_ = false;
-        apply_pending_hook_mutations();
         stop_result = result.stop_result.value_or(ExecutionResult{StopReason::unsupported_instruction, 0, std::nullopt, ctx.instr.code()});
         return result.action;
       }
       if (result.action == InstructionHookAction::skip_core) {
-        dispatching_hooks_ = false;
-        apply_pending_hook_mutations();
         return result.action;
       }
     }
   }
-  dispatching_hooks_ = false;
-  apply_pending_hook_mutations();
   return InstructionHookAction::continue_to_core;
 }
 
@@ -1129,37 +1219,50 @@ TrapHookResult Executor::run_trap_hooks(TrapHookContext& ctx) {
   if (it == trap_hooks_.end()) {
     return {};
   }
-  dispatching_hooks_ = true;
+  HookDispatchScope scope{*this};
   for (auto& [id, hook] : it->second) {
     (void)id;
     const auto result = hook(ctx);
     if (result.action != TrapHookAction::continue_to_core) {
-      dispatching_hooks_ = false;
-      apply_pending_hook_mutations();
       return result;
     }
   }
-  dispatching_hooks_ = false;
-  apply_pending_hook_mutations();
   return {};
+}
+
+bool Executor::report_external_fault(CpuState& state, Memory& memory, const ExecutionResult& fault,
+                                     std::uint64_t fault_address) {
+  const auto action = run_fault_hooks(FaultHookEvent{state, memory, fault, state.rip, fault_address});
+  if (action != FaultHookAction::stop) {
+    // Both surviving actions mean "attempt this instruction again". step_impl's restart also rewinds
+    // rip, which is already where it needs to be here.
+    state.gpr[4] = mask_stack_pointer(state, state.gpr[4]);
+    return true;
+  }
+  if (fault.reason != StopReason::none && fault.reason != StopReason::halted &&
+      fault.reason != StopReason::execution_limit && fault.reason != StopReason::stop_requested) {
+    has_violation_ = true;
+    violation_reason_ = fault.reason;
+    violation_ip_ = state.rip;
+    violation_address_ = fault_address;
+  }
+  ++stop_reason_counts_[stop_reason_to_index(fault.reason)];
+  notify_stop_hooks(state, memory, fault, state.rip);
+  return false;
 }
 
 FaultHookAction Executor::run_fault_hooks(const FaultHookEvent& event) {
   if (fault_hooks_.empty()) {
     return FaultHookAction::stop;
   }
-  dispatching_hooks_ = true;
+  HookDispatchScope scope{*this};
   for (auto& [id, hook] : fault_hooks_) {
     (void)id;
     const auto action = hook(event);
     if (action != FaultHookAction::stop) {
-      dispatching_hooks_ = false;
-      apply_pending_hook_mutations();
       return action;
     }
   }
-  dispatching_hooks_ = false;
-  apply_pending_hook_mutations();
   return FaultHookAction::stop;
 }
 
@@ -1168,15 +1271,31 @@ void Executor::notify_stop_hooks(CpuState& state, Memory& memory, const Executio
     return;
   }
   auto& self = const_cast<Executor&>(*this);
-  self.dispatching_hooks_ = true;
+  HookDispatchScope scope{self};
   const StopHookEvent event{state, memory, result, fault_address};
   for (const auto& [id, hook] : stop_hooks_) {
     (void)id;
     hook(event);
   }
-  self.dispatching_hooks_ = false;
-  self.apply_pending_hook_mutations();
 }
+
+Executor::HookDispatchScope::HookDispatchScope(Executor& executor) noexcept
+    : self(executor), was_dispatching(executor.dispatching_hooks_) {
+  self.dispatching_hooks_ = true;
+}
+
+Executor::HookDispatchScope::~HookDispatchScope() {
+  self.dispatching_hooks_ = was_dispatching;
+  if (!was_dispatching) {
+    self.apply_pending_hook_mutations();
+  }
+}
+
+Executor::StepDepthScope::StepDepthScope(Executor& executor) noexcept : self(executor) {
+  ++self.step_depth_;
+}
+
+Executor::StepDepthScope::~StepDepthScope() { --self.step_depth_; }
 
 void Executor::apply_pending_hook_mutations() {
   if (pending_hook_mutations_.empty()) {
@@ -1225,6 +1344,39 @@ std::size_t Executor::supported_code_count() const noexcept {
 
 ExecutionResult Executor::unsupported(ExecutionContext& ctx) {
   return {StopReason::unsupported_instruction, 0, ExceptionInfo{StopReason::unsupported_instruction, ctx.state.rip, 0}, std::nullopt};
+}
+
+bool Executor::is_trap_instruction(iced_x86::Code code) noexcept {
+  return trap_kind_for_code(code).has_value();
+}
+
+bool Executor::simd_profile_allows(const iced_x86::Instruction& instr) noexcept {
+  const auto encoding = iced_x86::InstructionExtensions::encoding(instr);
+  if (encoding == iced_x86::EncodingKind::EVEX && !kEnableAvx512) {
+    return false;
+  }
+  if (encoding == iced_x86::EncodingKind::VEX && !kEnableAvx) {
+    return false;
+  }
+  for (std::uint32_t i = 0; i < instr.op_count(); ++i) {
+    if (instr.op_kind(i) == iced_x86::OpKind::REGISTER &&
+        vector_width_for_register(instr.op_register(i)) > kVectorBytes) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// forceinline so step_impl's dispatch stays as fast as before this got pulled out of it
+__forceinline ExecutionResult Executor::dispatch_handler(ExecutionContext& ctx, iced_x86::Code code) {
+  switch (code) {
+#define KUBERA_CODE(code) \
+    case iced_x86::Code::code: return handlers::handle_code_##code(ctx);
+#include "seven/handled_codes.def"
+#undef KUBERA_CODE
+    default:
+      return unsupported(ctx);
+  }
 }
 
 std::vector<std::uint8_t> parse_hex_bytes(std::string_view text) {

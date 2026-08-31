@@ -3,6 +3,22 @@
 
 namespace seven::handlers {
 
+namespace {
+
+// Hardware allows CLI/STI when CPL <= IOPL and #GP(0)s otherwise. seven emulates ring 3 only, where
+// IOPL is 0, so this reduces to CPL0-only, but the real comparison is the correct one to write.
+[[nodiscard]] bool cli_sti_allowed(const CpuState& state) {
+  const auto cpl = state.sreg[1] & 0x3u;
+  const auto iopl = (state.rflags >> 12) & 0x3u;
+  return cpl <= iopl;
+}
+
+[[nodiscard]] ExecutionResult gp_fault(ExecutionContext& ctx) {
+  return {StopReason::general_protection, 0, ExceptionInfo{StopReason::general_protection, ctx.state.rip, 0}, ctx.instr.code()};
+}
+
+}  // namespace
+
 ExecutionResult handle_code_CLC(ExecutionContext& ctx) {
   detail::set_flag(ctx.state.rflags, kFlagCF, false);
   return {};
@@ -29,42 +45,58 @@ ExecutionResult handle_code_STD(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_CLI(ExecutionContext& ctx) {
+  if (!cli_sti_allowed(ctx.state)) {
+    return gp_fault(ctx);
+  }
   detail::set_flag(ctx.state.rflags, kFlagIF, false);
   return {};
 }
 
 ExecutionResult handle_code_STI(ExecutionContext& ctx) {
+  if (!cli_sti_allowed(ctx.state)) {
+    return gp_fault(ctx);
+  }
   detail::set_flag(ctx.state.rflags, kFlagIF, true);
   return {};
 }
 
 ExecutionResult handle_code_PUSHFQ(ExecutionContext& ctx) {
-  ctx.state.gpr[4] = mask_stack_pointer(ctx.state, ctx.state.gpr[4] - 8);
-  if (!ctx.memory.write(ctx.state.gpr[4], &ctx.state.rflags, 8)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, ctx.state.gpr[4], 0}, ctx.instr.code()};
+  // rsp only moves once the slot is written, same as push.cpp's push_width: a fault here aborts the
+  // instruction and leaves rsp where it was.
+  const auto slot = mask_stack_pointer(ctx.state, ctx.state.gpr[4] - 8);
+  if (!ctx.memory.write(slot, &ctx.state.rflags, 8)) {
+    return detail::memory_fault(ctx, slot);
   }
+  ctx.state.gpr[4] = slot;
+  detail::note_stack_access(ctx, slot, 8, true);
   return {};
 }
 
 ExecutionResult handle_code_POPFQ(ExecutionContext& ctx) {
+  const auto slot = ctx.state.gpr[4];
   std::uint64_t value = 0;
-  if (!ctx.memory.read(ctx.state.gpr[4], &value, 8)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, ctx.state.gpr[4], 0}, ctx.instr.code()};
+  if (!ctx.memory.read(slot, &value, 8)) {
+    return detail::memory_fault(ctx, slot);
   }
-  // seven emulates ring 3 only. At CPL 3 (IOPL 0) POPFQ CANNOT modify IF/IOPL/VIF/VIP/VM and it
-  // clears RF -- it never disables interrupts. Measured on an i9-11900K: user-mode POPF always
-  // leaves IF=1 regardless of the popped value. Blindly loading IF (as before) let it go to 0,
-  // which VMProtect's baked flag checks then detect. Preserve the system bits, force IF=1, clear RF.
+  // seven emulates ring 3 only, where POPFQ cannot touch IF/IOPL/VIF/VIP/VM and clears RF. Measured
+  // on an i9-11900K, user-mode POPF always leaves IF=1 whatever was popped. kRflagsWritableMask drops
+  // the bits that do not exist, since this is one of only two instructions that can write them.
   constexpr std::uint64_t kSysBits = kFlagIF | (3ull << 12) | (1ull << 17) | (1ull << 19) | (1ull << 20);
   constexpr std::uint64_t kRF = 1ull << 16;
-  ctx.state.rflags = (value & ~kSysBits & ~kRF) | (ctx.state.rflags & kSysBits);
-  ctx.state.rflags |= kFlagIF | 0x2ull;  // user-mode IF is always set; bit 1 is reserved-1
-  ctx.state.gpr[4] = mask_stack_pointer(ctx.state, ctx.state.gpr[4] + 8);
+  ctx.state.rflags = (value & kRflagsWritableMask & ~kSysBits & ~kRF) | (ctx.state.rflags & kSysBits);
+  ctx.state.rflags |= kFlagIF | kRflagsReservedOnes;  // user-mode IF is always set; bit 1 is reserved-1
+  ctx.state.gpr[4] = mask_stack_pointer(ctx.state, slot + 8);
+  detail::note_stack_access(ctx, slot, 8, false);
   return {};
 }
 
+// HLT is CPL0-only. A ring-3 guest reaching this was halting the machine instead of faulting,
+// which is the one privileged instruction where the wrong answer stops execution outright.
 ExecutionResult handle_code_HLT(ExecutionContext& ctx) {
-  (void)ctx;
+  if ((ctx.state.sreg[1] & 0x3u) != 0) {
+    return {StopReason::general_protection, 0,
+            ExceptionInfo{StopReason::general_protection, ctx.state.rip, 0}, ctx.instr.code()};
+  }
   return {StopReason::halted, 0, std::nullopt, std::nullopt};
 }
 
@@ -89,31 +121,32 @@ ExecutionResult handle_code_SAHF(ExecutionContext& ctx) {
   return {};
 }
 
+// INT1 (ICEBP) is left out of the software-interrupt group deliberately: it delivers as a #DB trap
+// and is not subject to the gate DPL check the other three get.
 ExecutionResult handle_code_INT1(ExecutionContext& ctx) {
   return detail::dispatch_interrupt(ctx, 1u, ctx.next_rip);
 }
 
 ExecutionResult handle_code_INT3(ExecutionContext& ctx) {
-  return detail::dispatch_interrupt(ctx, 3u, ctx.next_rip);
+  return detail::dispatch_interrupt(ctx, 3u, ctx.next_rip, std::nullopt, false, true);
 }
 
 ExecutionResult handle_code_INT_IMM8(ExecutionContext& ctx) {
   const auto vector = static_cast<std::uint8_t>(ctx.instr.immediate8());
-  return detail::dispatch_interrupt(ctx, vector, ctx.next_rip);
+  return detail::dispatch_interrupt(ctx, vector, ctx.next_rip, std::nullopt, false, true);
 }
 
 ExecutionResult handle_code_INTO(ExecutionContext& ctx) {
   if ((ctx.state.rflags & kFlagOF) == 0) {
     return {};
   }
-  return detail::dispatch_interrupt(ctx, 4u, ctx.next_rip);
+  return detail::dispatch_interrupt(ctx, 4u, ctx.next_rip, std::nullopt, false, true);
 }
 
 ExecutionResult handle_code_RDTSC(ExecutionContext& ctx) {
-  static std::uint64_t tsc = 0;
-  ++tsc;
-  detail::write_register(ctx.state, iced_x86::Register::EAX, static_cast<std::uint32_t>(tsc & 0xFFFFFFFFull), 4);
-  detail::write_register(ctx.state, iced_x86::Register::EDX, static_cast<std::uint32_t>(tsc >> 32), 4);
+  ++ctx.state.tsc;
+  detail::write_register(ctx.state, iced_x86::Register::EAX, static_cast<std::uint32_t>(ctx.state.tsc & 0xFFFFFFFFull), 4);
+  detail::write_register(ctx.state, iced_x86::Register::EDX, static_cast<std::uint32_t>(ctx.state.tsc >> 32), 4);
   return {};
 }
 
@@ -151,29 +184,9 @@ ExecutionResult handle_code_ENDBR64(ExecutionContext&) {
   return {};
 }
 
-ExecutionResult handle_code_STMXCSR(ExecutionContext& ctx) {
-  if (!detail::write_operand(ctx, 0, ctx.state.mxcsr, 4)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
-  }
-  return {};
-}
-
-ExecutionResult handle_code_LDMXCSR(ExecutionContext& ctx) {
-  bool ok = false;
-  const auto value = detail::read_operand(ctx, 0, 4, &ok);
-  if (!ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
-  }
-  if ((value >> 16) != 0) {
-    return {StopReason::general_protection, 0, ExceptionInfo{StopReason::general_protection, detail::memory_address(ctx), 0}, ctx.instr.code()};
-  }
-  ctx.state.mxcsr = static_cast<std::uint32_t>(value);
-  return {};
-}
-
 ExecutionResult handle_code_STMXCSR_M32(ExecutionContext& ctx) {
   if (!detail::write_operand(ctx, 0, ctx.state.mxcsr, 4)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -182,7 +195,7 @@ ExecutionResult handle_code_LDMXCSR_M32(ExecutionContext& ctx) {
   bool ok = false;
   const auto value = detail::read_operand(ctx, 0, 4, &ok);
   if (!ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   if ((value >> 16) != 0) {
     return {StopReason::general_protection, 0, ExceptionInfo{StopReason::general_protection, detail::memory_address(ctx), 0}, ctx.instr.code()};
@@ -220,13 +233,24 @@ ExecutionResult handle_code_RDGSBASE_R64(ExecutionContext& ctx) {
   return {};
 }
 
+// WRFSBASE/WRGSBASE require the value written to FS.base/GS.base to already be a canonical 48-bit
+// linear address, #GP(0) otherwise -- the same rule memory operands get through memory_fault(),
+// checked here because these two touch state directly and never go through that path.
 ExecutionResult handle_code_WRFSBASE_R64(ExecutionContext& ctx) {
-  ctx.state.fs_base = detail::read_register(ctx.state, ctx.instr.op_register(0));
+  const auto value = detail::read_register(ctx.state, ctx.instr.op_register(0));
+  if (!is_canonical_address(value)) {
+    return gp_fault(ctx);
+  }
+  ctx.state.fs_base = value;
   return {};
 }
 
 ExecutionResult handle_code_WRGSBASE_R64(ExecutionContext& ctx) {
-  ctx.state.gs_base = detail::read_register(ctx.state, ctx.instr.op_register(0));
+  const auto value = detail::read_register(ctx.state, ctx.instr.op_register(0));
+  if (!is_canonical_address(value)) {
+    return gp_fault(ctx);
+  }
+  ctx.state.gs_base = value;
   return {};
 }
 

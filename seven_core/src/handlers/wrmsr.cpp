@@ -2,27 +2,54 @@
 
 namespace seven::handlers {
 
+namespace {
+
+[[nodiscard]] bool cpl_is_zero(const CpuState& state) {
+  return (state.sreg[1] & 0x3u) == 0;
+}
+
+[[nodiscard]] ExecutionResult gp_fault(ExecutionContext& ctx) {
+  return {StopReason::general_protection, 0, ExceptionInfo{StopReason::general_protection, ctx.state.rip, 0}, ctx.instr.code()};
+}
+
+}  // namespace
+
+// WRMSR/WRMSRNS/WRMSRLIST are CPL0-only on real hardware (#GP(0) otherwise) -- any privilege
+// level could otherwise overwrite an arbitrary MSR, including ones (STAR/LSTAR/FMASK/
+// KERNEL_GS_BASE) that other privilege levels rely on for their own control-flow/addressing.
 ExecutionResult handle_code_WRMSR(ExecutionContext& ctx) {
+  if (!cpl_is_zero(ctx.state)) {
+    return gp_fault(ctx);
+  }
   const auto ecx = static_cast<std::uint32_t>(detail::read_register(ctx.state, iced_x86::Register::ECX));
   const std::uint64_t eax = detail::read_register(ctx.state, iced_x86::Register::EAX);
   const std::uint64_t edx = detail::read_register(ctx.state, iced_x86::Register::EDX);
-  detail::write_msr(ctx.state, ecx, (edx << 32) | (eax & 0xFFFFFFFFull));
+  if (!detail::write_msr(ctx.state, ecx, (edx << 32) | (eax & 0xFFFFFFFFull))) {
+    return gp_fault(ctx);
+  }
   return {};
 }
 
 ExecutionResult handle_code_WRMSRNS(ExecutionContext& ctx) {
-  bool msr_ok = false;
-  const auto msr_index = static_cast<std::uint32_t>(detail::read_operand(ctx, 0, 4, &msr_ok));
-  if (!msr_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+  if (!cpl_is_zero(ctx.state)) {
+    return gp_fault(ctx);
   }
+  // WRMSRNS encodes no operands at all -- it takes the index from ECX exactly like WRMSR. Reading
+  // operand slot 0 got back the value-initialised (REGISTER, NONE) slot, which resolves to a
+  // register index of zero, so the index came from EAX and every write landed on the wrong MSR.
+  const auto msr_index = static_cast<std::uint32_t>(detail::read_register(ctx.state, iced_x86::Register::ECX));
   const std::uint64_t eax = detail::read_register(ctx.state, iced_x86::Register::EAX);
   const std::uint64_t edx = detail::read_register(ctx.state, iced_x86::Register::EDX);
-  detail::write_msr(ctx.state, msr_index, (edx << 32) | (eax & 0xFFFFFFFFull));
+  if (!detail::write_msr(ctx.state, msr_index, (edx << 32) | (eax & 0xFFFFFFFFull))) {
+    return gp_fault(ctx);
+  }
   return {};
 }
 
 ExecutionResult handle_code_WRMSRLIST(ExecutionContext& ctx) {
+  if (!cpl_is_zero(ctx.state)) {
+    return gp_fault(ctx);
+  }
   const auto rdi = detail::read_register(ctx.state, iced_x86::Register::RDI);
   const auto rsi = detail::read_register(ctx.state, iced_x86::Register::RSI);
   if (((rdi | rsi) & 0x7ull) != 0ull) {
@@ -41,12 +68,14 @@ ExecutionResult handle_code_WRMSRLIST(ExecutionContext& ctx) {
     const auto msr_address = rsi + (bit * 8);
     const auto value_address = rdi + (bit * 8);
     if (!ctx.memory.read(msr_address, &msr_index, 8)) {
-      return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, msr_address, 0}, ctx.instr.code()};
+      return detail::memory_fault(ctx, msr_address);
     }
     if (!ctx.memory.read(value_address, &value, 8)) {
-      return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, value_address, 0}, ctx.instr.code()};
+      return detail::memory_fault(ctx, value_address);
     }
-    detail::write_msr(ctx.state, static_cast<std::uint32_t>(msr_index), value);
+    if (!detail::write_msr(ctx.state, static_cast<std::uint32_t>(msr_index), value)) {
+      return gp_fault(ctx);
+    }
 
     rcx &= ~mask;
     detail::write_register(ctx.state, iced_x86::Register::RCX, rcx);

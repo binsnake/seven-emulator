@@ -82,6 +82,11 @@ struct hook_object : utils::object {
   kind hook_kind{kind::local};
   seven::Executor::HookId executor_id{};
   seven::Memory::HookId memory_id{};
+  // Kept for memory hooks so a snapshot restore, which replaces the whole Memory object, can put
+  // them back rather than silently losing them. See deserialize_state.
+  seven::Memory::AccessHook memory_hook{};
+  seven::MemoryHookRange memory_range{};
+  seven::MemoryAccessKindMask memory_kinds{};
 };
 
 seven::MemoryPermissionMask to_seven_permissions(memory_permission permissions) {
@@ -163,7 +168,12 @@ void emulate_cpuid_defaults(seven::CpuState& state) {
 
 bool ranges_overlap(uint64_t a_base, uint64_t a_size, uint64_t b_base, uint64_t b_size) {
   if (a_size == 0 || b_size == 0) return false;
-  return a_base < (b_base + b_size) && b_base < (a_base + a_size);
+  // A decoded access is guest-controlled, so a_base + a_size can wrap past the top of the address
+  // space and a non-wrapping comparison would attribute the fault to the wrong operand.
+  const auto a_end = a_base + a_size;
+  const auto b_end = b_base + b_size;
+  if (a_end < a_base || b_end < b_base) return true;
+  return a_base < b_end && b_base < a_end;
 }
 
 struct decoded_memory_access {
@@ -236,6 +246,12 @@ std::optional<int> interrupt_vector_from_instruction(const seven::TrapHookContex
 }
 
 std::optional<iced_x86::Instruction> decode_instruction_at(const seven::CpuState& state, const seven::Memory& memory, const uint64_t rip) {
+  // Advisory decoding for block metadata, so it must not have side effects. Memory::read routes a
+  // contained access to an MMIO on_read callback, and the walk below runs past instructions the guest
+  // may never execute, so a device range next to a code page would see real speculative reads.
+  if (!memory.is_mapped(rip, 1)) {
+    return std::nullopt;
+  }
   std::array<uint8_t, iced_x86::IcedConstants::_MAX_INSTRUCTION_LENGTH> bytes{};
   if (!memory.read(rip, bytes.data(), bytes.size(), seven::MemoryAccessKind::instruction_fetch)) {
     return std::nullopt;
@@ -246,6 +262,42 @@ std::optional<iced_x86::Instruction> decode_instruction_at(const seven::CpuState
     return std::nullopt;
   }
   return decoded.value();
+}
+
+// flow_control() here is a partial table knowing only Jcc/JMP/CALL/RET/INT3, so LOOP, JRCXZ,
+// SYSCALL, IRET, HLT, UD and XBEGIN all fall through to NEXT. That mis-sizes a block ending in one
+// and lets the walk below spend its full 256-instruction budget on a block one instruction long.
+bool terminates_basic_block(const iced_x86::Instruction& instr) {
+  switch (instr.code()) {
+    case iced_x86::Code::LOOP_REL8_16_CX: case iced_x86::Code::LOOP_REL8_32_CX:
+    case iced_x86::Code::LOOP_REL8_16_ECX: case iced_x86::Code::LOOP_REL8_32_ECX:
+    case iced_x86::Code::LOOP_REL8_64_ECX: case iced_x86::Code::LOOP_REL8_16_RCX:
+    case iced_x86::Code::LOOP_REL8_64_RCX:
+    case iced_x86::Code::LOOPE_REL8_16_CX: case iced_x86::Code::LOOPE_REL8_32_CX:
+    case iced_x86::Code::LOOPE_REL8_16_ECX: case iced_x86::Code::LOOPE_REL8_32_ECX:
+    case iced_x86::Code::LOOPE_REL8_64_ECX: case iced_x86::Code::LOOPE_REL8_16_RCX:
+    case iced_x86::Code::LOOPE_REL8_64_RCX:
+    case iced_x86::Code::LOOPNE_REL8_16_CX: case iced_x86::Code::LOOPNE_REL8_32_CX:
+    case iced_x86::Code::LOOPNE_REL8_16_ECX: case iced_x86::Code::LOOPNE_REL8_32_ECX:
+    case iced_x86::Code::LOOPNE_REL8_64_ECX: case iced_x86::Code::LOOPNE_REL8_16_RCX:
+    case iced_x86::Code::LOOPNE_REL8_64_RCX:
+    case iced_x86::Code::JECXZ_REL8_16: case iced_x86::Code::JECXZ_REL8_32:
+    case iced_x86::Code::JECXZ_REL8_64:
+    case iced_x86::Code::JRCXZ_REL8_16: case iced_x86::Code::JRCXZ_REL8_64:
+    case iced_x86::Code::SYSCALL: case iced_x86::Code::SYSENTER:
+    case iced_x86::Code::SYSEXITD: case iced_x86::Code::SYSEXITQ:
+    case iced_x86::Code::SYSRETD: case iced_x86::Code::SYSRETQ:
+    case iced_x86::Code::IRETW: case iced_x86::Code::IRETD: case iced_x86::Code::IRETQ:
+    case iced_x86::Code::HLT:
+    case iced_x86::Code::UD0: case iced_x86::Code::UD0_R16_RM16:
+    case iced_x86::Code::UD0_R32_RM32: case iced_x86::Code::UD0_R64_RM64:
+    case iced_x86::Code::UD1_R16_RM16: case iced_x86::Code::UD1_R32_RM32:
+    case iced_x86::Code::UD1_R64_RM64: case iced_x86::Code::UD2:
+    case iced_x86::Code::XBEGIN_REL16: case iced_x86::Code::XBEGIN_REL32:
+      return true;
+    default:
+      return iced_x86::InstructionExtensions::flow_control(instr) != iced_x86::FlowControl::NEXT;
+  }
 }
 
 basic_block summarize_basic_block(const seven::CpuState& state, const seven::Memory& memory, const std::uint64_t rip) {
@@ -263,8 +315,7 @@ basic_block summarize_basic_block(const seven::CpuState& state, const seven::Mem
     block.instruction_count += 1;
     block.size += length;
 
-    const auto flow = iced_x86::InstructionExtensions::flow_control(instr.value());
-    if (flow != iced_x86::FlowControl::NEXT) {
+    if (terminates_basic_block(instr.value())) {
       break;
     }
 
@@ -437,31 +488,6 @@ bool resolve_dr_index_for_api(const seven::CpuState& state, x86_register reg, si
 class seven_x86_64_emulator final : public x86_64_emulator {
  public:
   seven_x86_64_emulator() {
-    static const bool trace_testproject = [] {
-      if (const char* v = std::getenv("SEVEN_TRACE_TESTPROJECT")) {
-        return v[0] != '\0' && v[0] != '0';
-      }
-      return false;
-    }();
-    if (trace_testproject) {
-      testproject_trace_hook_id_ = executor_.add_instruction_hook([](seven::InstructionHookContext& ctx) {
-        constexpr std::uint64_t kStart = 0x1400058A0ull;
-        constexpr std::uint64_t kEnd = 0x140006000ull;
-        if (ctx.state.rip >= kStart && ctx.state.rip < kEnd) {
-          std::fprintf(stderr,
-                       "[seven-testproject] rip=0x%llx code=%u len=%u rax=0x%llx rcx=0x%llx rdx=0x%llx rflags=0x%llx\n",
-                       static_cast<unsigned long long>(ctx.state.rip),
-                       static_cast<unsigned>(ctx.instr.code()),
-                       static_cast<unsigned>(ctx.instr.length()),
-                       static_cast<unsigned long long>(ctx.state.gpr[0]),
-                       static_cast<unsigned long long>(ctx.state.gpr[1]),
-                       static_cast<unsigned long long>(ctx.state.gpr[2]),
-                       static_cast<unsigned long long>(ctx.state.rflags));
-        }
-        return seven::InstructionHookResult{};
-      });
-    }
-
     static const bool trace_unique_instructions = [] {
       if (const char* v = std::getenv("SEVEN_TRACE_UNIQUE_INSTRUCTIONS")) {
         return v[0] != '\0' && v[0] != '0';
@@ -637,7 +663,7 @@ class seven_x86_64_emulator final : public x86_64_emulator {
 
     if (r >= x86_register::mm0 && r <= x86_register::mm7) {
       const auto idx = static_cast<size_t>(static_cast<int>(r) - static_cast<int>(x86_register::mm0));
-      state_.mmx[idx] = scalar;
+      state_.mmx_set(idx, scalar);
       return std::min(size, size_t(8));
     }
 
@@ -742,7 +768,7 @@ class seven_x86_64_emulator final : public x86_64_emulator {
         return 0;
       } else if (r >= x86_register::mm0 && r <= x86_register::mm7) {
         const auto idx = static_cast<size_t>(static_cast<int>(r) - static_cast<int>(x86_register::mm0));
-        scalar = state_.mmx[idx];
+        scalar = state_.mmx_get(idx);
         out_size = 8;
       } else {
         size_t vec_index{};
@@ -780,33 +806,46 @@ class seven_x86_64_emulator final : public x86_64_emulator {
   }
 
   void map_mmio(uint64_t address, size_t size, mmio_read_callback read_cb, mmio_write_callback write_cb) override {
-    auto replace_or_add_binding = [&](mmio_read_callback r, mmio_write_callback w) {
-      for (auto& binding : mmio_bindings_) {
-        if (binding.base == address && binding.size == size) {
-          binding.read = std::move(r);
-          binding.write = std::move(w);
-          return;
-        }
+    mmio_binding* existing = nullptr;
+    for (auto& binding : mmio_bindings_) {
+      if (binding.base == address && binding.size == size) {
+        existing = &binding;
+        break;
       }
-      mmio_bindings_.push_back(mmio_binding{
-        .base = address,
-        .size = size,
-        .read = std::move(r),
-        .write = std::move(w),
-      });
-    };
-    replace_or_add_binding(read_cb, write_cb);
+    }
 
-    (void)memory_.map_mmio(
+    // map_mmio appends and find_mmio_region returns the first match, so re-mapping without removing
+    // leaves the original callbacks servicing the range. Once the host tears that device down the
+    // guest is driving a dangling std::function with an offset and payload of its own choosing.
+    if (existing != nullptr && existing->region_id != 0) {
+      (void)memory_.unmap_mmio(existing->region_id);
+      existing->region_id = 0;
+    }
+
+    const auto region_id = memory_.map_mmio(
       address, size,
-      [cb = std::move(read_cb)](uint64_t offset, void* dst, size_t cb_size) {
+      [cb = read_cb](uint64_t offset, void* dst, size_t cb_size) {
         cb(offset, dst, cb_size);
         return true;
       },
-      [cb = std::move(write_cb)](uint64_t offset, const void* src, size_t cb_size) {
+      [cb = write_cb](uint64_t offset, const void* src, size_t cb_size) {
         cb(offset, src, cb_size);
         return true;
       });
+
+    if (existing != nullptr) {
+      existing->read = std::move(read_cb);
+      existing->write = std::move(write_cb);
+      existing->region_id = region_id;
+      return;
+    }
+    mmio_bindings_.push_back(mmio_binding{
+      .base = address,
+      .size = size,
+      .read = std::move(read_cb),
+      .write = std::move(write_cb),
+      .region_id = region_id,
+    });
   }
 
   void map_memory(uint64_t address, size_t size, memory_permission permissions) override { memory_.map(address, size, to_seven_permissions(permissions)); }
@@ -855,10 +894,8 @@ class seven_x86_64_emulator final : public x86_64_emulator {
       if (ctx.kind == seven::TrapKind::syscall &&
           action == instruction_hook_continuation::skip_instruction &&
           ctx.state.rip != trap_rip) {
-        // SOGEN's shared syscall helpers rewrite RIP as if the backend will still
-        // advance past the syscall instruction after the hook returns. Unicorn
-        // does that for us; seven handles the trap entirely in the hook, so we
-        // must apply the same advance here to preserve the existing contract.
+        // The shared syscall helpers rewrite RIP expecting the backend to advance past the syscall
+        // afterwards, which Unicorn does and seven does not, so apply it here.
         ctx.state.rip += static_cast<std::uint64_t>(ctx.instr.length());
       }
       return result;
@@ -939,25 +976,27 @@ class seven_x86_64_emulator final : public x86_64_emulator {
   }
 
   emulator_hook* hook_memory_read(uint64_t address, uint64_t size, memory_access_hook_callback callback) override {
-    const auto id = memory_.add_access_hook(
+    seven::Memory::AccessHook access_hook =
         [cb = std::move(callback)](const seven::MemoryAccessEvent& event) {
           cb(event.address, event.data, event.data_size);
           return true;
-        },
-        seven::MemoryHookRange{.base = address, .size = static_cast<size_t>(size)},
-        seven::bit(seven::MemoryAccessKind::data_read));
-    return make_memory_hook(id);
+        };
+    const seven::MemoryHookRange range{.base = address, .size = static_cast<size_t>(size)};
+    const auto kinds = seven::bit(seven::MemoryAccessKind::data_read);
+    const auto id = memory_.add_access_hook(access_hook, range, kinds);
+    return make_memory_hook(id, std::move(access_hook), range, kinds);
   }
 
   emulator_hook* hook_memory_write(uint64_t address, uint64_t size, memory_access_hook_callback callback) override {
-    const auto id = memory_.add_access_hook(
+    seven::Memory::AccessHook access_hook =
         [cb = std::move(callback)](const seven::MemoryAccessEvent& event) {
           cb(event.address, event.data, event.data_size);
           return true;
-        },
-        seven::MemoryHookRange{.base = address, .size = static_cast<size_t>(size)},
-        seven::bit(seven::MemoryAccessKind::data_write));
-    return make_memory_hook(id);
+        };
+    const seven::MemoryHookRange range{.base = address, .size = static_cast<size_t>(size)};
+    const auto kinds = seven::bit(seven::MemoryAccessKind::data_write);
+    const auto id = memory_.add_access_hook(access_hook, range, kinds);
+    return make_memory_hook(id, std::move(access_hook), range, kinds);
   }
 
   void delete_hook(emulator_hook* hook) override {
@@ -1022,10 +1061,13 @@ class seven_x86_64_emulator final : public x86_64_emulator {
 
     memory_.restore_mmio_regions(regions, [this](const seven::Memory::MmioRegionSnapshot& region)
         -> std::optional<std::pair<seven::Memory::MmioReadCallback, seven::Memory::MmioWriteCallback>> {
-      for (const auto& binding : mmio_bindings_) {
+      for (auto& binding : mmio_bindings_) {
         if (binding.base != region.base || binding.size != region.size) {
           continue;
         }
+        // Adopt the restored region's id so a later map_mmio on this range unmaps the region that
+        // is actually installed now, not the one from before the snapshot.
+        binding.region_id = region.id;
         seven::Memory::MmioReadCallback read_cb =
             [cb = binding.read](uint64_t offset, void* dst, size_t cb_size) {
               cb(offset, dst, cb_size);
@@ -1040,6 +1082,16 @@ class seven_x86_64_emulator final : public x86_64_emulator {
       }
       return std::nullopt;
     });
+
+    // `memory_ = {}` dropped the access-hook table while every handle stays live, so hooks silently
+    // stop firing after a restore, and it frees hook ids those handles still carry for reuse.
+    // Re-registering runs after restore_mmio_regions so the fresh ids cannot collide.
+    for (auto& hook : hooks_) {
+      if (hook->hook_kind != hook_object::kind::memory || !hook->memory_hook) {
+        continue;
+      }
+      hook->memory_id = memory_.add_access_hook(hook->memory_hook, hook->memory_range, hook->memory_kinds);
+    }
   }
 
   std::vector<std::byte> save_registers() const override {
@@ -1058,7 +1110,7 @@ class seven_x86_64_emulator final : public x86_64_emulator {
     s.write(state_.idtr.base);
     s.write(state_.idtr.limit);
     for (const auto& v : state_.gpr) s.write(v);
-    for (const auto& v : state_.mmx) s.write(v);
+    // No separate MMX block: MM0-MM7 are the low halves of the x87 registers serialized below.
     for (const auto& v : state_.sreg) s.write(v);
     for (const auto& v : state_.cr) s.write(v);
     for (const auto& v : state_.dr) s.write(v);
@@ -1099,13 +1151,19 @@ class seven_x86_64_emulator final : public x86_64_emulator {
     d.read(state_.mxcsr);
     d.read(state_.x87_control_word);
     d.read(state_.x87_status_word);
-    d.read(state_.x87_top);
+    {
+      // Straight into the field, this was the one writer in either repo that skipped the 0..7 mask
+      // every other one applies. x87_top indexes an 8-entry array, so a byte of 8..255 out of a
+      // blob reached past it -- inside CpuState, but past the array all the same.
+      std::uint8_t top{};
+      d.read(top);
+      state_.set_x87_top(top);
+    }
     d.read(state_.gdtr.base);
     d.read(state_.gdtr.limit);
     d.read(state_.idtr.base);
     d.read(state_.idtr.limit);
     for (auto& v : state_.gpr) d.read(v);
-    for (auto& v : state_.mmx) d.read(v);
     for (auto& v : state_.sreg) d.read(v);
     for (auto& v : state_.cr) d.read(v);
     for (auto& v : state_.dr) d.read(v);
@@ -1120,6 +1178,11 @@ class seven_x86_64_emulator final : public x86_64_emulator {
       uint64_t val{};
       d.read(id);
       d.read(val);
+      // Same ceiling write_msr enforces on the guest-driven path, for the same reason: the count
+      // here is just a number out of the blob, and this map is otherwise free to grow to it.
+      if (state_.msr.size() >= 4096) {
+        continue;
+      }
       state_.msr.emplace(id, val);
     }
 
@@ -1169,6 +1232,9 @@ class seven_x86_64_emulator final : public x86_64_emulator {
     size_t size{};
     mmio_read_callback read{};
     mmio_write_callback write{};
+    // Region currently installed in Memory for this binding, so a re-map can drop the old one
+    // instead of leaving it live and first-in-line. 0 means "none installed".
+    seven::Memory::HookId region_id{};
   };
 
   emulator_hook* make_executor_hook(seven::Executor::HookId id) {
@@ -1180,10 +1246,14 @@ class seven_x86_64_emulator final : public x86_64_emulator {
     return ptr;
   }
 
-  emulator_hook* make_memory_hook(seven::Memory::HookId id) {
+  emulator_hook* make_memory_hook(seven::Memory::HookId id, seven::Memory::AccessHook access_hook,
+                                  seven::MemoryHookRange range, seven::MemoryAccessKindMask kinds) {
     auto hook = std::make_unique<hook_object>();
     hook->hook_kind = hook_object::kind::memory;
     hook->memory_id = id;
+    hook->memory_hook = std::move(access_hook);
+    hook->memory_range = range;
+    hook->memory_kinds = kinds;
     auto* ptr = reinterpret_cast<emulator_hook*>(hook.get());
     hooks_.push_back(std::move(hook));
     return ptr;
@@ -1202,7 +1272,6 @@ class seven_x86_64_emulator final : public x86_64_emulator {
   seven::ExecutionResult last_result_{};
   std::vector<std::unique_ptr<hook_object>> hooks_{};
   std::vector<mmio_binding> mmio_bindings_{};
-  std::optional<seven::Executor::HookId> testproject_trace_hook_id_{};
   bool unique_instruction_trace_enabled_{false};
   std::optional<seven::Executor::HookId> unique_instruction_trace_hook_id_{};
   std::map<std::uint32_t, std::uint32_t> unique_instruction_ids_{};

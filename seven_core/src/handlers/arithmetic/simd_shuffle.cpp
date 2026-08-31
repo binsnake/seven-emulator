@@ -1,6 +1,10 @@
+#include <algorithm>
+
 #include <array>
 #include <cstdint>
 #include <cstring>
+
+#include <iced_x86/memory_size_info.hpp>
 
 #include "seven/handler_helpers.hpp"
 
@@ -65,6 +69,10 @@ void write_vec(CpuState& state, iced_x86::Register reg, big_uint value, bool zer
 
 big_uint read_mem(ExecutionContext& ctx, std::uint64_t address, std::size_t width, bool* ok) {
   std::array<std::uint8_t, kZmmBytes> bytes{};
+  // A ZMM register is the widest thing this can stage, so a larger width is a caller bug --
+  // but both the copy and the loop below are sized by it, so bound it here rather than let
+  // one run off the end of this frame.
+  width = std::min(width, bytes.size());
   if (!ctx.memory.read(address, bytes.data(), width)) {
     if (ok) *ok = false;
     return 0;
@@ -89,6 +97,25 @@ big_uint read_operand(ExecutionContext& ctx, std::uint32_t operand_index, std::s
     return read_vec(ctx.state, reg) & mask(width);
   }
   if (kind == iced_x86::OpKind::MEMORY) {
+    // An EVEX {1toN} source reads one element and repeats it, and that element size lives in the raw
+    // MemorySize. memory_size() has collapsed to the operand width, and feeding the byte count back
+    // through the size table reindexes to an unrelated entry. Same fix as simd_int.cpp's copy.
+    if (ctx.instr.is_broadcast()) {
+      const auto element_width = iced_x86::memory_size_ext::get_element_size(ctx.instr.memory_size_enum());
+      if (element_width == 0 || element_width > width) {
+        if (ok) *ok = false;
+        return 0;
+      }
+      const auto element = read_mem(ctx, detail::memory_address(ctx), element_width, ok);
+      if (ok && !*ok) return 0;
+      big_uint out = 0;
+      const auto lane_value = element & mask(element_width);
+      for (std::size_t lane = 0; lane < width; lane += element_width) {
+        out |= lane_value << (lane * 8);
+      }
+      if (ok) *ok = true;
+      return out;
+    }
     return read_mem(ctx, detail::memory_address(ctx), width, ok);
   }
   if (ok) *ok = false;
@@ -126,6 +153,9 @@ ExecutionResult legacy_binary_lanewise(ExecutionContext& ctx, std::size_t lane_b
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
+  // Legacy (non-VEX) form: real hardware requires the m128 source aligned to 16 bytes, #GP(0)
+  // otherwise -- see require_aligned_memory_operand's own doc comment.
+  if (auto fault = detail::require_aligned_memory_operand(ctx, 1, 0xFULL)) return *fault;
   bool ok = false;
   const auto dst_reg = ctx.instr.op_register(0);
   const auto lhs_bits = read_vec(ctx.state, dst_reg);
@@ -142,8 +172,11 @@ ExecutionResult legacy_binary_lanewise(ExecutionContext& ctx, std::size_t lane_b
   return {};
 }
 
+// Nothing here implements writemasking and the EVEX handlers share these VEX helpers, so a named
+// mask has to stop the instruction rather than be ignored. Moot until one of those codes is added.
 template <typename T, std::size_t N, typename Fn>
 ExecutionResult vex_binary_lanewise(ExecutionContext& ctx, std::size_t lane_bytes, Fn&& fn, bool zero_upper = true) {
+  if (detail::has_active_opmask(ctx.instr)) return detail::unsupported_opmask(ctx);
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
@@ -169,6 +202,9 @@ ExecutionResult legacy_unary_lanewise(ExecutionContext& ctx, std::size_t lane_by
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
+  // Legacy form: hardware wants the m128 source 16-byte aligned. Confirmed on hardware that this
+  // covers MOVSLDUP/MOVSHDUP too, whose operand is a full m128 unlike MOVDDUP's m64.
+  if (auto fault = detail::require_aligned_memory_operand(ctx, 1, 0xFULL)) return *fault;
   bool ok = false;
   const auto dst_reg = ctx.instr.op_register(0);
   const auto src_bits = read_operand(ctx, 1, vector_width(dst_reg), &ok);
@@ -185,6 +221,7 @@ ExecutionResult legacy_unary_lanewise(ExecutionContext& ctx, std::size_t lane_by
 
 template <typename T, std::size_t N, typename Fn>
 ExecutionResult vex_unary_lanewise(ExecutionContext& ctx, std::size_t lane_bytes, Fn&& fn, bool zero_upper = true) {
+  if (detail::has_active_opmask(ctx.instr)) return detail::unsupported_opmask(ctx);
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
@@ -203,6 +240,7 @@ ExecutionResult vex_unary_lanewise(ExecutionContext& ctx, std::size_t lane_bytes
 }
 
 ExecutionResult duplicate_low_double(ExecutionContext& ctx, bool zero_upper = false) {
+  if (detail::has_active_opmask(ctx.instr)) return detail::unsupported_opmask(ctx);
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
@@ -352,7 +390,7 @@ ExecutionResult handle_code_VEX_VUNPCKHPD_XMM_XMM_XMMM128(ExecutionContext& ctx)
   });
 }
 
-ExecutionResult handle_code_VEX_VSHUFPS_XMM_XMM_XMMM128(ExecutionContext& ctx) {
+ExecutionResult handle_code_VEX_VSHUFPS_XMM_XMM_XMMM128_IMM8(ExecutionContext& ctx) {
   const auto imm = ctx.instr.immediate8();
   return vex_binary_lanewise<float, 4>(ctx, kXmmBytes, [imm](const auto& lhs, const auto& rhs) {
     return std::array<float, 4>{
@@ -364,7 +402,7 @@ ExecutionResult handle_code_VEX_VSHUFPS_XMM_XMM_XMMM128(ExecutionContext& ctx) {
   });
 }
 
-ExecutionResult handle_code_VEX_VSHUFPD_XMM_XMM_XMMM128(ExecutionContext& ctx) {
+ExecutionResult handle_code_VEX_VSHUFPD_XMM_XMM_XMMM128_IMM8(ExecutionContext& ctx) {
   const auto imm = ctx.instr.immediate8();
   return vex_binary_lanewise<double, 2>(ctx, kXmmBytes, [imm](const auto& lhs, const auto& rhs) {
     return std::array<double, 2>{
@@ -414,7 +452,7 @@ ExecutionResult handle_code_VEX_VUNPCKHPD_YMM_YMM_YMMM256(ExecutionContext& ctx)
   });
 }
 
-ExecutionResult handle_code_VEX_VSHUFPS_YMM_YMM_YMMM256(ExecutionContext& ctx) {
+ExecutionResult handle_code_VEX_VSHUFPS_YMM_YMM_YMMM256_IMM8(ExecutionContext& ctx) {
   const auto imm = ctx.instr.immediate8();
   return vex_binary_lanewise<float, 4>(ctx, kXmmBytes, [imm](const auto& lhs, const auto& rhs) {
     return std::array<float, 4>{
@@ -426,7 +464,7 @@ ExecutionResult handle_code_VEX_VSHUFPS_YMM_YMM_YMMM256(ExecutionContext& ctx) {
   });
 }
 
-ExecutionResult handle_code_VEX_VSHUFPD_YMM_YMM_YMMM256(ExecutionContext& ctx) {
+ExecutionResult handle_code_VEX_VSHUFPD_YMM_YMM_YMMM256_IMM8(ExecutionContext& ctx) {
   const auto imm = ctx.instr.immediate8();
   return vex_binary_lanewise<double, 2>(ctx, kXmmBytes, [imm](const auto& lhs, const auto& rhs) {
     return std::array<double, 2>{
@@ -454,31 +492,31 @@ ExecutionResult handle_code_VEX_VMOVDDUP_YMM_YMMM256(ExecutionContext& ctx) {
   });
 }
 
-ExecutionResult handle_code_EVEX_VUNPCKLPS_XMM_K1Z_XMM_XMMM128(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VUNPCKLPS_XMM_K1Z_XMM_XMMM128B32(ExecutionContext& ctx) {
   return vex_binary_lanewise<float, 4>(ctx, kXmmBytes, [](const auto& lhs, const auto& rhs) {
     return std::array<float, 4>{lhs[0], rhs[0], lhs[1], rhs[1]};
   });
 }
 
-ExecutionResult handle_code_EVEX_VUNPCKLPD_XMM_K1Z_XMM_XMMM128(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VUNPCKLPD_XMM_K1Z_XMM_XMMM128B64(ExecutionContext& ctx) {
   return vex_binary_lanewise<double, 2>(ctx, kXmmBytes, [](const auto& lhs, const auto& rhs) {
     return std::array<double, 2>{lhs[0], rhs[0]};
   });
 }
 
-ExecutionResult handle_code_EVEX_VUNPCKHPS_XMM_K1Z_XMM_XMMM128(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VUNPCKHPS_XMM_K1Z_XMM_XMMM128B32(ExecutionContext& ctx) {
   return vex_binary_lanewise<float, 4>(ctx, kXmmBytes, [](const auto& lhs, const auto& rhs) {
     return std::array<float, 4>{lhs[2], rhs[2], lhs[3], rhs[3]};
   });
 }
 
-ExecutionResult handle_code_EVEX_VUNPCKHPD_XMM_K1Z_XMM_XMMM128(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VUNPCKHPD_XMM_K1Z_XMM_XMMM128B64(ExecutionContext& ctx) {
   return vex_binary_lanewise<double, 2>(ctx, kXmmBytes, [](const auto& lhs, const auto& rhs) {
     return std::array<double, 2>{lhs[1], rhs[1]};
   });
 }
 
-ExecutionResult handle_code_EVEX_VSHUFPS_XMM_K1Z_XMM_XMMM128(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VSHUFPS_XMM_K1Z_XMM_XMMM128B32_IMM8(ExecutionContext& ctx) {
   const auto imm = ctx.instr.immediate8();
   return vex_binary_lanewise<float, 4>(ctx, kXmmBytes, [imm](const auto& lhs, const auto& rhs) {
     return std::array<float, 4>{
@@ -490,7 +528,7 @@ ExecutionResult handle_code_EVEX_VSHUFPS_XMM_K1Z_XMM_XMMM128(ExecutionContext& c
   });
 }
 
-ExecutionResult handle_code_EVEX_VSHUFPD_XMM_K1Z_XMM_XMMM128(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VSHUFPD_XMM_K1Z_XMM_XMMM128B64_IMM8(ExecutionContext& ctx) {
   const auto imm = ctx.instr.immediate8();
   return vex_binary_lanewise<double, 2>(ctx, kXmmBytes, [imm](const auto& lhs, const auto& rhs) {
     return std::array<double, 2>{
@@ -500,47 +538,47 @@ ExecutionResult handle_code_EVEX_VSHUFPD_XMM_K1Z_XMM_XMMM128(ExecutionContext& c
   });
 }
 
-ExecutionResult handle_code_EVEX_VMOVSLDUP_XMM_K1Z_XMM_XMMM128(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VMOVSLDUP_XMM_K1Z_XMMM128(ExecutionContext& ctx) {
   return vex_unary_lanewise<float, 4>(ctx, kXmmBytes, [](const auto& src) {
     return std::array<float, 4>{src[0], src[0], src[2], src[2]};
   });
 }
 
-ExecutionResult handle_code_EVEX_VMOVSHDUP_XMM_K1Z_XMM_XMMM128(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VMOVSHDUP_XMM_K1Z_XMMM128(ExecutionContext& ctx) {
   return vex_unary_lanewise<float, 4>(ctx, kXmmBytes, [](const auto& src) {
     return std::array<float, 4>{src[1], src[1], src[3], src[3]};
   });
 }
 
-ExecutionResult handle_code_EVEX_VMOVDDUP_XMM_K1Z_XMM_XMMM64(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VMOVDDUP_XMM_K1Z_XMMM64(ExecutionContext& ctx) {
   return duplicate_low_double(ctx, true);
 }
 
-ExecutionResult handle_code_EVEX_VUNPCKLPS_YMM_K1Z_YMM_YMMM256(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VUNPCKLPS_YMM_K1Z_YMM_YMMM256B32(ExecutionContext& ctx) {
   return vex_binary_lanewise<float, 4>(ctx, kXmmBytes, [](const auto& lhs, const auto& rhs) {
     return std::array<float, 4>{lhs[0], rhs[0], lhs[1], rhs[1]};
   });
 }
 
-ExecutionResult handle_code_EVEX_VUNPCKLPD_YMM_K1Z_YMM_YMMM256(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VUNPCKLPD_YMM_K1Z_YMM_YMMM256B64(ExecutionContext& ctx) {
   return vex_binary_lanewise<double, 2>(ctx, kXmmBytes, [](const auto& lhs, const auto& rhs) {
     return std::array<double, 2>{lhs[0], rhs[0]};
   });
 }
 
-ExecutionResult handle_code_EVEX_VUNPCKHPS_YMM_K1Z_YMM_YMMM256(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VUNPCKHPS_YMM_K1Z_YMM_YMMM256B32(ExecutionContext& ctx) {
   return vex_binary_lanewise<float, 4>(ctx, kXmmBytes, [](const auto& lhs, const auto& rhs) {
     return std::array<float, 4>{lhs[2], rhs[2], lhs[3], rhs[3]};
   });
 }
 
-ExecutionResult handle_code_EVEX_VUNPCKHPD_YMM_K1Z_YMM_YMMM256(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VUNPCKHPD_YMM_K1Z_YMM_YMMM256B64(ExecutionContext& ctx) {
   return vex_binary_lanewise<double, 2>(ctx, kXmmBytes, [](const auto& lhs, const auto& rhs) {
     return std::array<double, 2>{lhs[1], rhs[1]};
   });
 }
 
-ExecutionResult handle_code_EVEX_VSHUFPS_YMM_K1Z_YMM_YMMM256(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VSHUFPS_YMM_K1Z_YMM_YMMM256B32_IMM8(ExecutionContext& ctx) {
   const auto imm = ctx.instr.immediate8();
   return vex_binary_lanewise<float, 4>(ctx, kXmmBytes, [imm](const auto& lhs, const auto& rhs) {
     return std::array<float, 4>{
@@ -552,7 +590,7 @@ ExecutionResult handle_code_EVEX_VSHUFPS_YMM_K1Z_YMM_YMMM256(ExecutionContext& c
   });
 }
 
-ExecutionResult handle_code_EVEX_VSHUFPD_YMM_K1Z_YMM_YMMM256(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VSHUFPD_YMM_K1Z_YMM_YMMM256B64_IMM8(ExecutionContext& ctx) {
   const auto imm = ctx.instr.immediate8();
   return vex_binary_lanewise<double, 2>(ctx, kXmmBytes, [imm](const auto& lhs, const auto& rhs) {
     return std::array<double, 2>{
@@ -562,49 +600,49 @@ ExecutionResult handle_code_EVEX_VSHUFPD_YMM_K1Z_YMM_YMMM256(ExecutionContext& c
   });
 }
 
-ExecutionResult handle_code_EVEX_VMOVSLDUP_YMM_K1Z_YMM_YMMM256(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VMOVSLDUP_YMM_K1Z_YMMM256(ExecutionContext& ctx) {
   return vex_unary_lanewise<float, 4>(ctx, kXmmBytes, [](const auto& src) {
     return std::array<float, 4>{src[0], src[0], src[2], src[2]};
   });
 }
 
-ExecutionResult handle_code_EVEX_VMOVSHDUP_YMM_K1Z_YMM_YMMM256(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VMOVSHDUP_YMM_K1Z_YMMM256(ExecutionContext& ctx) {
   return vex_unary_lanewise<float, 4>(ctx, kXmmBytes, [](const auto& src) {
     return std::array<float, 4>{src[1], src[1], src[3], src[3]};
   });
 }
 
-ExecutionResult handle_code_EVEX_VMOVDDUP_YMM_K1Z_YMM_YMMM256(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VMOVDDUP_YMM_K1Z_YMMM256(ExecutionContext& ctx) {
   return vex_unary_lanewise<double, 2>(ctx, kXmmBytes, [](const auto& src) {
     return std::array<double, 2>{src[0], src[0]};
   });
 }
 
-ExecutionResult handle_code_EVEX_VUNPCKLPS_ZMM_K1Z_ZMM_ZMMM512(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VUNPCKLPS_ZMM_K1Z_ZMM_ZMMM512B32(ExecutionContext& ctx) {
   return vex_binary_lanewise<float, 4>(ctx, kXmmBytes, [](const auto& lhs, const auto& rhs) {
     return std::array<float, 4>{lhs[0], rhs[0], lhs[1], rhs[1]};
   });
 }
 
-ExecutionResult handle_code_EVEX_VUNPCKLPD_ZMM_K1Z_ZMM_ZMMM512(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VUNPCKLPD_ZMM_K1Z_ZMM_ZMMM512B64(ExecutionContext& ctx) {
   return vex_binary_lanewise<double, 2>(ctx, kXmmBytes, [](const auto& lhs, const auto& rhs) {
     return std::array<double, 2>{lhs[0], rhs[0]};
   });
 }
 
-ExecutionResult handle_code_EVEX_VUNPCKHPS_ZMM_K1Z_ZMM_ZMMM512(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VUNPCKHPS_ZMM_K1Z_ZMM_ZMMM512B32(ExecutionContext& ctx) {
   return vex_binary_lanewise<float, 4>(ctx, kXmmBytes, [](const auto& lhs, const auto& rhs) {
     return std::array<float, 4>{lhs[2], rhs[2], lhs[3], rhs[3]};
   });
 }
 
-ExecutionResult handle_code_EVEX_VUNPCKHPD_ZMM_K1Z_ZMM_ZMMM512(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VUNPCKHPD_ZMM_K1Z_ZMM_ZMMM512B64(ExecutionContext& ctx) {
   return vex_binary_lanewise<double, 2>(ctx, kXmmBytes, [](const auto& lhs, const auto& rhs) {
     return std::array<double, 2>{lhs[1], rhs[1]};
   });
 }
 
-ExecutionResult handle_code_EVEX_VSHUFPS_ZMM_K1Z_ZMM_ZMMM512(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VSHUFPS_ZMM_K1Z_ZMM_ZMMM512B32_IMM8(ExecutionContext& ctx) {
   const auto imm = ctx.instr.immediate8();
   return vex_binary_lanewise<float, 4>(ctx, kXmmBytes, [imm](const auto& lhs, const auto& rhs) {
     return std::array<float, 4>{
@@ -616,7 +654,7 @@ ExecutionResult handle_code_EVEX_VSHUFPS_ZMM_K1Z_ZMM_ZMMM512(ExecutionContext& c
   });
 }
 
-ExecutionResult handle_code_EVEX_VSHUFPD_ZMM_K1Z_ZMM_ZMMM512(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VSHUFPD_ZMM_K1Z_ZMM_ZMMM512B64_IMM8(ExecutionContext& ctx) {
   const auto imm = ctx.instr.immediate8();
   return vex_binary_lanewise<double, 2>(ctx, kXmmBytes, [imm](const auto& lhs, const auto& rhs) {
     return std::array<double, 2>{
@@ -626,19 +664,19 @@ ExecutionResult handle_code_EVEX_VSHUFPD_ZMM_K1Z_ZMM_ZMMM512(ExecutionContext& c
   });
 }
 
-ExecutionResult handle_code_EVEX_VMOVSLDUP_ZMM_K1Z_ZMM_ZMMM512(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VMOVSLDUP_ZMM_K1Z_ZMMM512(ExecutionContext& ctx) {
   return vex_unary_lanewise<float, 4>(ctx, kXmmBytes, [](const auto& src) {
     return std::array<float, 4>{src[0], src[0], src[2], src[2]};
   });
 }
 
-ExecutionResult handle_code_EVEX_VMOVSHDUP_ZMM_K1Z_ZMM_ZMMM512(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VMOVSHDUP_ZMM_K1Z_ZMMM512(ExecutionContext& ctx) {
   return vex_unary_lanewise<float, 4>(ctx, kXmmBytes, [](const auto& src) {
     return std::array<float, 4>{src[1], src[1], src[3], src[3]};
   });
 }
 
-ExecutionResult handle_code_EVEX_VMOVDDUP_ZMM_K1Z_ZMM_ZMMM512(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VMOVDDUP_ZMM_K1Z_ZMMM512(ExecutionContext& ctx) {
   return vex_unary_lanewise<double, 2>(ctx, kXmmBytes, [](const auto& src) {
     return std::array<double, 2>{src[0], src[0]};
   });

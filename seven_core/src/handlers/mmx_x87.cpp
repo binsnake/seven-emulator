@@ -2,6 +2,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 #include "seven/handler_helpers.hpp"
 #include "seven/x87_helpers.hpp"
@@ -18,10 +19,6 @@ big_uint mask(std::size_t width) {
 }
 
 
-std::size_t xmm_index(iced_x86::Register reg) {
-  return static_cast<std::size_t>(static_cast<std::uint32_t>(reg) - static_cast<std::uint32_t>(iced_x86::Register::XMM0));
-}
-
 std::size_t vector_index(iced_x86::Register reg) {
   const auto value = static_cast<std::uint32_t>(reg);
   const auto xmm0 = static_cast<std::uint32_t>(iced_x86::Register::XMM0);
@@ -34,6 +31,11 @@ std::size_t vector_index(iced_x86::Register reg) {
 }
 
 ExecutionResult validate_memory_span(ExecutionContext& ctx, std::uint64_t base, std::size_t size, seven::MemoryAccessKind kind) {
+  // Callers check the whole image before touching any of it, but base + offset is plain uint64, so a
+  // span near the top of the address space wrapped and validated page 0 before faulting mid-store.
+  if (size != 0 && base + (static_cast<std::uint64_t>(size) - 1u) < base) {
+    return detail::memory_fault(ctx, base);
+  }
   std::size_t offset = 0;
   while (offset < size) {
     const auto address = base + offset;
@@ -101,8 +103,8 @@ ExecutionResult store_masked_bytes(ExecutionContext& ctx, std::uint32_t data_ind
   if (use_xmm) {
     const auto data_reg = ctx.instr.op_register(data_index);
     const auto mask_reg = ctx.instr.op_register(mask_index);
-    const auto data = ctx.state.vectors[xmm_index(data_reg)].value;
-    const auto mask_value = ctx.state.vectors[xmm_index(mask_reg)].value;
+    const auto data = ctx.state.vectors[vector_index(data_reg)].value;
+    const auto mask_value = ctx.state.vectors[vector_index(mask_reg)].value;
     for (std::size_t i = 0; i < width; ++i) {
       bytes[i] = static_cast<std::uint8_t>((data >> (8 * i)) & 0xFFu);
       mask[i] = static_cast<std::uint8_t>((mask_value >> (8 * i)) & 0xFFu);
@@ -152,112 +154,153 @@ uint8_t x87_ftw(const CpuState& state) {
   return ftw;
 }
 
-void store_x87_env(ExecutionContext& ctx, std::uint64_t base) {
-  const std::uint16_t fcw = ctx.state.get_x87_control_word();
-  const std::uint16_t fsw = ctx.state.get_x87_status_word();
-  const std::uint16_t ftw = static_cast<std::uint16_t>(x87_ftw(ctx.state));
-  const std::uint16_t zero16 = 0;
-  const std::uint64_t zero64 = 0;
-  ctx.memory.write(base + 0, &fcw, 2);
-  ctx.memory.write(base + 2, &fsw, 2);
-  ctx.memory.write(base + 4, &ftw, 2);
-  ctx.memory.write(base + 6, &zero16, 2);
-  ctx.memory.write(base + 8, &zero64, 8);
-  ctx.memory.write(base + 16, &zero64, 8);
-  ctx.memory.write(base + 24, &zero16, 2);
+// These come in a 16-bit form with a 14-byte environment and a 32-bit form with a 28-byte one, laid
+// out at different offsets; FNSAVE adds eight 10-byte slots for 94 and 108 total. The tag word is
+// per physical register while the data slots are top-relative, and crossing the two loses registers.
+constexpr std::size_t kX87Slots = 8;
+constexpr std::size_t kX87SlotBytes = 10;
+
+struct X87EnvLayout {
+  std::size_t fcw;
+  std::size_t fsw;
+  std::size_t ftw;
+};
+
+constexpr X87EnvLayout x87_env_layout(std::size_t env_size) {
+  // The 32-bit form widens each of these to four bytes, with the upper half reserved.
+  return env_size == 14 ? X87EnvLayout{0, 2, 4} : X87EnvLayout{0, 4, 8};
 }
 
-ExecutionResult load_x87_env(ExecutionContext& ctx, std::uint64_t base) {
-  std::uint16_t fcw = 0;
-  std::uint16_t fsw = 0;
+std::uint16_t x87_full_tag_word(const CpuState& state) {
   std::uint16_t ftw = 0;
-  if (!ctx.memory.read(base + 0, &fcw, 2)) return detail::memory_fault(ctx, base + 0);
-  if (!ctx.memory.read(base + 2, &fsw, 2)) return detail::memory_fault(ctx, base + 2);
-  if (!ctx.memory.read(base + 4, &ftw, 2)) return detail::memory_fault(ctx, base + 4);
-  if ((fcw & 0xE0C0u) != 0) return detail::memory_fault(ctx, base);
-  ctx.state.set_x87_control_word(fcw);
-  ctx.state.set_x87_status_word(fsw);
-  for (std::size_t i = 0; i < 8; ++i) {
-    ctx.state.x87_tags[ctx.state.x87_phys_index(i)] = ((ftw >> i) & 1u) ? 0x0 : 0x3;
+  for (std::size_t phys = 0; phys < kX87Slots; ++phys) {
+    ftw |= static_cast<std::uint16_t>((state.x87_tags[phys] & 0x3u) << (phys * 2));
+  }
+  return ftw;
+}
+
+void put_le16(std::uint8_t* dst, std::uint16_t value) {
+  dst[0] = static_cast<std::uint8_t>(value);
+  dst[1] = static_cast<std::uint8_t>(value >> 8);
+}
+
+std::uint16_t get_le16(const std::uint8_t* src) {
+  return static_cast<std::uint16_t>(src[0] | (static_cast<std::uint16_t>(src[1]) << 8));
+}
+
+ExecutionResult store_x87_env(ExecutionContext& ctx, std::uint64_t base, std::size_t env_size) {
+  std::array<std::uint8_t, 28> image{};
+  // 14 or 28 by construction, but fsave derives it by subtracting the register file from the image
+  // size, and that subtraction would wrap to an enormous size_t if the image were ever smaller.
+  env_size = std::min(env_size, image.size());
+  const auto layout = x87_env_layout(env_size);
+  put_le16(image.data() + layout.fcw, ctx.state.get_x87_control_word());
+  put_le16(image.data() + layout.fsw, ctx.state.get_x87_status_word());
+  put_le16(image.data() + layout.ftw, x87_full_tag_word(ctx.state));
+  // FIP/FCS/FDP/FDS stay zero; this emulator does not track the x87 instruction or data pointers.
+  if (!ctx.memory.write(base, image.data(), env_size)) return detail::memory_fault(ctx, base);
+  // Storing the environment masks every exception, so the handler about to walk it cannot be
+  // interrupted by one of its own. The image above was built first and keeps the old control word.
+  // FSAVE reaches the same state through the reset it does afterwards.
+  ctx.state.set_x87_control_word(
+      static_cast<std::uint16_t>(ctx.state.get_x87_control_word() | 0x3Fu));
+  return {};
+}
+
+ExecutionResult load_x87_env(ExecutionContext& ctx, std::uint64_t base, std::size_t env_size) {
+  std::array<std::uint8_t, 28> image{};
+  env_size = std::min(env_size, image.size());
+  if (!ctx.memory.read(base, image.data(), env_size)) return detail::memory_fault(ctx, base);
+  const auto layout = x87_env_layout(env_size);
+  // No reserved-bit check on the control word. FLDENV loads whatever is there rather than faulting
+  // on the value, and the old check reported it as a page fault at that.
+  ctx.state.set_x87_control_word(get_le16(image.data() + layout.fcw));
+  ctx.state.set_x87_status_word(get_le16(image.data() + layout.fsw));
+  const auto ftw = get_le16(image.data() + layout.ftw);
+  for (std::size_t phys = 0; phys < kX87Slots; ++phys) {
+    ctx.state.x87_tags[phys] = static_cast<std::uint8_t>((ftw >> (phys * 2)) & 0x3u);
   }
   return {};
 }
 
-void write_fxsave_st(ExecutionContext& ctx, std::uint64_t base, std::size_t phys, X87Scalar value) {
+ExecutionResult write_fxsave_st(ExecutionContext& ctx, std::uint64_t base, std::size_t phys, X87Scalar value) {
   std::array<std::uint8_t, 16> raw{};
   x87_encoding::encode_ext80(value, raw.data());
   const auto slot = base + 32 + (phys * 16);
   for (std::size_t i = 0; i < raw.size(); ++i) {
-    ctx.memory.write(slot + i, &raw[i], 1);
+    if (!ctx.memory.write(slot + i, &raw[i], 1)) return detail::memory_fault(ctx, slot + i);
   }
+  return {};
 }
 
-X87Scalar read_fxsave_st(ExecutionContext& ctx, std::uint64_t base, std::size_t phys) {
+ExecutionResult read_fxsave_st(ExecutionContext& ctx, std::uint64_t base, std::size_t phys, X87Scalar& out) {
   std::array<std::uint8_t, 16> raw{};
   const auto slot = base + 32 + (phys * 16);
   for (std::size_t i = 0; i < raw.size(); ++i) {
-    ctx.memory.read(slot + i, &raw[i], 1);
+    if (!ctx.memory.read(slot + i, &raw[i], 1)) return detail::memory_fault(ctx, slot + i);
   }
-  return x87_encoding::decode_ext80(raw.data());
+  out = x87_encoding::decode_ext80(raw.data());
+  return {};
 }
 
-void write_fpu_state(ExecutionContext& ctx, std::uint64_t base, std::size_t offset) {
+ExecutionResult write_fpu_state(ExecutionContext& ctx, std::uint64_t base, std::size_t offset) {
   const std::uint16_t fcw = ctx.state.get_x87_control_word();
   const std::uint16_t fsw = ctx.state.get_x87_status_word();
   const std::uint8_t ftw = x87_ftw(ctx.state);
   const std::uint64_t zero64 = 0;
-  ctx.memory.write(base + offset + 0, &fcw, 2);
-  ctx.memory.write(base + offset + 2, &fsw, 2);
-  ctx.memory.write(base + offset + 4, &ftw, 1);
-  ctx.memory.write(base + offset + 5, &zero64, 1);
-  ctx.memory.write(base + offset + 6, &zero64, 2);
-  ctx.memory.write(base + offset + 8, &zero64, 8);
-  ctx.memory.write(base + offset + 16, &zero64, 8);
+  if (!ctx.memory.write(base + offset + 0, &fcw, 2)) return detail::memory_fault(ctx, base + offset + 0);
+  if (!ctx.memory.write(base + offset + 2, &fsw, 2)) return detail::memory_fault(ctx, base + offset + 2);
+  if (!ctx.memory.write(base + offset + 4, &ftw, 1)) return detail::memory_fault(ctx, base + offset + 4);
+  if (!ctx.memory.write(base + offset + 5, &zero64, 1)) return detail::memory_fault(ctx, base + offset + 5);
+  if (!ctx.memory.write(base + offset + 6, &zero64, 2)) return detail::memory_fault(ctx, base + offset + 6);
+  if (!ctx.memory.write(base + offset + 8, &zero64, 8)) return detail::memory_fault(ctx, base + offset + 8);
+  if (!ctx.memory.write(base + offset + 16, &zero64, 8)) return detail::memory_fault(ctx, base + offset + 16);
+  return {};
 }
 
-ExecutionResult fsave(ExecutionContext& ctx, std::size_t env_size) {
-  (void)env_size;
+ExecutionResult fsave(ExecutionContext& ctx, std::size_t image_size) {
   const auto base = detail::memory_address(ctx);
-  if ((base & 0x7) != 0) {
-    return detail::memory_fault(ctx, base);
+  const auto env_size = image_size - (kX87Slots * kX87SlotBytes);
+  // No alignment requirement on hardware. Validate the whole image first, since hardware faults
+  // before any of the store and the x87_reset() below must not wipe state for a save that failed.
+  if (const auto span = validate_memory_span(ctx, base, image_size, seven::MemoryAccessKind::data_write); !span.ok()) {
+    return span;
   }
-  write_fpu_state(ctx, base, 0);
-  for (std::size_t i = 0; i < 8; ++i) {
-    write_fxsave_st(ctx, base, i, ctx.state.x87_get(i));
+  if (const auto r = store_x87_env(ctx, base, env_size); !r.ok()) return r;
+  for (std::size_t i = 0; i < kX87Slots; ++i) {
+    std::array<std::uint8_t, kX87SlotBytes> raw{};
+    x87_encoding::encode_ext80(ctx.state.x87_get(i), raw.data());
+    const auto slot = base + env_size + (i * kX87SlotBytes);
+    if (!ctx.memory.write(slot, raw.data(), raw.size())) return detail::memory_fault(ctx, slot);
   }
   ctx.state.x87_reset();
   return {};
 }
 
-ExecutionResult frstor(ExecutionContext& ctx, std::size_t env_size) {
-  (void)env_size;
+ExecutionResult frstor(ExecutionContext& ctx, std::size_t image_size) {
   const auto base = detail::memory_address(ctx);
-  if ((base & 0x7) != 0) {
-    return detail::memory_fault(ctx, base);
+  const auto env_size = image_size - (kX87Slots * kX87SlotBytes);
+  if (const auto span = validate_memory_span(ctx, base, image_size, seven::MemoryAccessKind::data_read); !span.ok()) {
+    return span;
   }
-  std::uint16_t fcw = 0;
-  std::uint16_t fsw = 0;
-  std::uint8_t ftw = 0;
-  if (!ctx.memory.read(base + 0, &fcw, 2)) return detail::memory_fault(ctx, base + 0);
-  if (!ctx.memory.read(base + 2, &fsw, 2)) return detail::memory_fault(ctx, base + 2);
-  if (!ctx.memory.read(base + 4, &ftw, 1)) return detail::memory_fault(ctx, base + 4);
-  ctx.state.set_x87_control_word(fcw);
-  ctx.state.set_x87_status_word(fsw);
-  for (std::size_t i = 0; i < 8; ++i) {
-    if ((ftw >> i) & 1u) {
-      ctx.state.x87_set(i, read_fxsave_st(ctx, base, i));
-    } else {
-      ctx.state.x87_mark_empty(i);
-    }
+  // The environment has to land first: it carries TOP, which is what makes the top-relative slot
+  // indexing below resolve to the right physical registers.
+  if (const auto r = load_x87_env(ctx, base, env_size); !r.ok()) return r;
+  for (std::size_t i = 0; i < kX87Slots; ++i) {
+    std::array<std::uint8_t, kX87SlotBytes> raw{};
+    const auto slot = base + env_size + (i * kX87SlotBytes);
+    if (!ctx.memory.read(slot, raw.data(), raw.size())) return detail::memory_fault(ctx, slot);
+    // Straight into the stack rather than through x87_set, which would stamp the tag valid and
+    // undo the tag word the environment just restored.
+    ctx.state.x87_stack[ctx.state.x87_phys_index(i)] = x87_encoding::decode_ext80(raw.data());
   }
   return {};
 }
 
 ExecutionResult fxsave(ExecutionContext& ctx, bool /*is64*/) {
   const auto base = detail::memory_address(ctx);
-  if ((base & 0xF) != 0) {
-    return detail::memory_fault(ctx, base);
-  }
+  // A misaligned FXSAVE area is #GP(0), not a page fault, the same as the legacy SSE m128 forms.
+  if (auto fault = detail::require_aligned_memory_operand(ctx, 0, 0xFULL)) return *fault;
   if (const auto span = validate_memory_span(ctx, base, 0x200, seven::MemoryAccessKind::data_write); !span.ok()) return span;
   if (!ctx.memory.write(base + 0, &ctx.state.x87_control_word, 2)) return detail::memory_fault(ctx, base + 0);
   if (!ctx.memory.write(base + 2, &ctx.state.x87_status_word, 2)) return detail::memory_fault(ctx, base + 2);
@@ -274,8 +317,11 @@ ExecutionResult fxsave(ExecutionContext& ctx, bool /*is64*/) {
   const std::uint32_t mxcsr_mask = 0xFFFFu;
   if (!ctx.memory.write(base + 28, &mxcsr_mask, 4)) return detail::memory_fault(ctx, base + 28);
 
-  for (std::size_t phys = 0; phys < 8; ++phys) {
-    write_fxsave_st(ctx, base, phys, ctx.state.x87_stack[phys]);
+  // Slot i holds ST(i). The tag word written above is indexed by physical register instead, which is
+  // the pairing fsave/frstor already use; doing both by physical index put every register in the
+  // wrong slot whenever TOP was not 0, and only showed up outside a save/restore round trip.
+  for (std::size_t i = 0; i < 8; ++i) {
+    if (const auto r = write_fxsave_st(ctx, base, i, ctx.state.x87_get(i)); !r.ok()) return r;
   }
   for (std::size_t i = 0; i < 16; ++i) {
     const auto value = ctx.state.vectors[i].value;
@@ -296,9 +342,7 @@ ExecutionResult fxsave(ExecutionContext& ctx, bool /*is64*/) {
 
 ExecutionResult fxrstor(ExecutionContext& ctx, bool /*is64*/) {
   const auto base = detail::memory_address(ctx);
-  if ((base & 0xF) != 0) {
-    return detail::memory_fault(ctx, base);
-  }
+  if (auto fault = detail::require_aligned_memory_operand(ctx, 0, 0xFULL)) return *fault;
   if (const auto span = validate_memory_span(ctx, base, 0x200, seven::MemoryAccessKind::data_read); !span.ok()) return span;
   std::uint16_t fcw = 0;
   std::uint16_t fsw = 0;
@@ -308,15 +352,21 @@ ExecutionResult fxrstor(ExecutionContext& ctx, bool /*is64*/) {
   if (!ctx.memory.read(base + 2, &fsw, 2)) return detail::memory_fault(ctx, base + 2);
   if (!ctx.memory.read(base + 4, &ftw, 1)) return detail::memory_fault(ctx, base + 4);
   if (!ctx.memory.read(base + 24, &mxcsr, 4)) return detail::memory_fault(ctx, base + 24);
-  fcw &= static_cast<std::uint16_t>(~0xE0C0u);
+  // Loaded as-is, same as FLDENV and FLDCW: clearing the reserved bits here meant the control word
+  // did not survive its own fxsave/fxrstor.
   mxcsr &= 0x0000FFFFu;
   ctx.state.set_x87_control_word(fcw);
   ctx.state.set_x87_status_word(fsw);
   ctx.state.mxcsr = mxcsr;
-  for (std::size_t phys = 0; phys < 8; ++phys) {
+  // Slot i is ST(i), the tag bits are physical -- see fxsave. The status word above carried TOP, so
+  // x87_phys_index resolves against the image's own top rather than the one we started with.
+  for (std::size_t i = 0; i < 8; ++i) {
+    const auto phys = ctx.state.x87_phys_index(i);
     if ((ftw >> phys) & 1u) {
-      ctx.state.x87_stack[phys] = read_fxsave_st(ctx, base, phys);
-      ctx.state.x87_tags[phys] = (ctx.state.x87_stack[phys] == 0) ? 0x1 : 0x0;
+      X87Scalar loaded{};
+      if (const auto r = read_fxsave_st(ctx, base, i, loaded); !r.ok()) return r;
+      ctx.state.x87_stack[phys] = loaded;
+      ctx.state.x87_tags[phys] = seven::x87_tag_of(loaded);
     } else {
       ctx.state.x87_tags[phys] = 0x3;
     }
@@ -366,41 +416,50 @@ ExecutionResult handle_code_FEMMS(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_FNCLEX(ExecutionContext& ctx) {
-  ctx.state.x87_status_word &= ~std::uint16_t(0xBFu);
+  // The stack fault bit and the busy bit are part of what FNCLEX clears. Leaving SF set meant a
+  // guest that cleared after a stack fault still read one back on the next FNSTSW.
+  ctx.state.x87_status_word &= ~std::uint16_t(0x80FFu);
   return {};
 }
 
 ExecutionResult handle_code_FLD1(ExecutionContext& ctx) {
+  x87_set_c1(ctx, false);
   if (!ctx.state.x87_push(1)) return x87_stack_overflow(ctx);
   return {};
 }
 
 ExecutionResult handle_code_FLDL2T(ExecutionContext& ctx) {
-  if (!ctx.state.x87_push(3.32192809488736234787)) return x87_stack_overflow(ctx);
+  x87_set_c1(ctx, false);
+  if (!ctx.state.x87_push(x87_constant(ctx.state, 0x4000u, 0xD49A784BCD1B8AFEull, false))) return x87_stack_overflow(ctx);
   return {};
 }
 
 ExecutionResult handle_code_FLDL2E(ExecutionContext& ctx) {
-  if (!ctx.state.x87_push(1.44269504088896340736)) return x87_stack_overflow(ctx);
+  x87_set_c1(ctx, false);
+  if (!ctx.state.x87_push(x87_constant(ctx.state, 0x3FFFu, 0xB8AA3B295C17F0BBull, true))) return x87_stack_overflow(ctx);
   return {};
 }
 
 ExecutionResult handle_code_FLDPI(ExecutionContext& ctx) {
-  if (!ctx.state.x87_push(3.14159265358979323846)) return x87_stack_overflow(ctx);
+  x87_set_c1(ctx, false);
+  if (!ctx.state.x87_push(x87_constant(ctx.state, 0x4000u, 0xC90FDAA22168C234ull, true))) return x87_stack_overflow(ctx);
   return {};
 }
 
 ExecutionResult handle_code_FLDLG2(ExecutionContext& ctx) {
-  if (!ctx.state.x87_push(0.30102999566398119521)) return x87_stack_overflow(ctx);
+  x87_set_c1(ctx, false);
+  if (!ctx.state.x87_push(x87_constant(ctx.state, 0x3FFDu, 0x9A209A84FBCFF798ull, true))) return x87_stack_overflow(ctx);
   return {};
 }
 
 ExecutionResult handle_code_FLDLN2(ExecutionContext& ctx) {
-  if (!ctx.state.x87_push(0.69314718055994530942)) return x87_stack_overflow(ctx);
+  x87_set_c1(ctx, false);
+  if (!ctx.state.x87_push(x87_constant(ctx.state, 0x3FFEu, 0xB17217F7D1CF79ABull, true))) return x87_stack_overflow(ctx);
   return {};
 }
 
 ExecutionResult handle_code_FLDZ(ExecutionContext& ctx) {
+  x87_set_c1(ctx, false);
   if (!ctx.state.x87_push(0)) return x87_stack_overflow(ctx);
   return {};
 }
@@ -413,30 +472,42 @@ ExecutionResult handle_code_FABS(ExecutionContext& ctx) {
   return x87_unary_st0(ctx, [](X87Scalar v) { return seven::abs(v); });
 }
 
+// extF80_sqrt raises #IA on a negative operand itself and reports its own inexactness, so none of
+// this needs guessing. The old version asked whether sqrt(x) differed from x and called that a
+// precision loss, which is true of almost every square root there is.
 ExecutionResult handle_code_FSQRT(ExecutionContext& ctx) {
-  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow(ctx);
+  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow_into(ctx, 0);
   const X87Scalar value = ctx.state.x87_get(0);
-  if (value < 0) return x87_exception(ctx, kX87ExceptionInvalid);
-  const X87Scalar result = seven::sqrt(value);
-  if (value != 0 && result == 0) {
-    auto r = x87_exception(ctx, static_cast<std::uint16_t>(kX87ExceptionUnderflow | kX87ExceptionPrecision));
-    if (!r.ok()) return r;
-  }
-  if (const auto exceptions = x87_classify_result(result, value, 0); exceptions != 0) {
-    auto r = x87_exception(ctx, exceptions);
-    if (!r.ok()) return r;
-  }
-  if (auto r = x87_precision_if_changed(ctx, value, result); !r.ok()) return r;
-  ctx.state.x87_set(0, result);
-  return {};
+  return x87_finish(ctx, 0, x87_evaluate(ctx.state, value, 0, [](X87Scalar v, X87Scalar) {
+                      return seven::sqrt(v);
+                    }));
 }
 
 ExecutionResult handle_code_FRNDINT(ExecutionContext& ctx) {
-  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow(ctx);
+  x87_set_c1(ctx, false);
+  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow_into(ctx, 0);
   const X87Scalar value = ctx.state.x87_get(0);
+  // An encoding hardware refuses to interpret is #IA with the indefinite for an answer, and it is
+  // decided before any rounding happens. Rounding it first reported an inexact result instead.
+  if (seven::isunsupported(value)) {
+    auto result = x87_exception(ctx, kX87ExceptionInvalid);
+    if (!result.ok()) return result;
+    ctx.state.x87_set(0, x87_indefinite());
+    return {};
+  }
+  if (seven::isnan(value) || seven::isinf(value)) {
+    ctx.state.x87_set(0, value);
+    return {};
+  }
+  std::uint16_t exceptions = 0;
+  if (x87_is_denormal_operand(value)) exceptions |= kX87ExceptionDenormal;
   const X87Scalar rounded = x87_round_to_control(ctx.state, value);
   if (rounded != value) {
-    auto result = x87_exception(ctx, kX87ExceptionPrecision);
+    exceptions |= kX87ExceptionPrecision;
+    x87_set_c1(ctx, rounded != seven::trunc(value));
+  }
+  if (exceptions != 0) {
+    auto result = x87_exception(ctx, exceptions);
     if (!result.ok()) return result;
   }
   ctx.state.x87_set(0, rounded);
@@ -444,9 +515,16 @@ ExecutionResult handle_code_FRNDINT(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_FSIN(ExecutionContext& ctx) {
-  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow(ctx);
+  x87_set_c1(ctx, false);
+  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow_into(ctx, 0);
   const X87Scalar value = ctx.state.x87_get(0);
-  const X87Scalar result = seven::sin(value);
+  if (auto answer = x87_reject_operand(ctx, value); answer.has_value()) return *answer;
+  if (x87_trig_argument_out_of_range(value)) {
+    x87_set_c2(ctx, true);
+    return {};
+  }
+  x87_set_c2(ctx, false);
+  const X87Scalar result = x87_tiny_argument(value) ? value : seven::sin(value);
   if (value != 0 && result == 0) {
     auto r = x87_exception(ctx, static_cast<std::uint16_t>(kX87ExceptionUnderflow | kX87ExceptionPrecision));
     if (!r.ok()) return r;
@@ -460,9 +538,16 @@ ExecutionResult handle_code_FSIN(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_FCOS(ExecutionContext& ctx) {
-  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow(ctx);
+  x87_set_c1(ctx, false);
+  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow_into(ctx, 0);
   const X87Scalar value = ctx.state.x87_get(0);
-  const X87Scalar result = seven::cos(value);
+  if (auto answer = x87_reject_operand(ctx, value); answer.has_value()) return *answer;
+  if (x87_trig_argument_out_of_range(value)) {
+    x87_set_c2(ctx, true);
+    return {};
+  }
+  x87_set_c2(ctx, false);
+  const X87Scalar result = x87_tiny_argument(value) ? X87Scalar(1) : seven::cos(value);
   if (value != 0 && result == 0) {
     auto r = x87_exception(ctx, static_cast<std::uint16_t>(kX87ExceptionUnderflow | kX87ExceptionPrecision));
     if (!r.ok()) return r;
@@ -476,10 +561,18 @@ ExecutionResult handle_code_FCOS(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_FSINCOS(ExecutionContext& ctx) {
-  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow(ctx);
+  x87_set_c1(ctx, false);
+  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow_into(ctx, 0);
   const X87Scalar x = ctx.state.x87_get(0);
-  const X87Scalar cosine = seven::cos(x);
-  const X87Scalar sine = seven::sin(x);
+  if (auto answer = x87_reject_operand_and_push(ctx, x); answer.has_value()) return *answer;
+  if (x87_trig_argument_out_of_range(x)) {
+    x87_set_c2(ctx, true);
+    return {};
+  }
+  x87_set_c2(ctx, false);
+  const bool tiny = x87_tiny_argument(x);
+  const X87Scalar cosine = tiny ? X87Scalar(1) : seven::cos(x);
+  const X87Scalar sine = tiny ? x : seven::sin(x);
   if (x != 0 && (cosine == 0 || sine == 0)) {
     auto r = x87_exception(ctx, static_cast<std::uint16_t>(kX87ExceptionUnderflow | kX87ExceptionPrecision));
     if (!r.ok()) return r;
@@ -488,15 +581,24 @@ ExecutionResult handle_code_FSINCOS(ExecutionContext& ctx) {
     auto r = x87_exception(ctx, exceptions);
     if (!r.ok()) return r;
   }
-  ctx.state.x87_set(0, cosine);
-  if (!ctx.state.x87_push(sine)) return x87_stack_overflow(ctx);
+  // The sine replaces ST(0) and the cosine is what gets pushed, so the cosine ends up on top. This
+  // was the other way round, which every caller reading ST(0) as the cosine got wrong.
+  ctx.state.x87_set(0, sine);
+  if (!ctx.state.x87_push(cosine)) return x87_stack_overflow(ctx);
   return {};
 }
 
 ExecutionResult handle_code_FPTAN(ExecutionContext& ctx) {
-  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow(ctx);
+  x87_set_c1(ctx, false);
+  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow_into(ctx, 0);
   const X87Scalar value = ctx.state.x87_get(0);
-  const X87Scalar result = seven::tan(value);
+  if (auto answer = x87_reject_operand_and_push(ctx, value); answer.has_value()) return *answer;
+  if (x87_trig_argument_out_of_range(value)) {
+    x87_set_c2(ctx, true);
+    return {};
+  }
+  x87_set_c2(ctx, false);
+  const X87Scalar result = x87_tiny_argument(value) ? value : seven::tan(value);
   if (value != 0 && result == 0) {
     auto r = x87_exception(ctx, static_cast<std::uint16_t>(kX87ExceptionUnderflow | kX87ExceptionPrecision));
     if (!r.ok()) return r;
@@ -511,19 +613,36 @@ ExecutionResult handle_code_FPTAN(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_FPATAN(ExecutionContext& ctx) {
+  x87_set_c1(ctx, false);
   if (ctx.state.x87_is_empty(0) || ctx.state.x87_is_empty(1)) return x87_stack_underflow(ctx);
   const X87Scalar y = ctx.state.x87_get(1);
   const X87Scalar x = ctx.state.x87_get(0);
-  ctx.state.x87_set(1, seven::atan2(y, x));
-  if (!ctx.state.x87_pop()) return x87_stack_underflow(ctx);
+  X87Scalar result{};
+  std::uint16_t exceptions = 0;
+  if (!x87_special_result(x, y, result, exceptions)) {
+    exceptions = x87_operand_exceptions(x, y);
+    result = seven::atan2(y, x);
+  }
+  if (exceptions != 0) {
+    auto r = x87_exception(ctx, exceptions);
+    if (!r.ok()) return r;
+  }
+  ctx.state.x87_set(1, result);
+  x87_forced_pop(ctx.state);
   return {};
 }
 
 ExecutionResult handle_code_F2XM1(ExecutionContext& ctx) {
-  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow(ctx);
+  x87_set_c1(ctx, false);
+  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow_into(ctx, 0);
   const X87Scalar value = ctx.state.x87_get(0);
-  if (value < -1 || value > 1) return x87_exception(ctx, kX87ExceptionInvalid);
-  const X87Scalar result = seven::pow(X87Scalar(2), value) - X87Scalar(1);
+  if (auto answer = x87_reject_operand(ctx, value); answer.has_value()) return *answer;
+  // The SDM calls the result undefined outside [-1, 1], but silicon just evaluates 2^x - 1, so
+  // F2XM1 of -infinity answers -1. Below 2^-64 the answer is x*ln2, which a host double flattens
+  // to zero across a whole denormal range.
+  const X87Scalar result = x87_tiny_argument(value)
+                               ? value * x87_ln2()
+                               : seven::pow(X87Scalar(2), value) - X87Scalar(1);
   if (value != 0 && result == 0) {
     auto r = x87_exception(ctx, static_cast<std::uint16_t>(kX87ExceptionUnderflow | kX87ExceptionPrecision));
     if (!r.ok()) return r;
@@ -537,48 +656,101 @@ ExecutionResult handle_code_F2XM1(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_FYL2X(ExecutionContext& ctx) {
+  x87_set_c1(ctx, false);
   if (ctx.state.x87_is_empty(0) || ctx.state.x87_is_empty(1)) return x87_stack_underflow(ctx);
   const X87Scalar y = ctx.state.x87_get(1);
   const X87Scalar x = ctx.state.x87_get(0);
-  if (x <= 0) return x87_exception(ctx, kX87ExceptionInvalid);
-  const X87Scalar result = y * seven::log2(x);
-  if (y != 0 && result == 0) {
-    auto r = x87_exception(ctx, static_cast<std::uint16_t>(kX87ExceptionUnderflow | kX87ExceptionPrecision));
-    if (!r.ok()) return r;
+  X87Scalar result{};
+  std::uint16_t exceptions = 0;
+  if (!x87_special_result(x, y, result, exceptions)) {
+    exceptions = x87_operand_exceptions(x, y);
+    // log2(0) is -infinity, which is a divide-by-zero on the x87, not an invalid operand. Only the
+    // 0 * infinity case that ST(1) = 0 produces is genuinely invalid.
+    if (x == 0 && y != 0) {
+      exceptions |= kX87ExceptionZeroDiv;
+      const auto infinity = std::numeric_limits<X87Scalar>::infinity();
+      result = seven::signbit(y) ? infinity : -infinity;
+    } else if (seven::signbit(x) || x == 0) {
+      exceptions |= kX87ExceptionInvalid;
+      result = x87_indefinite();
+    } else {
+      result = y * seven::log2(x);
+      exceptions |= x87_classify_result(result, y, x);
+      if (y != 0 && result == 0) exceptions |= kX87ExceptionUnderflow | kX87ExceptionPrecision;
+    }
   }
-  if (const auto exceptions = x87_classify_result(result, y, x); exceptions != 0) {
+  // A masked exception does not cancel the instruction: hardware still writes ST(1) and still pops.
+  // Returning from the #IA path without doing either left the guest's stack where it started.
+  if (exceptions != 0) {
     auto r = x87_exception(ctx, exceptions);
     if (!r.ok()) return r;
   }
   ctx.state.x87_set(1, result);
-  if (!ctx.state.x87_pop()) return x87_stack_underflow(ctx);
+  x87_forced_pop(ctx.state);
   return {};
 }
 
 ExecutionResult handle_code_FYL2XP1(ExecutionContext& ctx) {
+  x87_set_c1(ctx, false);
   if (ctx.state.x87_is_empty(0) || ctx.state.x87_is_empty(1)) return x87_stack_underflow(ctx);
   const X87Scalar y = ctx.state.x87_get(1);
   const X87Scalar x = ctx.state.x87_get(0);
-  if (x <= -1) return x87_exception(ctx, kX87ExceptionInvalid);
-  const X87Scalar result = y * seven::log2(x + 1);
-  if (y != 0 && result == 0) {
-    auto r = x87_exception(ctx, static_cast<std::uint16_t>(kX87ExceptionUnderflow | kX87ExceptionPrecision));
-    if (!r.ok()) return r;
+  X87Scalar result{};
+  std::uint16_t exceptions = 0;
+  if (!x87_special_result(x, y, result, exceptions)) {
+    exceptions = x87_operand_exceptions(x, y);
+    if (x <= X87Scalar(-1)) {
+      exceptions |= kX87ExceptionInvalid;
+      result = x87_indefinite();
+    } else if (x87_tiny_argument(x)) {
+      // log2(1 + x) collapses to x / ln2 below 2^-64, and this is the range FYL2XP1 exists for.
+      result = y * (x / x87_ln2());
+    } else {
+      result = y * seven::log2(x + 1);
+      exceptions |= x87_classify_result(result, y, x + 1);
+      if (y != 0 && result == 0) exceptions |= kX87ExceptionUnderflow | kX87ExceptionPrecision;
+    }
   }
-  if (const auto exceptions = x87_classify_result(result, y, x + 1); exceptions != 0) {
+  if (exceptions != 0) {
     auto r = x87_exception(ctx, exceptions);
     if (!r.ok()) return r;
   }
   ctx.state.x87_set(1, result);
-  if (!ctx.state.x87_pop()) return x87_stack_underflow(ctx);
+  x87_forced_pop(ctx.state);
   return {};
 }
 
 ExecutionResult handle_code_FSCALE(ExecutionContext& ctx) {
-  if (ctx.state.x87_is_empty(0) || ctx.state.x87_is_empty(1)) return x87_stack_underflow(ctx);
+  x87_set_c1(ctx, false);
+  if (ctx.state.x87_is_empty(0) || ctx.state.x87_is_empty(1)) return x87_stack_underflow_into(ctx, 0);
   const X87Scalar a = ctx.state.x87_get(0);
   const X87Scalar b = ctx.state.x87_get(1);
-  const X87Scalar result = seven::ldexp(a, static_cast<int>(seven::trunc(b)));
+  {
+    X87Scalar answer{};
+    std::uint16_t special = 0;
+    if (x87_special_result(a, b, answer, special)) {
+      if (special != 0) {
+        auto r = x87_exception(ctx, special);
+        if (!r.ok()) return r;
+      }
+      ctx.state.x87_set(0, answer);
+      return {};
+    }
+  }
+  // ST(1) is whatever the guest left there and the narrowing below is only defined inside int's
+  // range. ldexp saturates long before the clamp bites, so +inf and 2^70 both answer as hardware
+  // does, where the raw cast landed on 0 and returned ST(0) unchanged.
+  const X87Scalar truncated = seven::trunc(b);
+  constexpr int kMaxShift = 0x7FFFFFFF;
+  int shift = 0;
+  if (truncated > X87Scalar(kMaxShift)) {
+    shift = kMaxShift;
+  } else if (truncated < X87Scalar(-kMaxShift)) {
+    shift = -kMaxShift;
+  } else {
+    shift = static_cast<int>(truncated);
+  }
+  const X87Scalar result = seven::ldexp(a, shift);
   if (a != 0 && result == 0) {
     auto r = x87_exception(ctx, static_cast<std::uint16_t>(kX87ExceptionUnderflow | kX87ExceptionPrecision));
     if (!r.ok()) return r;
@@ -591,12 +763,63 @@ ExecutionResult handle_code_FSCALE(ExecutionContext& ctx) {
   return {};
 }
 
+// D9 F4. Splits ST(0) into its unbiased exponent and its significand, leaving the exponent in ST(1)
+// and pushing the significand. It had no handler at all, so every FXTRACT stopped the guest with
+// unsupported_instruction.
+ExecutionResult handle_code_FXTRACT(ExecutionContext& ctx) {
+  x87_set_c1(ctx, false);
+  if (ctx.state.x87_is_empty(0)) return x87_stack_underflow_into(ctx, 0);
+  const X87Scalar value = ctx.state.x87_get(0);
+  const auto infinity = std::numeric_limits<X87Scalar>::infinity();
+  // Same as FRNDINT: the encoding is judged before the split is attempted, and an unnormal leaves the
+  // indefinite in both halves.
+  if (seven::isunsupported(value)) {
+    auto r = x87_exception(ctx, kX87ExceptionInvalid);
+    if (!r.ok()) return r;
+    ctx.state.x87_set(0, x87_indefinite());
+    if (!ctx.state.x87_push(x87_indefinite())) return x87_stack_overflow(ctx);
+    return {};
+  }
+  if (x87_is_denormal_operand(value)) {
+    auto r = x87_exception(ctx, kX87ExceptionDenormal);
+    if (!r.ok()) return r;
+  }
+  if (value == 0) {
+    auto r = x87_exception(ctx, kX87ExceptionZeroDiv);
+    if (!r.ok()) return r;
+    ctx.state.x87_set(0, -infinity);
+    if (!ctx.state.x87_push(value)) return x87_stack_overflow(ctx);
+    return {};
+  }
+  if (seven::isnan(value)) {
+    const X87Scalar answer = seven::issnan(value) ? seven::quiet(value) : value;
+    if (seven::issnan(value)) {
+      auto r = x87_exception(ctx, kX87ExceptionInvalid);
+      if (!r.ok()) return r;
+    }
+    ctx.state.x87_set(0, answer);
+    if (!ctx.state.x87_push(answer)) return x87_stack_overflow(ctx);
+    return {};
+  }
+  if (seven::isinf(value)) {
+    ctx.state.x87_set(0, infinity);
+    if (!ctx.state.x87_push(value)) return x87_stack_overflow(ctx);
+    return {};
+  }
+  int exponent = 0;
+  const X87Scalar mantissa = seven::frexp(value, &exponent);
+  // frexp normalizes to [0.5, 1); the x87 wants the significand in [1, 2), hence the shared step.
+  ctx.state.x87_set(0, X87Scalar(static_cast<std::int64_t>(exponent) - 1));
+  if (!ctx.state.x87_push(seven::ldexp(mantissa, 1))) return x87_stack_overflow(ctx);
+  return {};
+}
+
 ExecutionResult handle_code_FLDENV_M14BYTE(ExecutionContext& ctx) {
-  return load_x87_env(ctx, detail::memory_address(ctx));
+  return load_x87_env(ctx, detail::memory_address(ctx), 14);
 }
 
 ExecutionResult handle_code_FLDENV_M28BYTE(ExecutionContext& ctx) {
-  return load_x87_env(ctx, detail::memory_address(ctx));
+  return load_x87_env(ctx, detail::memory_address(ctx), 28);
 }
 
 ExecutionResult handle_code_FLD_M32FP(ExecutionContext& ctx) {
@@ -612,18 +835,28 @@ ExecutionResult handle_code_FLD_M80FP(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_FLD_STI(ExecutionContext& ctx) {
-  if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || ctx.instr.op_kind(1) != iced_x86::OpKind::REGISTER) {
+  x87_set_c1(ctx, false);
+  if (!x87_operand_is_st(ctx, 0)) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
-  if (!ctx.state.x87_push(ctx.state.x87_get(x87_st_index(ctx.instr.op_register(0))))) {
-    return detail::memory_fault(ctx, detail::memory_address(ctx));
+  // FLD ST(i) reads a register like any other operand, so an empty source is a stack underflow and
+  // the indefinite is what gets pushed. Pushing the stale contents instead handed the guest a value
+  // it had already popped, with no #IS to say anything had gone wrong.
+  const auto src = x87_st_index(ctx.instr.op_register(0));
+  if (ctx.state.x87_is_empty(src)) {
+    auto fault = x87_stack_underflow(ctx);
+    if (!fault.ok()) return fault;
+    if (!ctx.state.x87_push(x87_indefinite())) return x87_stack_overflow(ctx);
+    return {};
+  }
+  if (!ctx.state.x87_push(ctx.state.x87_get(src))) {
+    return x87_stack_overflow(ctx);
   }
   return {};
 }
 
 ExecutionResult handle_code_FNSTENV_M14BYTE(ExecutionContext& ctx) {
-  store_x87_env(ctx, detail::memory_address(ctx));
-  return {};
+  return store_x87_env(ctx, detail::memory_address(ctx), 14);
 }
 
 ExecutionResult handle_code_FSTENV_M14BYTE(ExecutionContext& ctx) {
@@ -631,8 +864,7 @@ ExecutionResult handle_code_FSTENV_M14BYTE(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_FNSTENV_M28BYTE(ExecutionContext& ctx) {
-  store_x87_env(ctx, detail::memory_address(ctx));
-  return {};
+  return store_x87_env(ctx, detail::memory_address(ctx), 28);
 }
 
 ExecutionResult handle_code_FSTENV_M28BYTE(ExecutionContext& ctx) {
@@ -644,9 +876,9 @@ ExecutionResult handle_code_FLDCW_M2BYTE(ExecutionContext& ctx) {
   if (!detail::read_operand_checked(ctx, 0, 2, value).ok()) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
-  if ((value & 0xE0C0u) != 0) {
-    return detail::memory_fault(ctx, detail::memory_address(ctx));
-  }
+  // No reserved-bit check, for the reason FLDENV's load already gives: hardware ignores those bits
+  // rather than faulting on them, and 0x037F -- the value the FPU resets to, so the one every
+  // fnstcw/fldcw pair round-trips -- has bit 6 set and was being rejected.
   ctx.state.set_x87_control_word(value);
   return {};
 }
@@ -667,7 +899,8 @@ ExecutionResult handle_code_FST_M64FP(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_FST_STI(ExecutionContext& ctx) {
-  return x87_reg_move(ctx, 0, 1, false);
+  // FST ST(i) names only the destination; the source is always ST(0).
+  return x87_store_st0_to_sti(ctx, false);
 }
 
 ExecutionResult handle_code_FNSTSW_M2BYTE(ExecutionContext& ctx) {
@@ -714,6 +947,15 @@ ExecutionResult handle_code_FSAVE_M108BYTE(ExecutionContext& ctx) {
   return fsave(ctx, 108);
 }
 
+// DD /6 decodes to these, not to the FSAVE_* codes above -- see handled_codes.def.
+ExecutionResult handle_code_FNSAVE_M94BYTE(ExecutionContext& ctx) {
+  return fsave(ctx, 94);
+}
+
+ExecutionResult handle_code_FNSAVE_M108BYTE(ExecutionContext& ctx) {
+  return fsave(ctx, 108);
+}
+
 ExecutionResult handle_code_FRSTOR_M94BYTE(ExecutionContext& ctx) {
   return frstor(ctx, 94);
 }
@@ -740,10 +982,6 @@ ExecutionResult handle_code_FIST_M16INT(ExecutionContext& ctx) {
 
 ExecutionResult handle_code_FIST_M32INT(ExecutionContext& ctx) {
   return x87_store_integer(ctx, 4, false, false);
-}
-
-ExecutionResult handle_code_FIST_M64INT(ExecutionContext& ctx) {
-  return x87_store_integer(ctx, 8, false, false);
 }
 
 ExecutionResult handle_code_FISTP_M16INT(ExecutionContext& ctx) {

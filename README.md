@@ -28,8 +28,8 @@ Google Test is fetched automatically if not found on the system.
 ## Library API
 
 The primary targets are:
-- **`seven_core`** — the emulator static library
-- **`iced_x86`** — the bundled x86 decoder (linked transitively)
+- **`seven_core`** - the emulator static library
+- **`iced_x86`** - the bundled x86 decoder (linked transitively)
 
 All public types live in the `seven` namespace. Include `seven/compat.hpp` for the `StandaloneMachine` convenience wrapper, or include individual headers for fine-grained use.
 
@@ -135,12 +135,12 @@ executor.reset_stats();
 `CpuState` exposes the full architectural state:
 
 ```cpp
-state.gpr[0..15]      // RAX–R15
+state.gpr[0..15]      // RAX-R15
 state.rip
 state.rflags
 state.vectors[0..31]  // XMM/YMM/ZMM (width set by SIMD profile)
 state.opmask[0..7]    // AVX-512 k registers
-state.mmx[0..7]
+state.mmx_get/set()   // MM0-MM7, aliased onto the x87 significands
 state.x87_stack[0..7] // 80-bit floats via Boost.Multiprecision
 state.sreg[0..5]      // ES, CS, SS, DS, FS, GS
 state.cr[0..15]
@@ -190,9 +190,9 @@ Output reports the stop reason, instruction count, final RIP, RAX, and RSP.
 | Control flow | JMP, CALL, RET, Jcc (all conditions), LOOP/LOOPE/LOOPNE, ENTER, LEAVE |
 | Bit manipulation | BSF, BSR, BSWAP, BT, BTC, BTR, BTS, POPCNT, LZCNT, TZCNT |
 | BMI / BMI2 | ANDN, BEXTR, BLSI, BLSMSK, BLSR, BZHI, MULX, PDEP, PEXT, RORX, SARX, SHLX, SHRX |
-| SIMD (SSE–AVX-512) | Integer, floating-point, pack/unpack, shuffle, move variants |
+| SIMD (SSE-AVX-512) | Integer, floating-point, pack/unpack, shuffle, move variants |
 | x87 FPU | Arithmetic, compare, load/store, transcendental, control |
-| MMX | Integer SIMD on mm0–mm7 |
+| MMX | Integer SIMD on mm0-mm7 |
 | System | SYSCALL, SYSENTER/SYSEXIT, SYSRET, RDMSR, WRMSR, RDTSC, RDTSCP, RDPMC, CPUID, SWAPGS, CLTS, INVD, WBINVD, XSETBV |
 | Synchronization | LOCK prefix, CMPXCHG, CMPXCHG8B/16B, XADD, PAUSE, LFENCE, MFENCE, SFENCE |
 | Misc | NOP (all forms), CLFLUSH, CLFLUSHOPT, CLWB, PREFETCH, UD0/UD1/UD2, BOUND, ARPL, CBW/CWDE/CDQE, CWD/CDQ/CQO, CMOV, SETcc |
@@ -204,8 +204,8 @@ ctest --test-dir build
 ```
 
 Test suites:
-- **`seven_tests`** — scalar instructions, SIMD, debug/trace behavior
-- **`seven_bmi2_tests`** — comprehensive BMI2 instruction tests
+- **`seven_tests`** - scalar instructions, SIMD, debug/trace behavior
+- **`seven_bmi2_tests`** - comprehensive BMI2 instruction tests
 
 ## Dependencies
 

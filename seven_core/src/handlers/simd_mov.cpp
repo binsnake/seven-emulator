@@ -1,3 +1,5 @@
+#include <algorithm>
+
 #include <array>
 
 #include "seven/handler_helpers.hpp"
@@ -50,6 +52,10 @@ big_uint mask(std::size_t width) {
 
 big_uint read_mem(ExecutionContext& ctx, std::uint64_t address, std::size_t width, bool* ok) {
   std::array<std::uint8_t, kZmmWidth> bytes{};
+  // A ZMM register is the widest thing this can stage, so a larger width is a caller bug --
+  // but both the copy and the loop below are sized by it, so bound it here rather than let
+  // one run off the end of this frame.
+  width = std::min(width, bytes.size());
   if (!ctx.memory.read(address, bytes.data(), width)) {
     if (ok) *ok = false;
     return 0;
@@ -62,6 +68,10 @@ big_uint read_mem(ExecutionContext& ctx, std::uint64_t address, std::size_t widt
 
 bool write_mem(ExecutionContext& ctx, std::uint64_t address, big_uint value, std::size_t width) {
   std::array<std::uint8_t, kZmmWidth> bytes{};
+  // A ZMM register is the widest thing this can stage, so a larger width is a caller bug --
+  // but both the copy and the loop below are sized by it, so bound it here rather than let
+  // one run off the end of this frame.
+  width = std::min(width, bytes.size());
   for (std::size_t i = 0; i < width; ++i) bytes[i] = static_cast<std::uint8_t>((value >> (8 * i)) & 0xFFu);
   return ctx.memory.write(address, bytes.data(), width);
 }
@@ -116,9 +126,20 @@ bool write_any(ExecutionContext& ctx, std::uint32_t operand_index, big_uint valu
   return false;
 }
 
-ExecutionResult full_move(ExecutionContext& ctx, std::uint32_t dst, std::uint32_t src, bool zero_upper) {
+// full_move backs about 80 instructions spanning both the unaligned-safe moves and the explicitly
+// aligned ones, so callers opt in rather than this guessing from the Code. The requirement is the
+// operand width, not a flat 16 bytes, and it survives into VEX and EVEX since those moves are
+// exception class 1.
+ExecutionResult full_move(ExecutionContext& ctx, std::uint32_t dst, std::uint32_t src, bool zero_upper,
+                          bool require_alignment = false) {
+  if (detail::has_active_opmask(ctx.instr)) return detail::unsupported_opmask(ctx);
   bool ok = false;
   const auto width = infer_width(ctx, dst, src);
+  if (require_alignment && width != 0) {
+    const auto alignment_mask = static_cast<std::uint64_t>(width) - 1u;
+    if (auto fault = detail::require_aligned_memory_operand(ctx, dst, alignment_mask)) return *fault;
+    if (auto fault = detail::require_aligned_memory_operand(ctx, src, alignment_mask)) return *fault;
+  }
   const auto value = read_any(ctx, src, width, &ok);
   if (!ok) return detail::memory_fault(ctx, detail::memory_address(ctx));
   if (!write_any(ctx, dst, value, width, zero_upper)) return detail::memory_fault(ctx, detail::memory_address(ctx));
@@ -126,6 +147,7 @@ ExecutionResult full_move(ExecutionContext& ctx, std::uint32_t dst, std::uint32_
 }
 
 ExecutionResult low_move(ExecutionContext& ctx, std::uint32_t dst, std::uint32_t src, std::size_t width, bool zero_upper) {
+  if (detail::has_active_opmask(ctx.instr)) return detail::unsupported_opmask(ctx);
   bool ok = false;
   const auto value = read_any(ctx, src, width, &ok);
   if (!ok) return detail::memory_fault(ctx, detail::memory_address(ctx));
@@ -134,6 +156,7 @@ ExecutionResult low_move(ExecutionContext& ctx, std::uint32_t dst, std::uint32_t
 }
 
 ExecutionResult low_move_legacy_scalar_load(ExecutionContext& ctx, std::uint32_t dst, std::uint32_t src, std::size_t width) {
+  if (detail::has_active_opmask(ctx.instr)) return detail::unsupported_opmask(ctx);
   bool ok = false;
   const auto value = read_any(ctx, src, width, &ok);
   if (!ok) return detail::memory_fault(ctx, detail::memory_address(ctx));
@@ -143,6 +166,7 @@ ExecutionResult low_move_legacy_scalar_load(ExecutionContext& ctx, std::uint32_t
 }
 
 ExecutionResult merge_low_move(ExecutionContext& ctx, std::uint32_t dst, std::uint32_t merge, std::uint32_t src, std::size_t width, bool zero_upper) {
+  if (detail::has_active_opmask(ctx.instr)) return detail::unsupported_opmask(ctx);
   bool ok = false;
   const auto value = read_any(ctx, src, width, &ok);
   if (!ok) return detail::memory_fault(ctx, detail::memory_address(ctx));
@@ -154,6 +178,7 @@ ExecutionResult merge_low_move(ExecutionContext& ctx, std::uint32_t dst, std::ui
 }
 
 ExecutionResult merge_high_move(ExecutionContext& ctx, std::uint32_t dst, std::uint32_t merge, std::uint32_t src, std::size_t width, bool zero_upper) {
+  if (detail::has_active_opmask(ctx.instr)) return detail::unsupported_opmask(ctx);
   bool ok = false;
   const auto value = read_any(ctx, src, width, &ok);
   if (!ok) return detail::memory_fault(ctx, detail::memory_address(ctx));
@@ -166,6 +191,7 @@ ExecutionResult merge_high_move(ExecutionContext& ctx, std::uint32_t dst, std::u
 }
 
 ExecutionResult gpr_to_xmm(ExecutionContext& ctx, std::uint32_t dst, std::uint32_t src, std::size_t width) {
+  if (detail::has_active_opmask(ctx.instr)) return detail::unsupported_opmask(ctx);
   bool ok = false;
   const auto value = read_any(ctx, src, width, &ok);
   if (!ok) return detail::memory_fault(ctx, detail::memory_address(ctx));
@@ -173,7 +199,15 @@ ExecutionResult gpr_to_xmm(ExecutionContext& ctx, std::uint32_t dst, std::uint32
   return {};
 }
 
-ExecutionResult xmm_to_gpr(ExecutionContext& ctx, std::uint32_t dst, std::uint32_t src, std::size_t width) {
+// See full_move's comment on require_alignment's default -- same reasoning, this backs both
+// alignment-free GPR<->XMM moves and the MOVNT* non-temporal stores, which DO require it.
+ExecutionResult xmm_to_gpr(ExecutionContext& ctx, std::uint32_t dst, std::uint32_t src, std::size_t width,
+                           bool require_alignment = false) {
+  if (detail::has_active_opmask(ctx.instr)) return detail::unsupported_opmask(ctx);
+  if (require_alignment && width != 0) {
+    const auto alignment_mask = static_cast<std::uint64_t>(width) - 1u;
+    if (auto fault = detail::require_aligned_memory_operand(ctx, dst, alignment_mask)) return *fault;
+  }
   bool ok = false;
   const auto value = read_any(ctx, src, width, &ok);
   if (!ok) return detail::memory_fault(ctx, detail::memory_address(ctx));
@@ -223,7 +257,23 @@ ExecutionResult movhlps_legacy(ExecutionContext& ctx) {
   return {};
 }
 
+// Both are register-only forms, but the decoder returns EVEX_VMOVLHPS_XMM_XMM_XMM for a VEX 0F 16
+// with mod != 3 and op2 still marked MEMORY, whose NONE register resolves to XMM0. Refuse the shape
+// here rather than trust the decoder tables never to produce it.
+[[nodiscard]] ExecutionResult unsupported_shape(ExecutionContext& ctx) {
+  return {StopReason::unsupported_instruction, 0,
+          ExceptionInfo{StopReason::unsupported_instruction, ctx.state.rip, 0}, ctx.instr.code()};
+}
+
+[[nodiscard]] bool three_register_operands(const ExecutionContext& ctx) {
+  return ctx.instr.op_count() >= 3 &&
+         ctx.instr.op_kind(0) == iced_x86::OpKind::REGISTER &&
+         ctx.instr.op_kind(1) == iced_x86::OpKind::REGISTER &&
+         ctx.instr.op_kind(2) == iced_x86::OpKind::REGISTER;
+}
+
 ExecutionResult vmovlhps(ExecutionContext& ctx) {
+  if (!three_register_operands(ctx)) return unsupported_shape(ctx);
   const auto dst_reg = ctx.instr.op_register(0);
   const auto src1_reg = ctx.instr.op_register(1);
   const auto src2_reg = ctx.instr.op_register(2);
@@ -235,6 +285,7 @@ ExecutionResult vmovlhps(ExecutionContext& ctx) {
 }
 
 ExecutionResult vmovhlps(ExecutionContext& ctx) {
+  if (!three_register_operands(ctx)) return unsupported_shape(ctx);
   const auto dst_reg = ctx.instr.op_register(0);
   const auto src1_reg = ctx.instr.op_register(1);
   const auto src2_reg = ctx.instr.op_register(2);
@@ -248,33 +299,40 @@ ExecutionResult vmovhlps(ExecutionContext& ctx) {
 }  // namespace
 
 #define KUBERA_FULL_MOVE(name, zero_upper) ExecutionResult handle_code_##name(ExecutionContext& ctx) { return full_move(ctx, 0, 1, zero_upper); }
+#define KUBERA_ALIGNED_MOVE(name, zero_upper) ExecutionResult handle_code_##name(ExecutionContext& ctx) { return full_move(ctx, 0, 1, zero_upper, true); }
+#define KUBERA_ALIGNED_STORE(name, width) ExecutionResult handle_code_##name(ExecutionContext& ctx) { return xmm_to_gpr(ctx, 0, 1, width, true); }
 #define KUBERA_LOW_MOVE(name, width, zero_upper) ExecutionResult handle_code_##name(ExecutionContext& ctx) { return low_move(ctx, 0, 1, width, zero_upper); }
 #define KUBERA_MERGE_LOW_MOVE(name, width, zero_upper) ExecutionResult handle_code_##name(ExecutionContext& ctx) { return merge_low_move(ctx, 0, 1, 2, width, zero_upper); }
 #define KUBERA_MERGE_HIGH_MOVE(name, width, zero_upper) ExecutionResult handle_code_##name(ExecutionContext& ctx) { return merge_high_move(ctx, 0, 1, 2, width, zero_upper); }
 #define KUBERA_GPR_TO_XMM(name, width) ExecutionResult handle_code_##name(ExecutionContext& ctx) { return gpr_to_xmm(ctx, 0, 1, width); }
 #define KUBERA_XMM_TO_GPR(name, width) ExecutionResult handle_code_##name(ExecutionContext& ctx) { return xmm_to_gpr(ctx, 0, 1, width); }
 
-KUBERA_FULL_MOVE(MOVAPS_XMM_XMMM128, false)
-KUBERA_FULL_MOVE(MOVAPD_XMM_XMMM128, false)
+// MOVAPS/MOVAPD/MOVDQA ("Aligned") explicitly #GP(0) on a misaligned m128 memory operand, unlike
+// their MOVUPS/MOVUPD/MOVDQU ("Unaligned") counterparts right below -- real hardware distinguishes
+// these by name, not just by convention, so they get the aligned macro.
+KUBERA_ALIGNED_MOVE(MOVAPS_XMM_XMMM128, false)
+KUBERA_ALIGNED_MOVE(MOVAPD_XMM_XMMM128, false)
 KUBERA_FULL_MOVE(MOVUPS_XMM_XMMM128, false)
 KUBERA_FULL_MOVE(MOVUPD_XMM_XMMM128, false)
 ExecutionResult handle_code_MOVSS_XMM_XMMM32(ExecutionContext& ctx) { return low_move_legacy_scalar_load(ctx, 0, 1, 4); }
 ExecutionResult handle_code_MOVSD_XMM_XMMM64(ExecutionContext& ctx) { return low_move_legacy_scalar_load(ctx, 0, 1, 8); }
-KUBERA_FULL_MOVE(MOVAPS_XMMM128_XMM, false)
-KUBERA_FULL_MOVE(MOVAPD_XMMM128_XMM, false)
+KUBERA_ALIGNED_MOVE(MOVAPS_XMMM128_XMM, false)
+KUBERA_ALIGNED_MOVE(MOVAPD_XMMM128_XMM, false)
 KUBERA_FULL_MOVE(MOVUPS_XMMM128_XMM, false)
 KUBERA_FULL_MOVE(MOVUPD_XMMM128_XMM, false)
 KUBERA_LOW_MOVE(MOVSS_XMMM32_XMM, 4, false)
 KUBERA_LOW_MOVE(MOVSD_XMMM64_XMM, 8, false)
-KUBERA_FULL_MOVE(MOVDQA_XMM_XMMM128, false)
+KUBERA_ALIGNED_MOVE(MOVDQA_XMM_XMMM128, false)
 KUBERA_FULL_MOVE(MOVDQU_XMM_XMMM128, false)
 ExecutionResult handle_code_LDDQU_XMM_M128(ExecutionContext& ctx) { return full_move(ctx, 0, 1, false); }
-KUBERA_FULL_MOVE(MOVDQA_XMMM128_XMM, false)
+KUBERA_ALIGNED_MOVE(MOVDQA_XMMM128_XMM, false)
 KUBERA_FULL_MOVE(MOVDQU_XMMM128_XMM, false)
 KUBERA_LOW_MOVE(MOVLPS_XMM_M64, 8, false)
 KUBERA_LOW_MOVE(MOVLPD_XMM_M64, 8, false)
-KUBERA_MERGE_HIGH_MOVE(MOVHPS_XMM_M64, 8, false)
-KUBERA_MERGE_HIGH_MOVE(MOVHPD_XMM_M64, 8, false)
+// Two operands, not three: the low half is preserved from the destination itself and the source
+// is slot 1. The macro's (0, 1, 2) shape belongs to the VEX forms further down.
+ExecutionResult handle_code_MOVHPS_XMM_M64(ExecutionContext& ctx) { return merge_high_move(ctx, 0, 0, 1, 8, false); }
+ExecutionResult handle_code_MOVHPD_XMM_M64(ExecutionContext& ctx) { return merge_high_move(ctx, 0, 0, 1, 8, false); }
 ExecutionResult handle_code_MOVLHPS_XMM_XMM(ExecutionContext& ctx) { return movlhps_legacy(ctx); }
 ExecutionResult handle_code_MOVHLPS_XMM_XMM(ExecutionContext& ctx) { return movhlps_legacy(ctx); }
 KUBERA_XMM_TO_GPR(MOVLPS_M64_XMM, 8)
@@ -291,19 +349,22 @@ ExecutionResult handle_code_PEXTRW_R32M16_XMM_IMM8(ExecutionContext& ctx) { retu
 ExecutionResult handle_code_PEXTRW_R64M16_XMM_IMM8(ExecutionContext& ctx) { return pextrw_to_gpr_or_mem(ctx); }
 KUBERA_LOW_MOVE(MOVQ_XMM_XMMM64, 8, true)
 KUBERA_LOW_MOVE(MOVQ_XMMM64_XMM, 8, true)
-KUBERA_XMM_TO_GPR(MOVNTPS_M128_XMM, 16)
-KUBERA_XMM_TO_GPR(MOVNTPD_M128_XMM, 16)
-KUBERA_XMM_TO_GPR(MOVNTDQ_M128_XMM, 16)
-KUBERA_FULL_MOVE(MOVNTDQA_XMM_M128, false)
+// MOVNTPS/MOVNTPD/MOVNTDQ (non-temporal stores) and MOVNTDQA (non-temporal "aligned hint" load,
+// literally named for it) both require their m128 memory operand 16-byte aligned per the SDM,
+// independent of the general legacy-SSE alignment rule this whole fix is about.
+KUBERA_ALIGNED_STORE(MOVNTPS_M128_XMM, 16)
+KUBERA_ALIGNED_STORE(MOVNTPD_M128_XMM, 16)
+KUBERA_ALIGNED_STORE(MOVNTDQ_M128_XMM, 16)
+KUBERA_ALIGNED_MOVE(MOVNTDQA_XMM_M128, false)
 
-KUBERA_FULL_MOVE(VEX_VMOVAPS_XMM_XMMM128, true)
-KUBERA_FULL_MOVE(VEX_VMOVAPS_YMM_YMMM256, true)
-KUBERA_FULL_MOVE(VEX_VMOVAPS_XMMM128_XMM, true)
-KUBERA_FULL_MOVE(VEX_VMOVAPS_YMMM256_YMM, true)
-KUBERA_FULL_MOVE(VEX_VMOVAPD_XMM_XMMM128, true)
-KUBERA_FULL_MOVE(VEX_VMOVAPD_YMM_YMMM256, true)
-KUBERA_FULL_MOVE(VEX_VMOVAPD_XMMM128_XMM, true)
-KUBERA_FULL_MOVE(VEX_VMOVAPD_YMMM256_YMM, true)
+KUBERA_ALIGNED_MOVE(VEX_VMOVAPS_XMM_XMMM128, true)
+KUBERA_ALIGNED_MOVE(VEX_VMOVAPS_YMM_YMMM256, true)
+KUBERA_ALIGNED_MOVE(VEX_VMOVAPS_XMMM128_XMM, true)
+KUBERA_ALIGNED_MOVE(VEX_VMOVAPS_YMMM256_YMM, true)
+KUBERA_ALIGNED_MOVE(VEX_VMOVAPD_XMM_XMMM128, true)
+KUBERA_ALIGNED_MOVE(VEX_VMOVAPD_YMM_YMMM256, true)
+KUBERA_ALIGNED_MOVE(VEX_VMOVAPD_XMMM128_XMM, true)
+KUBERA_ALIGNED_MOVE(VEX_VMOVAPD_YMMM256_YMM, true)
 KUBERA_FULL_MOVE(VEX_VMOVUPS_XMM_XMMM128, true)
 KUBERA_FULL_MOVE(VEX_VMOVUPS_YMM_YMMM256, true)
 KUBERA_FULL_MOVE(VEX_VMOVUPS_XMMM128_XMM, true)
@@ -320,10 +381,10 @@ KUBERA_MERGE_LOW_MOVE(VEX_VMOVSD_XMM_XMM_XMM, 8, true)
 KUBERA_MERGE_LOW_MOVE(VEX_VMOVSD_XMM_XMM_XMM_0_F11, 8, true)
 KUBERA_LOW_MOVE(VEX_VMOVSD_XMM_M64, 8, true)
 KUBERA_LOW_MOVE(VEX_VMOVSD_M64_XMM, 8, false)
-KUBERA_FULL_MOVE(VEX_VMOVDQA_XMM_XMMM128, true)
-KUBERA_FULL_MOVE(VEX_VMOVDQA_YMM_YMMM256, true)
-KUBERA_FULL_MOVE(VEX_VMOVDQA_XMMM128_XMM, true)
-KUBERA_FULL_MOVE(VEX_VMOVDQA_YMMM256_YMM, true)
+KUBERA_ALIGNED_MOVE(VEX_VMOVDQA_XMM_XMMM128, true)
+KUBERA_ALIGNED_MOVE(VEX_VMOVDQA_YMM_YMMM256, true)
+KUBERA_ALIGNED_MOVE(VEX_VMOVDQA_XMMM128_XMM, true)
+KUBERA_ALIGNED_MOVE(VEX_VMOVDQA_YMMM256_YMM, true)
 KUBERA_FULL_MOVE(VEX_VMOVDQU_XMM_XMMM128, true)
 KUBERA_FULL_MOVE(VEX_VMOVDQU_YMM_YMMM256, true)
 KUBERA_FULL_MOVE(VEX_VMOVDQU_XMMM128_XMM, true)
@@ -334,9 +395,9 @@ KUBERA_XMM_TO_GPR(VEX_VMOVD_RM32_XMM, 4)
 KUBERA_XMM_TO_GPR(VEX_VMOVQ_RM64_XMM, 8)
 KUBERA_LOW_MOVE(VEX_VMOVQ_XMM_XMMM64, 8, true)
 KUBERA_LOW_MOVE(VEX_VMOVQ_XMMM64_XMM, 8, true)
-KUBERA_MERGE_HIGH_MOVE(VEX_VMOVLPS_XMM_XMM_M64, 8, true)
+KUBERA_MERGE_LOW_MOVE(VEX_VMOVLPS_XMM_XMM_M64, 8, true)
 KUBERA_XMM_TO_GPR(VEX_VMOVLPS_M64_XMM, 8)
-KUBERA_MERGE_HIGH_MOVE(VEX_VMOVLPD_XMM_XMM_M64, 8, true)
+KUBERA_MERGE_LOW_MOVE(VEX_VMOVLPD_XMM_XMM_M64, 8, true)
 KUBERA_XMM_TO_GPR(VEX_VMOVLPD_M64_XMM, 8)
 KUBERA_MERGE_HIGH_MOVE(VEX_VMOVHPS_XMM_XMM_M64, 8, true)
 ExecutionResult handle_code_VEX_VMOVLHPS_XMM_XMM_XMM(ExecutionContext& ctx) { return vmovlhps(ctx); }
@@ -344,27 +405,27 @@ ExecutionResult handle_code_VEX_VMOVHLPS_XMM_XMM_XMM(ExecutionContext& ctx) { re
 ExecutionResult handle_code_VEX_VMOVHPS_M64_XMM(ExecutionContext& ctx) { return high_lane_to_gpr(ctx, 0, 1, 8); }
 KUBERA_MERGE_HIGH_MOVE(VEX_VMOVHPD_XMM_XMM_M64, 8, true)
 ExecutionResult handle_code_VEX_VMOVHPD_M64_XMM(ExecutionContext& ctx) { return high_lane_to_gpr(ctx, 0, 1, 8); }
-KUBERA_XMM_TO_GPR(VEX_VMOVNTPS_M128_XMM, 16)
-KUBERA_XMM_TO_GPR(VEX_VMOVNTPS_M256_YMM, 32)
-KUBERA_XMM_TO_GPR(VEX_VMOVNTPD_M128_XMM, 16)
-KUBERA_XMM_TO_GPR(VEX_VMOVNTPD_M256_YMM, 32)
-KUBERA_XMM_TO_GPR(VEX_VMOVNTDQ_M128_XMM, 16)
-KUBERA_XMM_TO_GPR(VEX_VMOVNTDQ_M256_YMM, 32)
-KUBERA_FULL_MOVE(VEX_VMOVNTDQA_XMM_M128, true)
-KUBERA_FULL_MOVE(VEX_VMOVNTDQA_YMM_M256, true)
+KUBERA_ALIGNED_STORE(VEX_VMOVNTPS_M128_XMM, 16)
+KUBERA_ALIGNED_STORE(VEX_VMOVNTPS_M256_YMM, 32)
+KUBERA_ALIGNED_STORE(VEX_VMOVNTPD_M128_XMM, 16)
+KUBERA_ALIGNED_STORE(VEX_VMOVNTPD_M256_YMM, 32)
+KUBERA_ALIGNED_STORE(VEX_VMOVNTDQ_M128_XMM, 16)
+KUBERA_ALIGNED_STORE(VEX_VMOVNTDQ_M256_YMM, 32)
+KUBERA_ALIGNED_MOVE(VEX_VMOVNTDQA_XMM_M128, true)
+KUBERA_ALIGNED_MOVE(VEX_VMOVNTDQA_YMM_M256, true)
 
-KUBERA_FULL_MOVE(EVEX_VMOVAPS_XMM_K1Z_XMMM128, true)
-KUBERA_FULL_MOVE(EVEX_VMOVAPS_YMM_K1Z_YMMM256, true)
-KUBERA_FULL_MOVE(EVEX_VMOVAPS_ZMM_K1Z_ZMMM512, true)
-KUBERA_FULL_MOVE(EVEX_VMOVAPS_XMMM128_K1Z_XMM, true)
-KUBERA_FULL_MOVE(EVEX_VMOVAPS_YMMM256_K1Z_YMM, true)
-KUBERA_FULL_MOVE(EVEX_VMOVAPS_ZMMM512_K1Z_ZMM, true)
-KUBERA_FULL_MOVE(EVEX_VMOVAPD_XMM_K1Z_XMMM128, true)
-KUBERA_FULL_MOVE(EVEX_VMOVAPD_YMM_K1Z_YMMM256, true)
-KUBERA_FULL_MOVE(EVEX_VMOVAPD_ZMM_K1Z_ZMMM512, true)
-KUBERA_FULL_MOVE(EVEX_VMOVAPD_XMMM128_K1Z_XMM, true)
-KUBERA_FULL_MOVE(EVEX_VMOVAPD_YMMM256_K1Z_YMM, true)
-KUBERA_FULL_MOVE(EVEX_VMOVAPD_ZMMM512_K1Z_ZMM, true)
+KUBERA_ALIGNED_MOVE(EVEX_VMOVAPS_XMM_K1Z_XMMM128, true)
+KUBERA_ALIGNED_MOVE(EVEX_VMOVAPS_YMM_K1Z_YMMM256, true)
+KUBERA_ALIGNED_MOVE(EVEX_VMOVAPS_ZMM_K1Z_ZMMM512, true)
+KUBERA_ALIGNED_MOVE(EVEX_VMOVAPS_XMMM128_K1Z_XMM, true)
+KUBERA_ALIGNED_MOVE(EVEX_VMOVAPS_YMMM256_K1Z_YMM, true)
+KUBERA_ALIGNED_MOVE(EVEX_VMOVAPS_ZMMM512_K1Z_ZMM, true)
+KUBERA_ALIGNED_MOVE(EVEX_VMOVAPD_XMM_K1Z_XMMM128, true)
+KUBERA_ALIGNED_MOVE(EVEX_VMOVAPD_YMM_K1Z_YMMM256, true)
+KUBERA_ALIGNED_MOVE(EVEX_VMOVAPD_ZMM_K1Z_ZMMM512, true)
+KUBERA_ALIGNED_MOVE(EVEX_VMOVAPD_XMMM128_K1Z_XMM, true)
+KUBERA_ALIGNED_MOVE(EVEX_VMOVAPD_YMMM256_K1Z_YMM, true)
+KUBERA_ALIGNED_MOVE(EVEX_VMOVAPD_ZMMM512_K1Z_ZMM, true)
 KUBERA_FULL_MOVE(EVEX_VMOVUPS_XMM_K1Z_XMMM128, true)
 KUBERA_FULL_MOVE(EVEX_VMOVUPS_YMM_K1Z_YMMM256, true)
 KUBERA_FULL_MOVE(EVEX_VMOVUPS_ZMM_K1Z_ZMMM512, true)
@@ -385,18 +446,18 @@ KUBERA_MERGE_LOW_MOVE(EVEX_VMOVSD_XMM_K1Z_XMM_XMM, 8, true)
 KUBERA_MERGE_LOW_MOVE(EVEX_VMOVSD_XMM_K1Z_XMM_XMM_0_F11, 8, true)
 KUBERA_LOW_MOVE(EVEX_VMOVSD_XMM_K1Z_M64, 8, true)
 KUBERA_LOW_MOVE(EVEX_VMOVSD_M64_K1_XMM, 8, false)
-KUBERA_FULL_MOVE(EVEX_VMOVDQA32_XMM_K1Z_XMMM128, true)
-KUBERA_FULL_MOVE(EVEX_VMOVDQA32_YMM_K1Z_YMMM256, true)
-KUBERA_FULL_MOVE(EVEX_VMOVDQA32_ZMM_K1Z_ZMMM512, true)
-KUBERA_FULL_MOVE(EVEX_VMOVDQA32_XMMM128_K1Z_XMM, true)
-KUBERA_FULL_MOVE(EVEX_VMOVDQA32_YMMM256_K1Z_YMM, true)
-KUBERA_FULL_MOVE(EVEX_VMOVDQA32_ZMMM512_K1Z_ZMM, true)
-KUBERA_FULL_MOVE(EVEX_VMOVDQA64_XMM_K1Z_XMMM128, true)
-KUBERA_FULL_MOVE(EVEX_VMOVDQA64_YMM_K1Z_YMMM256, true)
-KUBERA_FULL_MOVE(EVEX_VMOVDQA64_ZMM_K1Z_ZMMM512, true)
-KUBERA_FULL_MOVE(EVEX_VMOVDQA64_XMMM128_K1Z_XMM, true)
-KUBERA_FULL_MOVE(EVEX_VMOVDQA64_YMMM256_K1Z_YMM, true)
-KUBERA_FULL_MOVE(EVEX_VMOVDQA64_ZMMM512_K1Z_ZMM, true)
+KUBERA_ALIGNED_MOVE(EVEX_VMOVDQA32_XMM_K1Z_XMMM128, true)
+KUBERA_ALIGNED_MOVE(EVEX_VMOVDQA32_YMM_K1Z_YMMM256, true)
+KUBERA_ALIGNED_MOVE(EVEX_VMOVDQA32_ZMM_K1Z_ZMMM512, true)
+KUBERA_ALIGNED_MOVE(EVEX_VMOVDQA32_XMMM128_K1Z_XMM, true)
+KUBERA_ALIGNED_MOVE(EVEX_VMOVDQA32_YMMM256_K1Z_YMM, true)
+KUBERA_ALIGNED_MOVE(EVEX_VMOVDQA32_ZMMM512_K1Z_ZMM, true)
+KUBERA_ALIGNED_MOVE(EVEX_VMOVDQA64_XMM_K1Z_XMMM128, true)
+KUBERA_ALIGNED_MOVE(EVEX_VMOVDQA64_YMM_K1Z_YMMM256, true)
+KUBERA_ALIGNED_MOVE(EVEX_VMOVDQA64_ZMM_K1Z_ZMMM512, true)
+KUBERA_ALIGNED_MOVE(EVEX_VMOVDQA64_XMMM128_K1Z_XMM, true)
+KUBERA_ALIGNED_MOVE(EVEX_VMOVDQA64_YMMM256_K1Z_YMM, true)
+KUBERA_ALIGNED_MOVE(EVEX_VMOVDQA64_ZMMM512_K1Z_ZMM, true)
 KUBERA_FULL_MOVE(EVEX_VMOVDQU32_XMM_K1Z_XMMM128, true)
 KUBERA_FULL_MOVE(EVEX_VMOVDQU32_YMM_K1Z_YMMM256, true)
 KUBERA_FULL_MOVE(EVEX_VMOVDQU32_ZMM_K1Z_ZMMM512, true)
@@ -427,9 +488,9 @@ KUBERA_XMM_TO_GPR(EVEX_VMOVD_RM32_XMM, 4)
 KUBERA_XMM_TO_GPR(EVEX_VMOVQ_RM64_XMM, 8)
 KUBERA_LOW_MOVE(EVEX_VMOVQ_XMM_XMMM64, 8, true)
 KUBERA_LOW_MOVE(EVEX_VMOVQ_XMMM64_XMM, 8, true)
-KUBERA_MERGE_HIGH_MOVE(EVEX_VMOVLPS_XMM_XMM_M64, 8, true)
+KUBERA_MERGE_LOW_MOVE(EVEX_VMOVLPS_XMM_XMM_M64, 8, true)
 KUBERA_XMM_TO_GPR(EVEX_VMOVLPS_M64_XMM, 8)
-KUBERA_MERGE_HIGH_MOVE(EVEX_VMOVLPD_XMM_XMM_M64, 8, true)
+KUBERA_MERGE_LOW_MOVE(EVEX_VMOVLPD_XMM_XMM_M64, 8, true)
 KUBERA_XMM_TO_GPR(EVEX_VMOVLPD_M64_XMM, 8)
 KUBERA_MERGE_HIGH_MOVE(EVEX_VMOVHPS_XMM_XMM_M64, 8, true)
 ExecutionResult handle_code_EVEX_VMOVLHPS_XMM_XMM_XMM(ExecutionContext& ctx) { return vmovlhps(ctx); }
@@ -437,20 +498,22 @@ ExecutionResult handle_code_EVEX_VMOVHLPS_XMM_XMM_XMM(ExecutionContext& ctx) { r
 ExecutionResult handle_code_EVEX_VMOVHPS_M64_XMM(ExecutionContext& ctx) { return high_lane_to_gpr(ctx, 0, 1, 8); }
 KUBERA_MERGE_HIGH_MOVE(EVEX_VMOVHPD_XMM_XMM_M64, 8, true)
 ExecutionResult handle_code_EVEX_VMOVHPD_M64_XMM(ExecutionContext& ctx) { return high_lane_to_gpr(ctx, 0, 1, 8); }
-KUBERA_XMM_TO_GPR(EVEX_VMOVNTPS_M128_XMM, 16)
-KUBERA_XMM_TO_GPR(EVEX_VMOVNTPS_M256_YMM, 32)
-KUBERA_XMM_TO_GPR(EVEX_VMOVNTPS_M512_ZMM, 64)
-KUBERA_XMM_TO_GPR(EVEX_VMOVNTPD_M128_XMM, 16)
-KUBERA_XMM_TO_GPR(EVEX_VMOVNTPD_M256_YMM, 32)
-KUBERA_XMM_TO_GPR(EVEX_VMOVNTPD_M512_ZMM, 64)
-KUBERA_XMM_TO_GPR(EVEX_VMOVNTDQ_M128_XMM, 16)
-KUBERA_XMM_TO_GPR(EVEX_VMOVNTDQ_M256_YMM, 32)
-KUBERA_XMM_TO_GPR(EVEX_VMOVNTDQ_M512_ZMM, 64)
-KUBERA_FULL_MOVE(EVEX_VMOVNTDQA_XMM_M128, true)
-KUBERA_FULL_MOVE(EVEX_VMOVNTDQA_YMM_M256, true)
-KUBERA_FULL_MOVE(EVEX_VMOVNTDQA_ZMM_M512, true)
+KUBERA_ALIGNED_STORE(EVEX_VMOVNTPS_M128_XMM, 16)
+KUBERA_ALIGNED_STORE(EVEX_VMOVNTPS_M256_YMM, 32)
+KUBERA_ALIGNED_STORE(EVEX_VMOVNTPS_M512_ZMM, 64)
+KUBERA_ALIGNED_STORE(EVEX_VMOVNTPD_M128_XMM, 16)
+KUBERA_ALIGNED_STORE(EVEX_VMOVNTPD_M256_YMM, 32)
+KUBERA_ALIGNED_STORE(EVEX_VMOVNTPD_M512_ZMM, 64)
+KUBERA_ALIGNED_STORE(EVEX_VMOVNTDQ_M128_XMM, 16)
+KUBERA_ALIGNED_STORE(EVEX_VMOVNTDQ_M256_YMM, 32)
+KUBERA_ALIGNED_STORE(EVEX_VMOVNTDQ_M512_ZMM, 64)
+KUBERA_ALIGNED_MOVE(EVEX_VMOVNTDQA_XMM_M128, true)
+KUBERA_ALIGNED_MOVE(EVEX_VMOVNTDQA_YMM_M256, true)
+KUBERA_ALIGNED_MOVE(EVEX_VMOVNTDQA_ZMM_M512, true)
 
 #undef KUBERA_FULL_MOVE
+#undef KUBERA_ALIGNED_MOVE
+#undef KUBERA_ALIGNED_STORE
 #undef KUBERA_LOW_MOVE
 #undef KUBERA_MERGE_LOW_MOVE
 #undef KUBERA_MERGE_HIGH_MOVE

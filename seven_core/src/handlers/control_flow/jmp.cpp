@@ -22,6 +22,9 @@ ExecutionResult handle_code_JMP_RM64(ExecutionContext& ctx) {
   if (auto result = read_near_target_width(ctx, 8, target); !result.ok()) {
     return result;
   }
+  if (!is_canonical_address(target)) {
+    return branch_target_fault(ctx, target);
+  }
   ctx.state.rip = target;
   ctx.control_flow_taken = true;
   return {};
@@ -44,6 +47,9 @@ ExecutionResult handle_code_JMP_RM32(ExecutionContext& ctx) {
   const auto width = (ctx.state.mode == ExecutionMode::long64) ? 8u : 4u;
   if (auto result = read_near_target_width(ctx, width, target); !result.ok()) {
     return result;
+  }
+  if (!is_canonical_address(target)) {
+    return branch_target_fault(ctx, target);
   }
   ctx.state.rip = target;
   ctx.control_flow_taken = true;
@@ -92,6 +98,9 @@ ExecutionResult handle_code_JMP_M1616(ExecutionContext& ctx) {
   if (auto result = read_far_mem(ctx, 2, target, selector); result.reason != StopReason::none) {
     return result;
   }
+  if (!far_transfer_allowed(ctx.state, selector)) {
+    return far_transfer_fault(ctx);
+  }
   ctx.state.mode = ExecutionMode::real16;
   ctx.state.sreg[1] = selector;
   ctx.state.rip = target;
@@ -104,6 +113,9 @@ ExecutionResult handle_code_JMP_M1632(ExecutionContext& ctx) {
   std::uint16_t selector = 0;
   if (auto result = read_far_mem(ctx, 4, target, selector); result.reason != StopReason::none) {
     return result;
+  }
+  if (!far_transfer_allowed(ctx.state, selector)) {
+    return far_transfer_fault(ctx);
   }
   ctx.state.mode = ExecutionMode::compat32;
   ctx.state.sreg[1] = selector;
@@ -118,6 +130,9 @@ ExecutionResult handle_code_JMP_M1664(ExecutionContext& ctx) {
   if (auto result = read_far_mem(ctx, 8, target, selector); result.reason != StopReason::none) {
     return result;
   }
+  if (!far_transfer_allowed(ctx.state, selector)) {
+    return far_transfer_fault(ctx);
+  }
   ctx.state.mode = ExecutionMode::long64;
   ctx.state.sreg[1] = selector;
   ctx.state.rip = target;
@@ -126,6 +141,9 @@ ExecutionResult handle_code_JMP_M1664(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_JMP_PTR1616(ExecutionContext& ctx) {
+  if (!far_transfer_allowed(ctx.state, ctx.instr.far_branch_selector())) {
+    return far_transfer_fault(ctx);
+  }
   ctx.state.mode = ExecutionMode::real16;
   ctx.state.sreg[1] = ctx.instr.far_branch_selector();
   ctx.state.rip = ctx.instr.far_branch16();
@@ -134,6 +152,9 @@ ExecutionResult handle_code_JMP_PTR1616(ExecutionContext& ctx) {
 }
 
 ExecutionResult handle_code_JMP_PTR1632(ExecutionContext& ctx) {
+  if (!far_transfer_allowed(ctx.state, ctx.instr.far_branch_selector())) {
+    return far_transfer_fault(ctx);
+  }
   ctx.state.mode = ExecutionMode::compat32;
   ctx.state.sreg[1] = ctx.instr.far_branch_selector();
   ctx.state.rip = ctx.instr.far_branch32();

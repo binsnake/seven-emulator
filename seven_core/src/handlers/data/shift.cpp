@@ -40,13 +40,8 @@ ExecutionResult shift_rm(ExecutionContext& ctx, std::size_t width, ShiftKind kin
   const auto count = read_shift_count(ctx, source, width);
   const auto mask = mask_for_width(width);
   if (count == 0) {
-    // Flags and the shifted value are unaffected by a masked-to-zero count,
-    // but the destination write-back still architecturally happens -- for a
-    // 32-bit register destination that means the usual zero-extension of
-    // the upper 32 bits still occurs even though the written value equals
-    // the original. Skipping the write here silently dropped that
-    // zero-extension (seven-fuzzer finding: SHL/SHR/SAR/ROL/ROR-family
-    // masked-count-0 on a 32-bit register left the upper 32 bits stale).
+    // A masked-to-zero count leaves flags and the value alone but the write-back still happens, so a
+    // 32-bit register destination still zero-extends. Skipping the write left the upper half stale.
     return detail::write_operand_checked(ctx, 0, value & mask, width);
   }
 
@@ -178,23 +173,17 @@ namespace {
   return 1ull << ((width * 8) - 1);
 }
 
-// x86 ROL/ROR flag semantics, matched to real hardware (measured on an i9-11900K):
-//  * The count is masked with 0x1F (0x3F for 64-bit operands) -- NOT (width-1). The effective
-//    rotation is that masked count modulo the operand size, but CF/OF depend on the masked count.
-//  * CF is written whenever the masked count is non-zero (CF = LSB of result for ROL, MSB for ROR).
-//  * OF is architecturally defined only for a masked count of 1, but real silicon writes it in more
-//    cases -- and the exact set is operand-form dependent (this is an undefined-flag quirk that
-//    VMProtect probes to detect emulators). Measured on the i9-11900K for masked count > 1:
-//      - CL-count encodings           : always write OF (any non-zero masked count).
-//      - imm/1 encodings, REGISTER dst : leave OF unchanged (preserved).
-//      - imm/1 encodings, MEMORY   dst : write OF (the memory execution path differs from register!)
-//    The written value is always the count==1 value derived from the *original* operand's edge bits:
-//    ROL: OF = msb ^ (msb-1);  ROR: OF = lsb ^ msb.
+// ROL/ROR flag semantics as measured on an i9-11900K. The count masks with 0x1F (0x3F at 64 bits),
+// not width-1, and CF/OF follow the masked count rather than the effective rotation. CF is written
+// for any non-zero masked count. OF is architecturally defined only at count 1, but silicon writes it
+// more widely and the set depends on the form: CL-count always writes it, imm/1 with a register
+// destination preserves it, imm/1 with a memory destination writes it. The value is always the
+// count==1 one taken from the original operand's edge bits.
 ExecutionResult rotate_left(ExecutionContext& ctx, std::size_t width, std::uint64_t count, bool count_is_cl = false) {
   bool ok = false;
   const auto value = detail::read_operand(ctx, 0, width, &ok);
   if (!ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto bits = static_cast<unsigned>(width * 8);
   const auto count_mask = static_cast<unsigned>(bits == 64 ? 0x3Fu : 0x1Fu);
@@ -204,7 +193,7 @@ ExecutionResult rotate_left(ExecutionContext& ctx, std::size_t width, std::uint6
     // See shift_rm's identical fix: the write-back still architecturally
     // happens even though the rotation/flags don't change.
     if (!detail::write_operand(ctx, 0, value & m, width)) {
-      return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+      return detail::memory_fault(ctx, detail::memory_address(ctx));
     }
     return {};
   }
@@ -219,7 +208,7 @@ ExecutionResult rotate_left(ExecutionContext& ctx, std::size_t width, std::uint6
     detail::set_flag(ctx.state.rflags, kFlagOF, old_msb ^ old_next);
   }
   if (!detail::write_operand(ctx, 0, result, width)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -228,7 +217,7 @@ ExecutionResult rotate_right(ExecutionContext& ctx, std::size_t width, std::uint
   bool ok = false;
   const auto value = detail::read_operand(ctx, 0, width, &ok);
   if (!ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto bits = static_cast<unsigned>(width * 8);
   const auto count_mask = static_cast<unsigned>(bits == 64 ? 0x3Fu : 0x1Fu);
@@ -238,7 +227,7 @@ ExecutionResult rotate_right(ExecutionContext& ctx, std::size_t width, std::uint
     // See shift_rm's identical fix: the write-back still architecturally
     // happens even though the rotation/flags don't change.
     if (!detail::write_operand(ctx, 0, value & m, width)) {
-      return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+      return detail::memory_fault(ctx, detail::memory_address(ctx));
     }
     return {};
   }
@@ -253,7 +242,7 @@ ExecutionResult rotate_right(ExecutionContext& ctx, std::size_t width, std::uint
     detail::set_flag(ctx.state.rflags, kFlagOF, old_lsb ^ old_msb);
   }
   if (!detail::write_operand(ctx, 0, result, width)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -262,7 +251,7 @@ ExecutionResult rotate_carry_left(ExecutionContext& ctx, std::size_t width, std:
   bool ok = false;
   auto value = detail::read_operand(ctx, 0, width, &ok);
   if (!ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto bits = static_cast<unsigned>(width * 8);
   const auto raw = static_cast<unsigned>(count & (bits == 64 ? 0x3Fu : 0x1Fu));
@@ -272,7 +261,7 @@ ExecutionResult rotate_carry_left(ExecutionContext& ctx, std::size_t width, std:
     // See shift_rm's identical fix: the write-back still architecturally
     // happens even though the rotation/flags don't change.
     if (!detail::write_operand(ctx, 0, value & m, width)) {
-      return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+      return detail::memory_fault(ctx, detail::memory_address(ctx));
     }
     return {};
   }
@@ -289,7 +278,7 @@ ExecutionResult rotate_carry_left(ExecutionContext& ctx, std::size_t width, std:
   const auto of = ((original & msb_mask(width)) != 0ull) ^ ((original & (msb_mask(width) >> 1)) != 0ull);
   detail::set_flag(ctx.state.rflags, kFlagOF, of);
   if (!detail::write_operand(ctx, 0, value, width)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -298,7 +287,7 @@ ExecutionResult rotate_carry_right(ExecutionContext& ctx, std::size_t width, std
   bool ok = false;
   auto value = detail::read_operand(ctx, 0, width, &ok);
   if (!ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto bits = static_cast<unsigned>(width * 8);
   const auto raw = static_cast<unsigned>(count & (bits == 64 ? 0x3Fu : 0x1Fu));
@@ -308,7 +297,7 @@ ExecutionResult rotate_carry_right(ExecutionContext& ctx, std::size_t width, std
     // See shift_rm's identical fix: the write-back still architecturally
     // happens even though the rotation/flags don't change.
     if (!detail::write_operand(ctx, 0, value & m, width)) {
-      return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+      return detail::memory_fault(ctx, detail::memory_address(ctx));
     }
     return {};
   }
@@ -327,7 +316,7 @@ ExecutionResult rotate_carry_right(ExecutionContext& ctx, std::size_t width, std
   const auto of = ((original & msb_mask(width)) != 0ull) ^ old_cf;
   detail::set_flag(ctx.state.rflags, kFlagOF, of);
   if (!detail::write_operand(ctx, 0, value, width)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -336,7 +325,7 @@ ExecutionResult shld(ExecutionContext& ctx, std::size_t width, std::uint64_t cou
   bool dst_ok = false;
   const auto dst = detail::read_operand(ctx, 0, width, &dst_ok);
   if (!dst_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto bits = static_cast<unsigned>(width * 8);
   const auto raw = static_cast<unsigned>(count & (bits == 64 ? 0x3Fu : 0x1Fu));
@@ -345,7 +334,7 @@ ExecutionResult shld(ExecutionContext& ctx, std::size_t width, std::uint64_t cou
     // See shift_rm's identical fix: the write-back still architecturally
     // happens even though the shift/flags don't change.
     if (!detail::write_operand(ctx, 0, dst & width_mask(width), width)) {
-      return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+      return detail::memory_fault(ctx, detail::memory_address(ctx));
     }
     return {};
   }
@@ -365,7 +354,7 @@ ExecutionResult shld(ExecutionContext& ctx, std::size_t width, std::uint64_t cou
   detail::set_flag(ctx.state.rflags, kFlagSF, (result & msb_mask(width)) != 0ull);
   detail::set_flag(ctx.state.rflags, kFlagPF, detail::even_parity(static_cast<std::uint8_t>(result & 0xFFull)));
   if (!detail::write_operand(ctx, 0, result, width)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }
@@ -374,7 +363,7 @@ ExecutionResult shrd(ExecutionContext& ctx, std::size_t width, std::uint64_t cou
   bool dst_ok = false;
   const auto dst = detail::read_operand(ctx, 0, width, &dst_ok);
   if (!dst_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto bits = static_cast<unsigned>(width * 8);
   const auto raw = static_cast<unsigned>(count & (bits == 64 ? 0x3Fu : 0x1Fu));
@@ -383,7 +372,7 @@ ExecutionResult shrd(ExecutionContext& ctx, std::size_t width, std::uint64_t cou
     // See shift_rm's identical fix: the write-back still architecturally
     // happens even though the shift/flags don't change.
     if (!detail::write_operand(ctx, 0, dst & width_mask(width), width)) {
-      return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+      return detail::memory_fault(ctx, detail::memory_address(ctx));
     }
     return {};
   }
@@ -403,7 +392,7 @@ ExecutionResult shrd(ExecutionContext& ctx, std::size_t width, std::uint64_t cou
   detail::set_flag(ctx.state.rflags, kFlagSF, (result & msb_mask(width)) != 0ull);
   detail::set_flag(ctx.state.rflags, kFlagPF, detail::even_parity(static_cast<std::uint8_t>(result & 0xFFull)));
   if (!detail::write_operand(ctx, 0, result, width)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   return {};
 }

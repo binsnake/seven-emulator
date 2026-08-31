@@ -4,19 +4,34 @@ namespace seven::handlers {
 
 namespace {
 
+// A rep-prefixed string op runs its whole count in one handler call with no way back to the Executor,
+// so a huge guest RCX hangs step_impl past any request_stop() or watchdog. Hardware stays preemptible
+// between iterations; capping and yielding with rip unchanged reproduces that, invisibly to the guest
+// since RCX/RSI/RDI already carry the partial progress.
+constexpr std::uint64_t kMaxRepIterationsPerCall = 4096;
+
+// A single-stepping guest sees a #DB after every iteration of a rep, not one after the whole loop.
+// Dropping the cap to one while TF is set reuses the same yield as the budget above, and the
+// executor already delivers TF at the end of whatever step() did.
+[[nodiscard]] std::uint64_t rep_iterations_per_call(const ExecutionContext& ctx) noexcept {
+  return (ctx.state.rflags & kFlagTF) != 0 ? 1u : kMaxRepIterationsPerCall;
+}
+
 ExecutionResult movs_impl(ExecutionContext& ctx, const std::size_t width) {
   const bool rep = ctx.instr.has_rep_prefix() || ctx.instr.has_repne_prefix();
-  std::uint64_t count = rep ? ctx.state.gpr[1] : 1u;  // RCX
+  const auto addr_mask = detail::string_address_mask(ctx.instr);
+  std::uint64_t count = rep ? (ctx.state.gpr[1] & addr_mask) : 1u;  // RCX
   if (count == 0) {
     return {};
   }
 
   const bool df = (ctx.state.rflags & kFlagDF) != 0;
-  std::uint64_t rsi = ctx.state.gpr[6];
-  std::uint64_t rdi = ctx.state.gpr[7];
+  const auto src_base = detail::string_source_segment_base(ctx.state, ctx.instr);
+  std::uint64_t rsi = ctx.state.gpr[6] & addr_mask;
+  std::uint64_t rdi = ctx.state.gpr[7] & addr_mask;
 
   for (std::uint64_t i = 0; i < count; ++i) {
-    const auto read_addr = rsi;
+    const auto read_addr = rsi + src_base;
     const auto write_addr = rdi;
     std::uint64_t value = 0;
     if (!ctx.memory.read(read_addr, &value, width)) {
@@ -25,7 +40,7 @@ ExecutionResult movs_impl(ExecutionContext& ctx, const std::size_t width) {
       if (rep) {
         ctx.state.gpr[1] = count - i;
       }
-      return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, read_addr, 0}, ctx.instr.code()};
+      return detail::memory_fault(ctx, read_addr);
     }
     value = detail::truncate(value, width);
     if (!ctx.memory.write(write_addr, &value, width)) {
@@ -34,7 +49,7 @@ ExecutionResult movs_impl(ExecutionContext& ctx, const std::size_t width) {
       if (rep) {
         ctx.state.gpr[1] = count - i;
       }
-      return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, write_addr, 0}, ctx.instr.code()};
+      return detail::memory_fault(ctx, write_addr);
     }
 
     const auto hit_bits = detail::debug_data_breakpoint_hits(ctx.state, read_addr, width, true, false) |
@@ -47,6 +62,8 @@ ExecutionResult movs_impl(ExecutionContext& ctx, const std::size_t width) {
       rsi += width;
       rdi += width;
     }
+    rsi &= addr_mask;
+    rdi &= addr_mask;
 
     const auto remaining = count - i - 1;
     if (detail::note_debug_break(ctx, hit_bits, rep && remaining > 0)) {
@@ -55,6 +72,17 @@ ExecutionResult movs_impl(ExecutionContext& ctx, const std::size_t width) {
       if (rep) {
         ctx.state.gpr[1] = remaining;
       }
+      return {};
+    }
+
+    // Yield after a bounded number of iterations rather than run a huge RCX uninterruptibly. rip
+    // stays on this instruction, so the next step() continues the same rep where it left off.
+    if (rep && remaining > 0 && (i + 1) >= rep_iterations_per_call(ctx)) {
+      ctx.state.gpr[6] = rsi;
+      ctx.state.gpr[7] = rdi;
+      ctx.state.gpr[1] = remaining;
+      ctx.push_rf_for_debug = true;
+      ctx.control_flow_taken = true;
       return {};
     }
   }

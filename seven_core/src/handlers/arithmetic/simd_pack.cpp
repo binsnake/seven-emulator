@@ -1,6 +1,10 @@
+#include <algorithm>
+
 #include <array>
 #include <cstdint>
 #include <cstring>
+
+#include <iced_x86/memory_size_info.hpp>
 
 #include "seven/handler_helpers.hpp"
 
@@ -65,6 +69,10 @@ void write_vec(CpuState& state, iced_x86::Register reg, big_uint value, bool zer
 
 big_uint read_mem(ExecutionContext& ctx, std::uint64_t address, std::size_t width, bool* ok) {
   std::array<std::uint8_t, kZmmBytes> bytes{};
+  // A ZMM register is the widest thing this can stage, so a larger width is a caller bug --
+  // but both the copy and the loop below are sized by it, so bound it here rather than let
+  // one run off the end of this frame.
+  width = std::min(width, bytes.size());
   if (!ctx.memory.read(address, bytes.data(), width)) {
     if (ok) *ok = false;
     return 0;
@@ -89,6 +97,25 @@ big_uint read_operand(ExecutionContext& ctx, std::uint32_t operand_index, std::s
     return read_vec(ctx.state, reg) & mask(width);
   }
   if (kind == iced_x86::OpKind::MEMORY) {
+    // An EVEX {1toN} source reads one element and repeats it, and that element size lives in the raw
+    // MemorySize. memory_size() has collapsed to the operand width, and feeding the byte count back
+    // through the size table reindexes to an unrelated entry. Same fix as simd_int.cpp's copy.
+    if (ctx.instr.is_broadcast()) {
+      const auto element_width = iced_x86::memory_size_ext::get_element_size(ctx.instr.memory_size_enum());
+      if (element_width == 0 || element_width > width) {
+        if (ok) *ok = false;
+        return 0;
+      }
+      const auto element = read_mem(ctx, detail::memory_address(ctx), element_width, ok);
+      if (ok && !*ok) return 0;
+      big_uint out = 0;
+      const auto lane_value = element & mask(element_width);
+      for (std::size_t lane = 0; lane < width; lane += element_width) {
+        out |= lane_value << (lane * 8);
+      }
+      if (ok) *ok = true;
+      return out;
+    }
     return read_mem(ctx, detail::memory_address(ctx), width, ok);
   }
   if (ok) *ok = false;
@@ -140,6 +167,9 @@ ExecutionResult legacy_pack(ExecutionContext& ctx, Fn&& fn) {
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
+  // Legacy (non-VEX) form: real hardware requires the m128 source aligned to 16 bytes, #GP(0)
+  // otherwise -- see require_aligned_memory_operand's own doc comment.
+  if (auto fault = detail::require_aligned_memory_operand(ctx, 1, 0xFULL)) return *fault;
   bool ok = false;
   const auto dst_reg = ctx.instr.op_register(0);
   const auto lhs_bits = read_vec(ctx.state, dst_reg);
@@ -153,6 +183,7 @@ ExecutionResult legacy_pack(ExecutionContext& ctx, Fn&& fn) {
 
 template <typename Dst, typename Src, typename Fn>
 ExecutionResult vex_pack(ExecutionContext& ctx, Fn&& fn) {
+  if (detail::has_active_opmask(ctx.instr)) return detail::unsupported_opmask(ctx);
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
@@ -175,6 +206,9 @@ ExecutionResult legacy_unpack(ExecutionContext& ctx, Fn&& fn) {
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
+  // Legacy (non-VEX) form: real hardware requires the m128 source aligned to 16 bytes, #GP(0)
+  // otherwise -- see require_aligned_memory_operand's own doc comment.
+  if (auto fault = detail::require_aligned_memory_operand(ctx, 1, 0xFULL)) return *fault;
   bool ok = false;
   const auto dst_reg = ctx.instr.op_register(0);
   const auto lhs_bits = read_vec(ctx.state, dst_reg);
@@ -188,6 +222,7 @@ ExecutionResult legacy_unpack(ExecutionContext& ctx, Fn&& fn) {
 
 template <typename Src, typename Fn>
 ExecutionResult vex_unpack(ExecutionContext& ctx, Fn&& fn) {
+  if (detail::has_active_opmask(ctx.instr)) return detail::unsupported_opmask(ctx);
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
@@ -617,7 +652,7 @@ ExecutionResult handle_code_EVEX_VPACKSSWB_XMM_K1Z_XMM_XMMM128(ExecutionContext&
   });
 }
 
-ExecutionResult handle_code_EVEX_VPACKSSDW_XMM_K1Z_XMM_XMMM128(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VPACKSSDW_XMM_K1Z_XMM_XMMM128B32(ExecutionContext& ctx) {
   return vex_pack<std::int16_t, std::int32_t>(ctx, [](const auto& lhs, const auto& rhs) {
     return std::array<std::int16_t, 8>{
       sat_pack_signed<std::int16_t>(lhs[0]), sat_pack_signed<std::int16_t>(lhs[1]),
@@ -695,7 +730,7 @@ ExecutionResult handle_code_EVEX_VPUNPCKHWD_XMM_K1Z_XMM_XMMM128(ExecutionContext
   });
 }
 
-ExecutionResult handle_code_EVEX_VPUNPCKLDQ_XMM_K1Z_XMM_XMMM128(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VPUNPCKLDQ_XMM_K1Z_XMM_XMMM128B32(ExecutionContext& ctx) {
   return vex_unpack<std::uint32_t>(ctx, [](const auto& lhs, const auto& rhs, std::size_t lane) {
     big_uint out = 0;
     for (std::size_t i = 0; i < 2; ++i) {
@@ -708,7 +743,7 @@ ExecutionResult handle_code_EVEX_VPUNPCKLDQ_XMM_K1Z_XMM_XMMM128(ExecutionContext
   });
 }
 
-ExecutionResult handle_code_EVEX_VPUNPCKHDQ_XMM_K1Z_XMM_XMMM128(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VPUNPCKHDQ_XMM_K1Z_XMM_XMMM128B32(ExecutionContext& ctx) {
   return vex_unpack<std::uint32_t>(ctx, [](const auto& lhs, const auto& rhs, std::size_t lane) {
     big_uint out = 0;
     for (std::size_t i = 0; i < 2; ++i) {
@@ -736,7 +771,7 @@ ExecutionResult handle_code_EVEX_VPACKSSWB_YMM_K1Z_YMM_YMMM256(ExecutionContext&
   });
 }
 
-ExecutionResult handle_code_EVEX_VPACKSSDW_YMM_K1Z_YMM_YMMM256(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VPACKSSDW_YMM_K1Z_YMM_YMMM256B32(ExecutionContext& ctx) {
   return vex_pack<std::int16_t, std::int32_t>(ctx, [](const auto& lhs, const auto& rhs) {
     return std::array<std::int16_t, 8>{
       sat_pack_signed<std::int16_t>(lhs[0]), sat_pack_signed<std::int16_t>(lhs[1]),
@@ -814,7 +849,7 @@ ExecutionResult handle_code_EVEX_VPUNPCKHWD_YMM_K1Z_YMM_YMMM256(ExecutionContext
   });
 }
 
-ExecutionResult handle_code_EVEX_VPUNPCKLDQ_YMM_K1Z_YMM_YMMM256(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VPUNPCKLDQ_YMM_K1Z_YMM_YMMM256B32(ExecutionContext& ctx) {
   return vex_unpack<std::uint32_t>(ctx, [](const auto& lhs, const auto& rhs, std::size_t lane) {
     big_uint out = 0;
     for (std::size_t i = 0; i < 2; ++i) {
@@ -827,7 +862,7 @@ ExecutionResult handle_code_EVEX_VPUNPCKLDQ_YMM_K1Z_YMM_YMMM256(ExecutionContext
   });
 }
 
-ExecutionResult handle_code_EVEX_VPUNPCKHDQ_YMM_K1Z_YMM_YMMM256(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VPUNPCKHDQ_YMM_K1Z_YMM_YMMM256B32(ExecutionContext& ctx) {
   return vex_unpack<std::uint32_t>(ctx, [](const auto& lhs, const auto& rhs, std::size_t lane) {
     big_uint out = 0;
     for (std::size_t i = 0; i < 2; ++i) {
@@ -854,7 +889,7 @@ ExecutionResult handle_code_EVEX_VPACKSSWB_ZMM_K1Z_ZMM_ZMMM512(ExecutionContext&
   });
 }
 
-ExecutionResult handle_code_EVEX_VPACKSSDW_ZMM_K1Z_ZMM_ZMMM512(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VPACKSSDW_ZMM_K1Z_ZMM_ZMMM512B32(ExecutionContext& ctx) {
   return vex_pack<std::int16_t, std::int32_t>(ctx, [](const auto& lhs, const auto& rhs) {
     return std::array<std::int16_t, 8>{
       sat_pack_signed<std::int16_t>(lhs[0]), sat_pack_signed<std::int16_t>(lhs[1]),
@@ -932,7 +967,7 @@ ExecutionResult handle_code_EVEX_VPUNPCKHWD_ZMM_K1Z_ZMM_ZMMM512(ExecutionContext
   });
 }
 
-ExecutionResult handle_code_EVEX_VPUNPCKLDQ_ZMM_K1Z_ZMM_ZMMM512(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VPUNPCKLDQ_ZMM_K1Z_ZMM_ZMMM512B32(ExecutionContext& ctx) {
   return vex_unpack<std::uint32_t>(ctx, [](const auto& lhs, const auto& rhs, std::size_t lane) {
     big_uint out = 0;
     for (std::size_t i = 0; i < 2; ++i) {
@@ -945,7 +980,7 @@ ExecutionResult handle_code_EVEX_VPUNPCKLDQ_ZMM_K1Z_ZMM_ZMMM512(ExecutionContext
   });
 }
 
-ExecutionResult handle_code_EVEX_VPUNPCKHDQ_ZMM_K1Z_ZMM_ZMMM512(ExecutionContext& ctx) {
+ExecutionResult handle_code_EVEX_VPUNPCKHDQ_ZMM_K1Z_ZMM_ZMMM512B32(ExecutionContext& ctx) {
   return vex_unpack<std::uint32_t>(ctx, [](const auto& lhs, const auto& rhs, std::size_t lane) {
     big_uint out = 0;
     for (std::size_t i = 0; i < 2; ++i) {

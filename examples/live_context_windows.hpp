@@ -1,6 +1,6 @@
 #pragma once
 
-// Windows live-context bridge — example only, not compiled into seven_core.
+// Windows live-context bridge -- example only, not compiled into seven_core.
 //
 // Syncs a seven::CpuState to/from a suspended Windows thread's CONTEXT so
 // the emulator operates on real register state.
@@ -58,7 +58,7 @@ struct WindowsContextBridge {
 
       state.mxcsr = ctx.MxCsr;
 
-      // XMM0–XMM15 → vectors[0]–vectors[15]
+      // XMM0-XMM15 → vectors[0]-vectors[15]
       static_assert(sizeof(ctx.Xmm0) == 16);
       const auto* xmm = &ctx.Xmm0;
       for (int i = 0; i < 16; ++i) {

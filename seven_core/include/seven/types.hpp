@@ -102,11 +102,12 @@ struct DescriptorTableRegister {
 
 struct CpuState {
   std::array<std::uint64_t, 16> gpr{};
-  std::array<std::uint64_t, 8> mmx{};
   std::array<std::uint16_t, 6> sreg{};  // ES,CS,SS,DS,FS,GS selectors
-  // cr[0]=CR0, cr[4]=CR4 — Windows 10/11 x64 typical values
+  // cr[0]=CR0, cr[4]=CR4 -- Windows 10/11 x64 typical values
   std::array<std::uint64_t, 16> cr{0x80050033u, 0, 0, 0, 0x370678u};
-  std::array<std::uint64_t, 16> dr{};
+  // dr[6]/dr[7] carry bits that read as 1 on real hardware no matter what is written; these are
+  // their reset values. See kDr6ReservedOnes/kDr7ReservedOnes.
+  std::array<std::uint64_t, 16> dr{0, 0, 0, 0, 0, 0, 0xFFFF0FF0ull, 0x400ull};
   std::array<std::uint64_t, 8> tr{};
   std::uint64_t rip = 0;
   ExecutionMode mode = ExecutionMode::long64;
@@ -115,7 +116,7 @@ struct CpuState {
   std::uint64_t gs_base = 0;
   DescriptorTableRegister gdtr{};
   DescriptorTableRegister idtr{};
-  // EFER (LME+LMA+NXE+SCE) and STAR (syscall CS/SS) — Windows 10/11 x64 typical values
+  // EFER (LME+LMA+NXE+SCE) and STAR (syscall CS/SS) -- Windows 10/11 x64 typical values
   std::unordered_map<std::uint32_t, std::uint64_t> msr{
     {0xC0000080u, 0x0000'0000'0000'0D01u},  // EFER
     {0xC0000081u, 0x0023'0010'0000'0000u},  // STAR
@@ -129,6 +130,9 @@ struct CpuState {
   std::array<std::uint8_t, 8> x87_tags{0x3, 0x3, 0x3, 0x3, 0x3, 0x3, 0x3, 0x3};
   std::array<std::uint64_t, 8> opmask{};
   std::array<VectorRegister, 32> vectors{};
+  // Per-guest, deliberately. As a function-local static in the RDTSC handler every Executor in the
+  // process shared one counter, watching each other's progress and racing on the increment.
+  std::uint64_t tsc = 0;
   std::uint8_t debug_suppression = 0;
   bool pending_single_step = false;
   std::uint64_t pending_debug_hit_bits = 0;
@@ -152,7 +156,7 @@ struct CpuState {
   void x87_set(std::size_t st_index, X87Scalar value) noexcept {
     const auto idx = x87_phys_index(st_index);
     x87_stack[idx] = value;
-    x87_tags[idx] = (value == 0) ? 0x1 : 0x0;
+    x87_tags[idx] = seven::x87_tag_of(value);
   }
 
   void x87_mark_empty(std::size_t st_index) noexcept {
@@ -200,17 +204,20 @@ struct CpuState {
     }
     x87_top = new_top;
     x87_stack[new_top] = value;
-    x87_tags[new_top] = (value == 0) ? 0x1 : 0x0;
+    x87_tags[new_top] = seven::x87_tag_of(value);
     set_x87_top(x87_top);
     return true;
   }
 
   bool x87_pop() noexcept {
-    if (x87_tags[x87_top] == 0x3) {
+    // The one place that read x87_top raw and trusted every writer to have masked it. Masking here
+    // makes the 0..7 invariant hold at the point of use, which a deserializer has already broken.
+    const auto phys = x87_phys_index(0);
+    if (x87_tags[phys] == 0x3) {
       return false;
     }
-    x87_tags[x87_top] = 0x3;
-    x87_top = static_cast<std::uint8_t>((x87_top + 1) & 0x7);
+    x87_tags[phys] = 0x3;
+    x87_top = static_cast<std::uint8_t>((phys + 1) & 0x7);
     set_x87_top(x87_top);
     return true;
   }
@@ -222,13 +229,17 @@ struct CpuState {
     std::swap(x87_tags[i0], x87_tags[iN]);
   }
 
+  // MM0-MM7 are the low 64 bits of the physical x87 registers R0-R7, not a file of their own, which
+  // is why they are indexed without TOP. A separate array meant FXSAVE stored zeros for them. Writing
+  // one fills the aliased exponent and sign with ones, so the x87 side reads it back as a NaN.
   [[nodiscard]] std::uint64_t mmx_get(std::size_t mm_index) const noexcept {
-    return mmx[mmx_phys_index(mm_index)];
+    return x87_stack[mmx_phys_index(mm_index)].val.signif;
   }
 
   void mmx_set(std::size_t mm_index, std::uint64_t value) noexcept {
     const auto idx = mmx_phys_index(mm_index);
-    mmx[idx] = value;
+    x87_stack[idx].val.signif = value;
+    x87_stack[idx].val.signExp = 0xFFFFu;
     x87_tags[idx] = 0x0;
   }
 };
@@ -272,6 +283,31 @@ constexpr std::uint64_t kFlagDF = 1ull << 10;
 constexpr std::uint64_t kFlagOF = 1ull << 11;
 constexpr std::uint64_t kFlagRF = 1ull << 16;
 
+// The ALU status flags eligible for the block liveness pass's dead-write elimination (see
+// seven/ir.hpp). Deliberately excludes control bits (TF/IF/DF/RF/...) -- those are never
+// dead-code-eliminated, only ever set explicitly by the instructions that own them.
+constexpr std::uint64_t kAluStatusFlagsMask = kFlagCF | kFlagPF | kFlagAF | kFlagZF | kFlagSF | kFlagOF;
+
+// The rflags bits that exist: bit 1 always reads 1, bits 3, 5, 15 and 22 up always read 0. POPF and
+// IRET load rflags wholesale from guest memory, so both have to drop the reserved bits.
+constexpr std::uint64_t kRflagsWritableMask = 0x00000000003F7FD5ull;
+constexpr std::uint64_t kRflagsReservedOnes = 0x0000000000000002ull;
+
+// 4-level paging (48-bit virtual addresses): bits 63:47 must all equal bit 47. Anything else is a
+// #GP(0) on real hardware, raised ahead of any page walk.
+[[nodiscard]] constexpr bool is_canonical_address(std::uint64_t address) noexcept {
+  constexpr int kShift = 16;  // 64 - 48
+  return (static_cast<std::int64_t>(address << kShift) >> kShift) == static_cast<std::int64_t>(address);
+}
+
+// DR6 keeps B0-B3 plus BD/BS/BT; DR7 keeps the enable pairs, LE/GE, GD, and the R/W+LEN fields.
+// Everything else in each reads back as a fixed 1 or 0 whatever the guest writes, and both are
+// 32 bits of architectural state, so the upper half never sticks either.
+constexpr std::uint64_t kDr6WritableMask = 0x0000E00Full;
+constexpr std::uint64_t kDr6ReservedOnes = 0xFFFF0FF0ull;
+constexpr std::uint64_t kDr7WritableMask = 0xFFFF23FFull;
+constexpr std::uint64_t kDr7ReservedOnes = 0x00000400ull;
+
 [[nodiscard]] constexpr std::uint64_t mask_for_width(std::size_t width) noexcept {
   return width >= 8 ? ~0ull : ((1ull << (width * 8)) - 1ull);
 }
@@ -283,7 +319,10 @@ constexpr std::uint64_t kFlagRF = 1ull << 16;
 }
 
 [[nodiscard]] constexpr std::uint64_t sign_bit_for_width(std::size_t width) noexcept {
-  return 1ull << ((width * 8) - 1);
+  // Guarded the way mask_for_width above already is. Every caller today passes a literal, so the
+  // shift is always in range -- but the two are used interchangeably on the same width and only one
+  // of them survived a width of 0 or one past 8, which is the kind of asymmetry that bites later.
+  return width == 0 ? 0ull : (width >= 8 ? (1ull << 63) : (1ull << ((width * 8) - 1)));
 }
 
 [[nodiscard]] constexpr std::uint64_t sign_extend(std::uint64_t value, std::size_t width) noexcept {

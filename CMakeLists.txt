@@ -48,10 +48,11 @@ if(NOT GTest_FOUND)
   FetchContent_MakeAvailable(googletest)
 endif()
 
+# Pinned for the same reason as asmjit: this is the floating-point core and master moves.
 FetchContent_Declare(
   softfloat
   GIT_REPOSITORY https://github.com/ucb-bar/berkeley-softfloat-3.git
-  GIT_TAG        master
+  GIT_TAG        a0c6494cdc11865811dec815d5c0049fba9d82a8
 )
 FetchContent_GetProperties(softfloat)
 if(NOT softfloat_POPULATED)
@@ -82,7 +83,18 @@ if(NOT softfloat_POPULATED)
     "${softfloat_SOURCE_DIR}/source/8086"
   )
   target_include_directories(softfloat PRIVATE "${_sf_platform_dir}")
-  target_compile_definitions(softfloat PUBLIC SOFTFLOAT_FAST_INT64)
+  # LITTLEENDIAN has to reach consumers, not just softfloat's own sources: softfloat_types.h swaps
+  # extFloat80M's field order on it, so a consumer without it reads signif and signExp at the
+  # wrong offsets.
+  target_compile_definitions(softfloat PUBLIC SOFTFLOAT_FAST_INT64 LITTLEENDIAN=1)
+  # Without this softfloat's headers fall back to an empty THREAD_LOCAL, making its rounding mode and
+  # exception flags process-wide. Two Executors on separate host threads then interleave a save and a
+  # restore and strand a guest's rounding mode for good. PUBLIC for the same reason LITTLEENDIAN is.
+  if(MSVC)
+    target_compile_definitions(softfloat PUBLIC "THREAD_LOCAL=__declspec(thread)")
+  else()
+    target_compile_definitions(softfloat PUBLIC "THREAD_LOCAL=_Thread_local")
+  endif()
   if(MSVC)
     target_compile_options(softfloat PRIVATE /WX- /wd4146 /wd4244 /wd4267)
   endif()
@@ -176,6 +188,9 @@ add_executable(seven_tests
   tests/kubera_debug_tests.cpp
   tests/kubera_scalar_tests.cpp
   tests/kubera_simd_tests.cpp
+  tests/kubera_liveness_tests.cpp
+  tests/kubera_decoder_tests.cpp
+  tests/kubera_memory_tests.cpp
 )
 target_link_libraries(seven_tests PRIVATE seven_core GTest::gtest_main)
 if(MSVC)

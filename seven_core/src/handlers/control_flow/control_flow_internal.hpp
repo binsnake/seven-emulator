@@ -54,29 +54,52 @@ ExecutionResult unsupported_instruction(ExecutionContext& ctx) {
   return {StopReason::unsupported_instruction, 0, ExceptionInfo{StopReason::unsupported_instruction, ctx.state.rip, 0}, ctx.instr.code()};
 }
 
+// RET, IRET and the indirect near branches take their target from guest data, the one way a
+// non-canonical value reaches rip with no memory operand involved. Hardware #GP(0)s at the branch;
+// deferring to the next step's fetch check blames the wrong instruction and retires the branch.
+[[nodiscard]] ExecutionResult branch_target_fault(ExecutionContext& ctx, std::uint64_t target) {
+  return {StopReason::general_protection, 0,
+          ExceptionInfo{StopReason::general_protection, target, 0}, ctx.instr.code()};
+}
+
+// rsp only moves once the slot is written. A #PF is a fault, so hardware leaves rsp where it was and
+// the retry works, which is what lets a guard page grow a stack. Committing the decrement first
+// walked the stack pointer down one slot per retry.
 ExecutionResult push_width(ExecutionContext& ctx, std::uint64_t value, std::size_t width) {
-  ctx.state.gpr[4] = mask_stack_pointer(ctx.state, ctx.state.gpr[4] - width);
+  const auto slot = mask_stack_pointer(ctx.state, ctx.state.gpr[4] - width);
+  ExecutionResult result{};
   switch (width) {
     case 1: {
       const auto v = static_cast<std::uint8_t>(value);
-      return detail::write_memory_checked(ctx, ctx.state.gpr[4], v);
+      result = detail::write_memory_checked(ctx, slot, v);
+      break;
     }
     case 2: {
       const auto v = static_cast<std::uint16_t>(value);
-      return detail::write_memory_checked(ctx, ctx.state.gpr[4], v);
+      result = detail::write_memory_checked(ctx, slot, v);
+      break;
     }
     case 4: {
       const auto v = static_cast<std::uint32_t>(value);
-      return detail::write_memory_checked(ctx, ctx.state.gpr[4], v);
+      result = detail::write_memory_checked(ctx, slot, v);
+      break;
     }
     case 8:
-      return detail::write_memory_checked(ctx, ctx.state.gpr[4], value);
+      result = detail::write_memory_checked(ctx, slot, value);
+      break;
     default:
       return unsupported_instruction(ctx);
   }
+  if (!result.ok()) {
+    return result;
+  }
+  ctx.state.gpr[4] = slot;
+  detail::note_stack_access(ctx, slot, width, true);
+  return {};
 }
 
 ExecutionResult pop_width(ExecutionContext& ctx, std::uint64_t& value, std::size_t width) {
+  const auto slot = ctx.state.gpr[4];
   switch (width) {
     case 1: {
       std::uint8_t v = 0;
@@ -106,6 +129,7 @@ ExecutionResult pop_width(ExecutionContext& ctx, std::uint64_t& value, std::size
       return unsupported_instruction(ctx);
   }
   ctx.state.gpr[4] = mask_stack_pointer(ctx.state, ctx.state.gpr[4] + width);
+  detail::note_stack_access(ctx, slot, width, false);
   return {};
 }
 
@@ -141,6 +165,10 @@ ExecutionResult pop_operand_width(ExecutionContext& ctx, std::size_t width) {
     return result;
   }
   if (auto result = detail::write_operand_checked(ctx, 0, value, width); !result.ok()) {
+    // The destination's effective address is computed from the already-incremented rsp -- that part
+    // is architectural, POP m64 really does address through the new rsp. Committing the increment
+    // when the store then faults is not: the instruction is aborted and rsp goes back.
+    ctx.state.gpr[4] = old_sp;
     return result;
   }
   if (ctx.instr.op_kind(0) == iced_x86::OpKind::REGISTER && ctx.instr.op_register(0) == iced_x86::Register::SS) {
@@ -176,6 +204,7 @@ ExecutionResult push_all_width(ExecutionContext& ctx, std::size_t width) {
       original_sp,      ctx.state.gpr[5], ctx.state.gpr[6], ctx.state.gpr[7]};
   for (const auto value : regs) {
     if (auto result = push_width(ctx, value, width); !result.ok()) {
+      ctx.state.gpr[4] = original_sp;
       return result;
     }
   }
@@ -195,6 +224,11 @@ ExecutionResult call_rm_width(ExecutionContext& ctx, std::size_t width) {
                  static_cast<unsigned long long>(target),
                  static_cast<unsigned long long>(ctx.next_rip));
   }
+  // Ahead of the push, matching the SDM's order: a CALL to a non-canonical target faults with the
+  // return address still unwritten and rsp untouched.
+  if (!is_canonical_address(target)) {
+    return branch_target_fault(ctx, target);
+  }
   if (auto result = push_width(ctx, ctx.next_rip, width); !result.ok()) {
     return result;
   }
@@ -203,12 +237,31 @@ ExecutionResult call_rm_width(ExecutionContext& ctx, std::size_t width) {
   return {};
 }
 
+// sreg[1] is the only record of privilege level here, and the far branches load it straight from a
+// guest-supplied selector, so one RETF or IRET would otherwise put the guest at CPL 0. Hardware lets
+// a far transfer move outward but never inward, and gaining privilege needs a validated call gate.
+// There are no descriptor tables here, so the selector's RPL is all there is to check.
+[[nodiscard]] inline bool far_transfer_allowed(const CpuState& state, std::uint64_t selector) noexcept {
+  return (selector & 0x3u) >= (state.sreg[1] & 0x3u);
+}
+
+[[nodiscard]] inline ExecutionResult far_transfer_fault(ExecutionContext& ctx) {
+  return {StopReason::general_protection, 0,
+          ExceptionInfo{StopReason::general_protection, ctx.state.rip, 0}, ctx.instr.code()};
+}
+
 ExecutionResult ret_width(ExecutionContext& ctx, std::size_t width, std::uint16_t imm16) {
+  const auto entry_sp = ctx.state.gpr[4];
   std::uint64_t target = 0;
   if (auto result = pop_width(ctx, target, width); !result.ok()) {
     return result;
   }
-  ctx.state.rip = mask_instruction_pointer(ctx.state, target);
+  target = mask_instruction_pointer(ctx.state, target);
+  if (!is_canonical_address(target)) {
+    ctx.state.gpr[4] = entry_sp;
+    return branch_target_fault(ctx, target);
+  }
+  ctx.state.rip = target;
   ctx.state.gpr[4] = mask_stack_pointer(ctx.state, ctx.state.gpr[4] + imm16);
   ctx.control_flow_taken = true;
   return {};

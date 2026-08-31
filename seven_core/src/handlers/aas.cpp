@@ -8,8 +8,11 @@ ExecutionResult handle_code_AAS(ExecutionContext& ctx) {
   const bool carry = af || ((al & 0x0Fu) > 9u);
   auto ah = detail::read_register(ctx.state, iced_x86::Register::AH);
   if (carry) {
+    // Intel defines the adjust as AX := AX - 6 followed by AH := AH - 1, so a borrow out of
+    // AL - 6 costs AH a second decrement. Only reachable for AL < 6, i.e. when AF drove the
+    // condition rather than the low nibble.
+    ah -= 1u + (al < 6u ? 1u : 0u);
     al -= 6u;
-    ah -= 1u;
   }
   al &= 0x0Fu;
   detail::write_register(ctx.state, iced_x86::Register::AL, al, 1);

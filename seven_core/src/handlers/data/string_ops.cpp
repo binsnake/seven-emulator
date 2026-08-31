@@ -4,6 +4,18 @@ namespace seven::handlers {
 
 namespace {
 
+// See movs.cpp's identical constant: a rep-prefixed count otherwise runs in one uninterruptible loop
+// no stop request can interject. Capping and yielding with rip unchanged reproduces hardware's
+// between-iterations checkability with no guest-visible effect.
+constexpr std::uint64_t kMaxRepIterationsPerCall = 4096;
+
+// A single-stepping guest sees a #DB after every iteration of a rep, not one after the whole loop.
+// Dropping the cap to one while TF is set reuses the same yield as the budget above, and the
+// executor already delivers TF at the end of whatever step() did.
+[[nodiscard]] std::uint64_t rep_iterations_per_call(const ExecutionContext& ctx) noexcept {
+  return (ctx.state.rflags & kFlagTF) != 0 ? 1u : kMaxRepIterationsPerCall;
+}
+
 [[nodiscard]] std::uint64_t width_mask(std::size_t width) {
   if (width >= 8) {
     return ~0ull;
@@ -14,31 +26,34 @@ namespace {
 ExecutionResult cmps_impl(ExecutionContext& ctx, std::size_t width) {
   const bool rep = ctx.instr.has_rep_prefix() || ctx.instr.has_repne_prefix();
   const bool repne = ctx.instr.has_repne_prefix();
-  std::uint64_t remaining = rep ? ctx.state.gpr[1] : 1ull;
+  const auto addr_mask = detail::string_address_mask(ctx.instr);
+  std::uint64_t remaining = rep ? (ctx.state.gpr[1] & addr_mask) : 1ull;
   if (remaining == 0) {
     return {};
   }
 
   const bool df = (ctx.state.rflags & kFlagDF) != 0;
-  std::uint64_t rsi = ctx.state.gpr[6];
-  std::uint64_t rdi = ctx.state.gpr[7];
+  const auto src_base = detail::string_source_segment_base(ctx.state, ctx.instr);
+  std::uint64_t rsi = ctx.state.gpr[6] & addr_mask;
+  std::uint64_t rdi = ctx.state.gpr[7] & addr_mask;
+  std::uint64_t iterations_done = 0;
 
   while (remaining > 0) {
-    const auto lhs_addr = rsi;
+    const auto lhs_addr = rsi + src_base;
     const auto rhs_addr = rdi;
     std::uint64_t lhs = 0;
     if (!ctx.memory.read(lhs_addr, &lhs, width)) {
       ctx.state.gpr[6] = rsi;
       ctx.state.gpr[7] = rdi;
       if (rep) ctx.state.gpr[1] = remaining;
-      return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, lhs_addr, 0}, ctx.instr.code()};
+      return detail::memory_fault(ctx, lhs_addr);
     }
     std::uint64_t rhs = 0;
     if (!ctx.memory.read(rhs_addr, &rhs, width)) {
       ctx.state.gpr[6] = rsi;
       ctx.state.gpr[7] = rdi;
       if (rep) ctx.state.gpr[1] = remaining;
-      return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, rhs_addr, 0}, ctx.instr.code()};
+      return detail::memory_fault(ctx, rhs_addr);
     }
     lhs &= width_mask(width);
     rhs &= width_mask(width);
@@ -54,6 +69,8 @@ ExecutionResult cmps_impl(ExecutionContext& ctx, std::size_t width) {
       rsi += width;
       rdi += width;
     }
+    rsi &= addr_mask;
+    rdi &= addr_mask;
     --remaining;
 
     bool continue_loop = false;
@@ -66,6 +83,16 @@ ExecutionResult cmps_impl(ExecutionContext& ctx, std::size_t width) {
       ctx.state.gpr[6] = rsi;
       ctx.state.gpr[7] = rdi;
       if (rep) ctx.state.gpr[1] = remaining;
+      return {};
+    }
+
+    ++iterations_done;
+    if (continue_loop && iterations_done >= rep_iterations_per_call(ctx)) {
+      ctx.state.gpr[6] = rsi;
+      ctx.state.gpr[7] = rdi;
+      ctx.state.gpr[1] = remaining;
+      ctx.push_rf_for_debug = true;
+      ctx.control_flow_taken = true;
       return {};
     }
 
@@ -83,14 +110,16 @@ ExecutionResult cmps_impl(ExecutionContext& ctx, std::size_t width) {
 ExecutionResult scas_impl(ExecutionContext& ctx, std::size_t width) {
   const bool rep = ctx.instr.has_rep_prefix() || ctx.instr.has_repne_prefix();
   const bool repne = ctx.instr.has_repne_prefix();
-  std::uint64_t remaining = rep ? ctx.state.gpr[1] : 1ull;
+  const auto addr_mask = detail::string_address_mask(ctx.instr);
+  std::uint64_t remaining = rep ? (ctx.state.gpr[1] & addr_mask) : 1ull;
   if (remaining == 0) {
     return {};
   }
 
   const bool df = (ctx.state.rflags & kFlagDF) != 0;
-  std::uint64_t rdi = ctx.state.gpr[7];
+  std::uint64_t rdi = ctx.state.gpr[7] & addr_mask;
   const auto lhs = detail::read_register(ctx.state, iced_x86::Register::RAX) & width_mask(width);
+  std::uint64_t iterations_done = 0;
 
   while (remaining > 0) {
     const auto rhs_addr = rdi;
@@ -98,7 +127,7 @@ ExecutionResult scas_impl(ExecutionContext& ctx, std::size_t width) {
     if (!ctx.memory.read(rhs_addr, &rhs, width)) {
       ctx.state.gpr[7] = rdi;
       if (rep) ctx.state.gpr[1] = remaining;
-      return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, rhs_addr, 0}, ctx.instr.code()};
+      return detail::memory_fault(ctx, rhs_addr);
     }
     rhs &= width_mask(width);
     const auto result = detail::truncate(lhs - rhs, width);
@@ -110,6 +139,7 @@ ExecutionResult scas_impl(ExecutionContext& ctx, std::size_t width) {
     } else {
       rdi += width;
     }
+    rdi &= addr_mask;
     --remaining;
 
     bool continue_loop = false;
@@ -121,6 +151,15 @@ ExecutionResult scas_impl(ExecutionContext& ctx, std::size_t width) {
     if (detail::note_debug_break(ctx, hit_bits, continue_loop)) {
       ctx.state.gpr[7] = rdi;
       if (rep) ctx.state.gpr[1] = remaining;
+      return {};
+    }
+
+    ++iterations_done;
+    if (continue_loop && iterations_done >= rep_iterations_per_call(ctx)) {
+      ctx.state.gpr[7] = rdi;
+      ctx.state.gpr[1] = remaining;
+      ctx.push_rf_for_debug = true;
+      ctx.control_flow_taken = true;
       return {};
     }
 
@@ -136,21 +175,23 @@ ExecutionResult scas_impl(ExecutionContext& ctx, std::size_t width) {
 
 ExecutionResult stos_impl(ExecutionContext& ctx, std::size_t width) {
   const bool rep = ctx.instr.has_rep_prefix() || ctx.instr.has_repne_prefix();
-  std::uint64_t remaining = rep ? ctx.state.gpr[1] : 1ull;
+  const auto addr_mask = detail::string_address_mask(ctx.instr);
+  std::uint64_t remaining = rep ? (ctx.state.gpr[1] & addr_mask) : 1ull;
   if (remaining == 0) {
     return {};
   }
 
   const bool df = (ctx.state.rflags & kFlagDF) != 0;
-  std::uint64_t rdi = ctx.state.gpr[7];
+  std::uint64_t rdi = ctx.state.gpr[7] & addr_mask;
   const auto value = detail::read_register(ctx.state, iced_x86::Register::RAX) & width_mask(width);
+  std::uint64_t iterations_done = 0;
 
   while (remaining > 0) {
     const auto write_addr = rdi;
     if (!ctx.memory.write(write_addr, &value, width)) {
       ctx.state.gpr[7] = rdi;
       if (rep) ctx.state.gpr[1] = remaining;
-      return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, write_addr, 0}, ctx.instr.code()};
+      return detail::memory_fault(ctx, write_addr);
     }
     const auto hit_bits = detail::debug_data_breakpoint_hits(ctx.state, write_addr, width, false, true);
     if (df) {
@@ -158,11 +199,21 @@ ExecutionResult stos_impl(ExecutionContext& ctx, std::size_t width) {
     } else {
       rdi += width;
     }
+    rdi &= addr_mask;
     --remaining;
 
     if (detail::note_debug_break(ctx, hit_bits, rep && remaining > 0)) {
       ctx.state.gpr[7] = rdi;
       if (rep) ctx.state.gpr[1] = remaining;
+      return {};
+    }
+
+    ++iterations_done;
+    if (rep && remaining > 0 && iterations_done >= rep_iterations_per_call(ctx)) {
+      ctx.state.gpr[7] = rdi;
+      ctx.state.gpr[1] = remaining;
+      ctx.push_rf_for_debug = true;
+      ctx.control_flow_taken = true;
       return {};
     }
 
@@ -178,21 +229,24 @@ ExecutionResult stos_impl(ExecutionContext& ctx, std::size_t width) {
 
 ExecutionResult lods_impl(ExecutionContext& ctx, std::size_t width) {
   const bool rep = ctx.instr.has_rep_prefix() || ctx.instr.has_repne_prefix();
-  std::uint64_t remaining = rep ? ctx.state.gpr[1] : 1ull;
+  const auto addr_mask = detail::string_address_mask(ctx.instr);
+  std::uint64_t remaining = rep ? (ctx.state.gpr[1] & addr_mask) : 1ull;
   if (remaining == 0) {
     return {};
   }
 
   const bool df = (ctx.state.rflags & kFlagDF) != 0;
-  std::uint64_t rsi = ctx.state.gpr[6];
+  const auto src_base = detail::string_source_segment_base(ctx.state, ctx.instr);
+  std::uint64_t rsi = ctx.state.gpr[6] & addr_mask;
+  std::uint64_t iterations_done = 0;
 
   while (remaining > 0) {
-    const auto read_addr = rsi;
+    const auto read_addr = rsi + src_base;
     std::uint64_t value = 0;
     if (!ctx.memory.read(read_addr, &value, width)) {
       ctx.state.gpr[6] = rsi;
       if (rep) ctx.state.gpr[1] = remaining;
-      return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, read_addr, 0}, ctx.instr.code()};
+      return detail::memory_fault(ctx, read_addr);
     }
     detail::write_register(ctx.state, iced_x86::Register::RAX, value, width);
     const auto hit_bits = detail::debug_data_breakpoint_hits(ctx.state, read_addr, width, true, false);
@@ -201,11 +255,21 @@ ExecutionResult lods_impl(ExecutionContext& ctx, std::size_t width) {
     } else {
       rsi += width;
     }
+    rsi &= addr_mask;
     --remaining;
 
     if (detail::note_debug_break(ctx, hit_bits, rep && remaining > 0)) {
       ctx.state.gpr[6] = rsi;
       if (rep) ctx.state.gpr[1] = remaining;
+      return {};
+    }
+
+    ++iterations_done;
+    if (rep && remaining > 0 && iterations_done >= rep_iterations_per_call(ctx)) {
+      ctx.state.gpr[6] = rsi;
+      ctx.state.gpr[1] = remaining;
+      ctx.push_rf_for_debug = true;
+      ctx.control_flow_taken = true;
       return {};
     }
 

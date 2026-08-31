@@ -71,6 +71,9 @@ void write_vec(CpuState& state, iced_x86::Register reg, big_uint value, bool zer
 
 big_uint read_mem(ExecutionContext& ctx, std::uint64_t address, std::size_t width, bool* ok) {
   std::array<std::uint8_t, kZmmBytes> bytes{};
+  // A ZMM register is the widest thing this can hold, so anything past that is a caller bug -- but
+  // the read below is sized by it, so keep it from running off the end of the buffer regardless.
+  width = std::min(width, bytes.size());
   if (!ctx.memory.read(address, bytes.data(), width)) {
     if (ok) *ok = false;
     return 0;
@@ -96,7 +99,15 @@ big_uint read_operand(ExecutionContext& ctx, std::uint32_t operand_index, std::s
   }
   if (kind == iced_x86::OpKind::MEMORY) {
     if (ctx.instr.is_broadcast()) {
-      const auto element_width = iced_x86::memory_size_ext::get_size(static_cast<iced_x86::MemorySize>(ctx.instr.memory_size()));
+      // The broadcast element size lives in the raw MemorySize. memory_size() has collapsed it to the
+      // full operand width, and running that byte count back through get_size reindexes the table on
+      // a meaningless index: 64 came back as 16, so a {1to16} dword broadcast read 16 bytes and laid
+      // down 4 lanes. The xmm forms were right by accident, and a zero would hang the lane loop.
+      const auto element_width = iced_x86::memory_size_ext::get_element_size(ctx.instr.memory_size_enum());
+      if (element_width == 0 || element_width > width) {
+        if (ok) *ok = false;
+        return 0;
+      }
       const auto element = read_mem(ctx, detail::memory_address(ctx), element_width, ok);
       if (ok && !*ok) return 0;
       big_uint out = 0;
@@ -212,6 +223,9 @@ ExecutionResult legacy_custom_binary(ExecutionContext& ctx, Fn&& fn, bool zero_u
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
+  // Legacy (non-VEX) form: real hardware requires the m128 source aligned to 16 bytes, #GP(0)
+  // otherwise -- see require_aligned_memory_operand's own doc comment.
+  if (auto fault = detail::require_aligned_memory_operand(ctx, 1, 0xFULL)) return *fault;
   bool ok = false;
   const auto dst_reg = ctx.instr.op_register(0);
   const auto lhs_bits = read_vec(ctx.state, dst_reg);
@@ -227,6 +241,9 @@ ExecutionResult legacy_binary(ExecutionContext& ctx, Fn&& fn, bool zero_upper = 
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
+  // Legacy (non-VEX) form: real hardware requires the m128 source aligned to 16 bytes, #GP(0)
+  // otherwise -- see require_aligned_memory_operand's own doc comment.
+  if (auto fault = detail::require_aligned_memory_operand(ctx, 1, 0xFULL)) return *fault;
   bool ok = false;
   const auto dst_reg = ctx.instr.op_register(0);
   const auto lhs_bits = read_vec(ctx.state, dst_reg);
@@ -270,6 +287,9 @@ ExecutionResult legacy_compare(ExecutionContext& ctx, Fn&& fn, bool zero_upper =
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
+  // Legacy (non-VEX) form: real hardware requires the m128 source aligned to 16 bytes, #GP(0)
+  // otherwise -- see require_aligned_memory_operand's own doc comment.
+  if (auto fault = detail::require_aligned_memory_operand(ctx, 1, 0xFULL)) return *fault;
   bool ok = false;
   const auto dst_reg = ctx.instr.op_register(0);
   const auto lhs_bits = read_vec(ctx.state, dst_reg);
@@ -313,6 +333,9 @@ ExecutionResult legacy_bitwise(ExecutionContext& ctx, Fn&& fn, bool zero_upper =
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
+  // Legacy (non-VEX) form: real hardware requires the m128 source aligned to 16 bytes, #GP(0)
+  // otherwise -- see require_aligned_memory_operand's own doc comment.
+  if (auto fault = detail::require_aligned_memory_operand(ctx, 1, 0xFULL)) return *fault;
   bool ok = false;
   const auto dst_reg = ctx.instr.op_register(0);
   const auto lhs = read_vec(ctx.state, dst_reg);
@@ -368,10 +391,10 @@ ExecutionResult legacy_shift_reg(ExecutionContext& ctx, Fn&& fn, bool zero_upper
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
-  // The count source (operand 1) is xmm-or-m128 for the legacy 2-operand
-  // form, not register-only -- read_operand() handles both, matching every
-  // sibling *_reg function in this file. A prior register-only check here
-  // rejected the valid memory form outright and faulted on a mapped address.
+  // The count source is xmm-or-m128 for the legacy 2-operand form, not register-only, and a prior
+  // register-only check rejected the valid memory form. Hardware also wants that m128 16-byte
+  // aligned.
+  if (auto fault = detail::require_aligned_memory_operand(ctx, 1, 0xFULL)) return *fault;
   bool ok = false;
   const auto dst_reg = ctx.instr.op_register(0);
   const auto count_bits = read_operand(ctx, 1, vector_width(dst_reg), &ok);
@@ -638,6 +661,9 @@ ExecutionResult pcmpstr(ExecutionContext& ctx, bool explicit_lengths, bool retur
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
+  // Legacy (non-VEX) form: real hardware requires the m128 source aligned to 16 bytes, #GP(0)
+  // otherwise -- see require_aligned_memory_operand's own doc comment.
+  if (auto fault = detail::require_aligned_memory_operand(ctx, 1, 0xFULL)) return *fault;
   const auto imm = static_cast<unsigned>(ctx.instr.immediate8());
   const auto elem_width = pcmp_element_width(imm);
   const auto elem_count = pcmp_element_count(imm);
@@ -904,14 +930,14 @@ KUBERA_VEX_PACKED_INT_BIT(VEX_VPAND_YMM_YMM_YMMM256, [](auto a, auto b) { return
 KUBERA_VEX_PACKED_INT_BIT(VEX_VPANDN_YMM_YMM_YMMM256, [](auto a, auto b) { return (~a) & b; })
 KUBERA_VEX_PACKED_INT_BIT(VEX_VPOR_YMM_YMM_YMMM256, [](auto a, auto b) { return a | b; })
 KUBERA_VEX_PACKED_INT_BIT(VEX_VPXOR_YMM_YMM_YMMM256, [](auto a, auto b) { return a ^ b; })
-ExecutionResult handle_code_VEX_VPSLLW_YMM_YMM_YMMM256(ExecutionContext& ctx) { return vex_shift_reg<std::uint16_t>(ctx, shift_left_lane<std::uint16_t>, true); }
-ExecutionResult handle_code_VEX_VPSLLD_YMM_YMM_YMMM256(ExecutionContext& ctx) { return vex_shift_reg<std::uint32_t>(ctx, shift_left_lane<std::uint32_t>, true); }
-ExecutionResult handle_code_VEX_VPSLLQ_YMM_YMM_YMMM256(ExecutionContext& ctx) { return vex_shift_reg<std::uint64_t>(ctx, shift_left_lane<std::uint64_t>, true); }
-ExecutionResult handle_code_VEX_VPSRLW_YMM_YMM_YMMM256(ExecutionContext& ctx) { return vex_shift_reg<std::uint16_t>(ctx, shift_right_logical_lane<std::uint16_t>, true); }
-ExecutionResult handle_code_VEX_VPSRLD_YMM_YMM_YMMM256(ExecutionContext& ctx) { return vex_shift_reg<std::uint32_t>(ctx, shift_right_logical_lane<std::uint32_t>, true); }
-ExecutionResult handle_code_VEX_VPSRLQ_YMM_YMM_YMMM256(ExecutionContext& ctx) { return vex_shift_reg<std::uint64_t>(ctx, shift_right_logical_lane<std::uint64_t>, true); }
-ExecutionResult handle_code_VEX_VPSRAW_YMM_YMM_YMMM256(ExecutionContext& ctx) { return vex_shift_reg<std::int16_t>(ctx, shift_right_arithmetic_lane<std::int16_t>, true); }
-ExecutionResult handle_code_VEX_VPSRAD_YMM_YMM_YMMM256(ExecutionContext& ctx) { return vex_shift_reg<std::int32_t>(ctx, shift_right_arithmetic_lane<std::int32_t>, true); }
+ExecutionResult handle_code_VEX_VPSLLW_YMM_YMM_XMMM128(ExecutionContext& ctx) { return vex_shift_reg<std::uint16_t>(ctx, shift_left_lane<std::uint16_t>, true); }
+ExecutionResult handle_code_VEX_VPSLLD_YMM_YMM_XMMM128(ExecutionContext& ctx) { return vex_shift_reg<std::uint32_t>(ctx, shift_left_lane<std::uint32_t>, true); }
+ExecutionResult handle_code_VEX_VPSLLQ_YMM_YMM_XMMM128(ExecutionContext& ctx) { return vex_shift_reg<std::uint64_t>(ctx, shift_left_lane<std::uint64_t>, true); }
+ExecutionResult handle_code_VEX_VPSRLW_YMM_YMM_XMMM128(ExecutionContext& ctx) { return vex_shift_reg<std::uint16_t>(ctx, shift_right_logical_lane<std::uint16_t>, true); }
+ExecutionResult handle_code_VEX_VPSRLD_YMM_YMM_XMMM128(ExecutionContext& ctx) { return vex_shift_reg<std::uint32_t>(ctx, shift_right_logical_lane<std::uint32_t>, true); }
+ExecutionResult handle_code_VEX_VPSRLQ_YMM_YMM_XMMM128(ExecutionContext& ctx) { return vex_shift_reg<std::uint64_t>(ctx, shift_right_logical_lane<std::uint64_t>, true); }
+ExecutionResult handle_code_VEX_VPSRAW_YMM_YMM_XMMM128(ExecutionContext& ctx) { return vex_shift_reg<std::int16_t>(ctx, shift_right_arithmetic_lane<std::int16_t>, true); }
+ExecutionResult handle_code_VEX_VPSRAD_YMM_YMM_XMMM128(ExecutionContext& ctx) { return vex_shift_reg<std::int32_t>(ctx, shift_right_arithmetic_lane<std::int32_t>, true); }
 ExecutionResult handle_code_VEX_VPSLLW_YMM_YMM_IMM8(ExecutionContext& ctx) { return vex_shift_imm<std::uint16_t>(ctx, shift_left_lane<std::uint16_t>, true); }
 ExecutionResult handle_code_VEX_VPSLLD_YMM_YMM_IMM8(ExecutionContext& ctx) { return vex_shift_imm<std::uint32_t>(ctx, shift_left_lane<std::uint32_t>, true); }
 ExecutionResult handle_code_VEX_VPSLLQ_YMM_YMM_IMM8(ExecutionContext& ctx) { return vex_shift_imm<std::uint64_t>(ctx, shift_left_lane<std::uint64_t>, true); }

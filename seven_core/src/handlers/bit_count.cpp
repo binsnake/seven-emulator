@@ -1,5 +1,6 @@
 #include "seven/handler_helpers.hpp"
 
+#include <algorithm>
 #include <bit>
 
 namespace seven::handlers {
@@ -14,11 +15,8 @@ ExecutionResult read_rm64(ExecutionContext& ctx, std::uint64_t& value) {
 
 void clear_count_flags(CpuState& state);
 
-// 16/32-bit forms of POPCNT/TZCNT/LZCNT — the counting must happen at the
-// actual operand width (std::countl_zero of a 32-bit value differs from a
-// 64-bit value holding the same bits, since it counts leading zeros
-// relative to the type's own width) rather than reusing the 64-bit path on
-// a masked value.
+// The 16/32-bit forms must count at the real operand width: std::countl_zero counts relative to the
+// type's own width, so the 64-bit path on a masked value gives a different answer.
 template <typename T>
 ExecutionResult popcnt_narrow(ExecutionContext& ctx, std::size_t width) {
   std::uint64_t value = 0;
@@ -111,6 +109,9 @@ iced_x86::Register crc32_dest_register(iced_x86::Register reg, std::size_t width
 
 std::uint32_t crc32c_update(std::uint32_t crc, std::uint64_t value, std::size_t width) {
   constexpr std::uint32_t kPoly = 0x82F63B78u;
+  // Same clamp read_operand applies: a width past 8 is a caller bug either way, but here it shifts a
+  // uint64_t by 64 or more, which is undefined rather than merely wrong.
+  width = std::min(width, sizeof(value));
   for (std::size_t i = 0; i < width; ++i) {
     crc ^= static_cast<std::uint8_t>((value >> (i * 8)) & 0xFFu);
     for (unsigned bit = 0; bit < 8; ++bit) {

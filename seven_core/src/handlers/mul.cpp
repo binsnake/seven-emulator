@@ -6,7 +6,7 @@ ExecutionResult handle_code_MUL_RM8(ExecutionContext& ctx) {
   bool rhs_ok = false;
   const auto rhs = detail::read_operand(ctx, 0, 1, &rhs_ok);
   if (!rhs_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto lhs = detail::read_register(ctx.state, iced_x86::Register::AL);
   const auto product = lhs * rhs;
@@ -21,7 +21,7 @@ ExecutionResult handle_code_MUL_RM16(ExecutionContext& ctx) {
   bool rhs_ok = false;
   const auto rhs = detail::read_operand(ctx, 0, 2, &rhs_ok);
   if (!rhs_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto lhs = detail::read_register(ctx.state, iced_x86::Register::AX);
   const auto product = lhs * rhs;
@@ -36,7 +36,7 @@ ExecutionResult handle_code_MUL_RM32(ExecutionContext& ctx) {
   bool rhs_ok = false;
   const auto rhs = detail::read_operand(ctx, 0, 4, &rhs_ok);
   if (!rhs_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto lhs = detail::read_register(ctx.state, iced_x86::Register::EAX);
   const std::uint64_t product = lhs * rhs;
@@ -51,7 +51,7 @@ ExecutionResult handle_code_MUL_RM64(ExecutionContext& ctx) {
   bool rhs_ok = false;
   const auto rhs = detail::read_operand(ctx, 0, 8, &rhs_ok);
   if (!rhs_ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto lhs = detail::read_register(ctx.state, iced_x86::Register::RAX);
   const math::wide_integer::uint128_t product =

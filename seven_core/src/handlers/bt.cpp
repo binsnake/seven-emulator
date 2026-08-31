@@ -13,18 +13,16 @@ ExecutionResult read_bt_base_value(ExecutionContext& ctx, std::size_t width, std
                                    std::uint64_t& bit_out) {
   const auto bit_span = 8ull * width;
   if (ctx.instr.op0_kind() == iced_x86::OpKind::MEMORY) {
-    // bit_index is a signed two's-complement value (the caller sign-extends
-    // register-sourced indices to the operand width; immediate-sourced ones
-    // are already small and non-negative). Intel defines the effective
-    // address as base + floor(bit_index / bit_span) elements -- an
-    // arithmetic right shift by log2(bit_span) implements that floor
-    // division exactly, including for negative indices. Unsigned truncating
-    // division here previously sent register bit-indices to wildly
-    // out-of-bounds addresses (seven-fuzzer finding).
+    // bit_index is signed, and Intel defines the address as base + floor(bit_index / bit_span), which
+    // an arithmetic right shift implements exactly including for negative indices. Unsigned truncating
+    // division sent register-sourced indices to wildly out-of-bounds addresses.
     const auto shift = static_cast<unsigned>(std::countr_zero(bit_span));
     const auto elem_index = static_cast<std::int64_t>(bit_index) >> shift;
-    const auto address = static_cast<std::uint64_t>(
-        static_cast<std::int64_t>(detail::memory_address(ctx)) + elem_index * static_cast<std::int64_t>(width));
+    // Unsigned throughout, since the signed form overflows int64 for a base near the top of the
+    // address space. The two's-complement result is identical and the range check downstream is what
+    // rejects a bad address.
+    const auto address = detail::memory_address_with_displacement(
+        ctx, static_cast<std::uint64_t>(elem_index) * static_cast<std::uint64_t>(width));
     bit_out = bit_index & (bit_span - 1ull);
     return detail::read_memory_checked(ctx, address, &value_out, width);
   }
@@ -32,7 +30,7 @@ ExecutionResult read_bt_base_value(ExecutionContext& ctx, std::size_t width, std
   bool ok = false;
   value_out = detail::read_operand(ctx, 0, width, &ok);
   if (!ok) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   bit_out = bit_index & (bit_span - 1ull);
   return {};

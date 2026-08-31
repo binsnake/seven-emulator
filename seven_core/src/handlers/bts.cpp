@@ -20,8 +20,10 @@ ExecutionResult bts_rmw(ExecutionContext& ctx, std::size_t width, std::uint64_t 
     // floor division (arithmetic shift), not unsigned truncating division.
     const auto shift = static_cast<unsigned>(std::countr_zero(bit_span));
     const auto elem_index = static_cast<std::int64_t>(bit_index) >> shift;
-    address = static_cast<std::uint64_t>(
-        static_cast<std::int64_t>(detail::memory_address(ctx)) + elem_index * static_cast<std::int64_t>(width));
+    // See bt.cpp: unsigned throughout, since the signed form overflows int64 near the top of the
+    // address space and that is undefined, not wraparound.
+    address = detail::memory_address_with_displacement(
+        ctx, static_cast<std::uint64_t>(elem_index) * static_cast<std::uint64_t>(width));
     bit = bit_index & (bit_span - 1ull);
     const auto rr = detail::read_memory_checked(ctx, address, &value, width);
     if (!rr.ok()) {
@@ -31,7 +33,7 @@ ExecutionResult bts_rmw(ExecutionContext& ctx, std::size_t width, std::uint64_t 
     bool lhs_ok = false;
     value = detail::read_operand(ctx, 0, width, &lhs_ok);
     if (!lhs_ok) {
-      return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+      return detail::memory_fault(ctx, detail::memory_address(ctx));
     }
     bit = bit_index & (bit_span - 1ull);
   }
@@ -45,7 +47,7 @@ ExecutionResult bts_rmw(ExecutionContext& ctx, std::size_t width, std::uint64_t 
       return wr;
     }
   } else if (!detail::write_operand(ctx, 0, value, width)) {
-    return {StopReason::page_fault, 0, ExceptionInfo{StopReason::page_fault, detail::memory_address(ctx), 0}, ctx.instr.code()};
+    return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
 
   detail::set_flag(ctx.state.rflags, kFlagCF, old_bit);
