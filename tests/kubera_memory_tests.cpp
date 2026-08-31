@@ -44,14 +44,9 @@ bool writing_faults(volatile std::byte* p) {
 }  // namespace
 #endif
 
-// Regression test for a real integer-overflow bug in Memory::find_mmio_region: address + size can
-// wrap past the top of the 64-bit address space for a guest-chosen address near ~0ull, and the
-// wrapped (small) end used to be able to pass both the mmio_min_base_/mmio_max_end_ pre-check and
-// the per-region range check despite the real address being nowhere near any registered region.
-// A false match there would have handed the MMIO callback an "offset" of address - region.base --
-// itself still a huge, effectively guest-controlled value -- which any callback that trusts the
-// framework's contract that offset always lies within [0, region.size) would use as an unchecked
-// index, a genuine guest-to-host out-of-bounds read/write.
+// Integer overflow in find_mmio_region: an address near ~0ull wraps address + size and the wrapped
+// end passes both range checks, handing the callback a huge guest-controlled offset where its
+// contract promises one inside [0, region.size).
 
 TEST(KuberaMemory, WraparoundAccessNeverFalseMatchesMmioRegion) {
   seven::Memory memory{};
@@ -112,10 +107,8 @@ TEST(KuberaMemory, NonWrappingAccessStillReachesMmioCallback) {
   EXPECT_EQ(buffer[0], 0x42u);
 }
 
-// Same overflow shape as find_mmio_region, here in access_allowed()'s hook overlap check: an
-// address near ~0ull wraps address + size back past zero and the interval test reads it as no
-// overlap. This runs before the page write, so a skipped write hook never gets to veto -- a real
-// bypass reachable purely by choosing a wraparound address.
+// Same overflow in access_allowed()'s hook overlap check. It runs before the page write, so a
+// skipped write hook never gets to veto: a real bypass from choosing a wraparound address.
 TEST(KuberaMemory, WraparoundWriteStillInvokesRangeScopedAccessHook) {
   seven::Memory memory{};
 
@@ -141,11 +134,9 @@ TEST(KuberaMemory, WraparoundWriteStillInvokesRangeScopedAccessHook) {
   EXPECT_TRUE(hook_invoked);
 }
 
-// A passthrough is the embedder's storage backend; an access hook is a policy layer over every
-// access. read()/write() used to return through the passthrough before dispatching hooks at all,
-// so an embedder that installed both got no hook calls and nothing to tell it so. For a write hook
-// that is the same shape as a skipped range check: the callback returning false is what blocks the
-// write, and it never ran.
+// A passthrough is the storage backend, an access hook the policy layer over it. read()/write()
+// returned through the passthrough before dispatching hooks, so an embedder with both got no hook
+// calls at all, and a write hook's false return is what blocks a write.
 TEST(KuberaMemory, AccessHooksStillRunWhenAPassthroughBacksMemory) {
   seven::Memory memory{};
 
@@ -195,11 +186,8 @@ TEST(KuberaMemory, AWriteOnlyPassthroughStillCountsAsOne) {
   EXPECT_FALSE(memory.has_passthrough());
 }
 
-// The other half of that comparison. The test above covers a wrapping ACCESS against a sane range;
-// this covers a sane access against a range whose own base + size runs off the top. The registered
-// end folded back down to a small number, so `event.address >= range_end` was true for every
-// address in the range the host actually asked to watch, and the hook was skipped for all of them.
-// Same consequence as above: for a write hook, skipped means the veto never runs.
+// The other half: a sane access against a range whose own base + size runs off the top. The folded
+// end made `event.address >= range_end` true for every address the host asked to watch.
 TEST(KuberaMemory, HookRangeRunningOffTheTopStillCoversItsOwnAddresses) {
   seven::Memory memory{};
   memory.map(0xFFFF'FFFF'FFFF'F000ull, 0x1000, seven::kMemoryPermissionAll);
@@ -224,12 +212,9 @@ TEST(KuberaMemory, HookRangeRunningOffTheTopStillCoversItsOwnAddresses) {
   EXPECT_EQ(read_back, 0u) << "the vetoed write reached the page anyway";
 }
 
-// map()/unmap()/reprotect() all derived their exclusive end page as
-// `(base + size + kPageSize - 1) / kPageSize`. For any range reaching the very top of the address
-// space that addition wraps, the end page comes out as 0, and the `page < last_page` loop body
-// never executes at all -- so the call silently did nothing. unmap() leaving the page mapped is a
-// leak, but reprotect() is the sharper one: a host revoking write access on that page is told
-// nothing failed while the guest keeps writing through it.
+// The exclusive end page wraps to 0 for any range reaching the top of the address space, so the
+// loop body never ran and the call silently did nothing. reprotect() is the sharp one: a host
+// revoking write access is told it succeeded while the guest keeps writing.
 TEST(KuberaMemory, TopOfAddressSpacePageIsActuallyMappedUnmappedAndReprotected) {
   constexpr std::uint64_t kTopPage = 0xFFFF'FFFF'FFFF'F000ull;
   constexpr auto kWrite = static_cast<seven::MemoryPermissionMask>(seven::MemoryPermission::write);
@@ -248,18 +233,14 @@ TEST(KuberaMemory, TopOfAddressSpacePageIsActuallyMappedUnmappedAndReprotected) 
   EXPECT_FALSE(memory.is_mapped(kTopPage, 0x1000));
 }
 
-// Memory::read/write took a single-page fast path guarded by `first_offset + size <= kPageSize`.
-// size is a full-width size_t, so that sum wraps: an access based in page 0 whose size covers the
-// rest of the address space produced a sum of exactly 2^64, which reads as 0 and sails through the
-// guard straight into a memcpy of ~2^64 bytes out of (or into) a 4096-byte page buffer.
+// The single-page fast path guarded on `first_offset + size <= kPageSize`, and size is a full-width
+// size_t, so a sum of exactly 2^64 reads as 0 and sails through into a memcpy of ~2^64 bytes.
 TEST(KuberaMemory, HugeSizeCannotWrapPastTheSinglePageFastPath) {
   seven::Memory memory{};
   memory.map(0, seven::Memory::kPageSize);
 
-  // Last byte of page 0, sized so that kBase + kSize lands exactly on 2^64. The access itself does
-  // not wrap, so a top-of-address-space check alone would let it past, but first_offset + kSize
-  // does. Basing it on the final byte keeps the correct slow path down to a single byte before it
-  // runs out of mapped pages, so the buffer below is all the destination this can legitimately use.
+  // Last byte of page 0, sized so kBase + kSize lands on exactly 2^64. The access itself does not
+  // wrap, so a top-of-address-space check would let it past, but first_offset + kSize does.
   constexpr std::uint64_t kBase = seven::Memory::kPageSize - 1;
   constexpr std::size_t kSize = static_cast<std::size_t>(~std::uint64_t{0} - kBase + 1);
 
@@ -343,12 +324,8 @@ TEST(KuberaMemory, RestoringMmioRegionsBlocksTheJitFastPathAgain) {
   EXPECT_TRUE(restored.jit_fast_path_blocked);
 }
 
-// access_allowed assigned dispatching_access_hooks_ = true/false rather than saving and restoring
-// it, and flushed the pending add/remove queue at every nesting level. A hook callback that reads
-// guest memory re-enters access_allowed, and the nested call cleared the flag on its way out --
-// so a later hook in the OUTER loop calling remove_access_hook took the immediate branch and
-// erased from access_hooks_ while the outer range-for was still walking it, leaving the loop
-// calling through freed std::function storage.
+// access_allowed assigned the dispatching flag rather than restoring it, so a hook reading guest
+// memory re-entered and cleared it, letting a later remove erase from the vector being walked.
 TEST(KuberaMemory, NestedAccessHookDispatchDoesNotInvalidateTheOuterLoop) {
   seven::Memory memory{};
   memory.map(0x1000, seven::Memory::kPageSize);
@@ -393,10 +370,8 @@ TEST(KuberaMemory, NestedAccessHookDispatchDoesNotInvalidateTheOuterLoop) {
   });
   ASSERT_NE(to_remove, 0u);
 
-  // Fourth hook is what the outer loop walks into after the removed one, and is what actually
-  // distinguishes a deferred erase from an in-place one: erasing the third element while the
-  // range-for sits on the second shifts this one down into the slot the loop has already passed,
-  // so it never runs at all.
+  // The fourth hook is what distinguishes a deferred erase from an in-place one: erasing the third
+  // shifts this one into a slot the loop has already passed, so it never runs.
   int after_removed_calls = 0;
   const auto after_removed = memory.add_access_hook([&](const seven::MemoryAccessEvent& event) {
     if (event.kind == seven::MemoryAccessKind::data_read) {
@@ -422,11 +397,9 @@ TEST(KuberaMemory, NestedAccessHookDispatchDoesNotInvalidateTheOuterLoop) {
   EXPECT_TRUE(memory.remove_access_hook(after_removed));
 }
 
-// remove_access_hook returns true from inside a dispatch -- it has removed the hook as far as its
-// caller is concerned, and that caller is free to immediately destroy whatever the hook captured.
-// The erase itself has to wait (access_allowed is walking access_hooks_), but the dispatch used to
-// carry on calling the removed hook for the rest of that same access, which is a call into an
-// object its owner was just told it could drop.
+// remove_access_hook returns true from inside a dispatch, so its caller is free to destroy whatever
+// the hook captured. The erase has to wait, but the dispatch kept calling the removed hook for the
+// rest of that access: a call into an object its owner was just told it could drop.
 TEST(KuberaMemory, AHookRemovedMidDispatchStopsFiringForTheRestOfThatAccess) {
   seven::Memory memory{};
   memory.map(0x1000, seven::Memory::kPageSize);
@@ -454,11 +427,9 @@ TEST(KuberaMemory, AHookRemovedMidDispatchStopsFiringForTheRestOfThatAccess) {
   EXPECT_EQ(victim_calls, 0) << "remove_access_hook said it was gone, so it must not be called again";
 }
 
-// An instruction fetch is only allowed to fault on bytes the instruction actually needs. seven used
-// to ask for a full 15 bytes every time, so a one-byte instruction in the last stretch of a page
-// faulted whenever the following page was unmapped or non-executable -- the ordinary layout of the
-// last instruction before a guard page. It also gave the guest a way to map out what the host had
-// placed around it without ever issuing an access to those addresses.
+// A fetch may only fault on bytes the instruction needs, and seven asked for a full 15 every time,
+// so a one-byte instruction before a guard page faulted. It also let a guest map out its
+// surroundings without ever issuing an access to them.
 
 TEST(KuberaMemory, ShortInstructionAtAPageBoundaryDoesNotFetchIntoTheNextPage) {
   seven::CpuState state{};
@@ -530,10 +501,8 @@ TEST(KuberaMemory, InstructionWhoseModrmStraddlesAnUnmappedPageStillFaults) {
   EXPECT_EQ(result.exception->address, 0x2000u) << "the fault belongs to the page it ran into";
 }
 
-// CpuState::msr is an unordered_map keyed on the 32-bit MSR index, and WRMSR used to insert
-// unconditionally. A CPL0 guest walking ECX through a wrmsr loop therefore made the host allocate
-// one node per index -- around 200 GB before the counter wraps, with no cooperative-cancellation
-// path able to interrupt it. Real hardware implements a few hundred MSRs and faults on the rest.
+// CpuState::msr is an unordered_map and WRMSR inserted unconditionally, so a guest walking ECX
+// through a wrmsr loop allocated one node per index, about 200 GB, uninterruptibly.
 
 TEST(KuberaMemory, WrmsrCannotGrowTheMsrMapWithoutBound) {
   seven::CpuState state{};
@@ -615,12 +584,9 @@ TEST(KuberaMemory, CopyAssignmentAlsoDropsTheInheritedCaches) {
   EXPECT_EQ(original_value, before);
 }
 
-// Moving a Memory relocates the map but not its PageEntry nodes, so the destination correctly
-// inherits a jit_tlb that still points at the right storage. The moved-from source is the hazard: a
-// defaulted move leaves its jit_tlb warm too, now naming storage that belongs to the destination,
-// and the JIT fast path reads jit_tlb directly without the reconciliation lookup_page does. A
-// compiled block run against the moved-from Memory would then read and write straight into the
-// destination's pages. The source must come out of a move with its fast path cleared.
+// A move relocates the map but not its nodes, so the destination's inherited jit_tlb is correct.
+// The moved-from source is the hazard: its jit_tlb stays warm naming the destination's storage, and
+// the JIT fast path reads it directly with none of lookup_page's reconciliation.
 TEST(KuberaMemory, AMovedFromMemoryKeepsNoFastPathIntoItsDestination) {
   seven::Memory source{};
   source.map(0x1000, 0x1000);
@@ -647,10 +613,8 @@ TEST(KuberaMemory, AMovedFromMemoryKeepsNoFastPathIntoItsDestination) {
   EXPECT_EQ(value, seed);
 }
 
-// Executor's decode and code-page caches are validated on (rip, code_epoch, mode), and code_epoch
-// is a per-Memory counter that every Memory starts near zero. Reusing one Executor across two of
-// them -- separate guests, or one guest torn down and rebuilt -- meant the second could hit a
-// cached decode belonging to the first and execute its bytes at that address.
+// The decode and code-page caches validate on (rip, code_epoch, mode), and code_epoch is per-Memory
+// starting near zero, so an Executor reused across two could run the first one's bytes.
 
 TEST(KuberaMemory, ReusingAnExecutorAcrossTwoMemoriesDoesNotReuseTheirDecodes) {
   seven::Executor executor{};
@@ -698,10 +662,8 @@ TEST(KuberaMemory, PassthroughNeverSeesAWrappingRangeInEitherDirection) {
   EXPECT_TRUE(saw_write);
 }
 
-// Every hook dispatch in Executor sets a flag so that add/remove/clear called from inside a callback
-// queue themselves instead of mutating the container being walked -- every dispatch except the two
-// execution-hook loops, which ran unguarded. A hook that removed itself, which is exactly what a
-// one-shot breakpoint does, therefore erased from the vector the range-for was iterating.
+// Every hook dispatch guards against mutation from inside a callback except the two execution-hook
+// loops, so a self-removing hook (a one-shot breakpoint) erased from the vector being walked.
 
 TEST(KuberaMemory, AnExecutionHookMayRemoveHooksFromInsideItsOwnCallback) {
   seven::CpuState state{};
@@ -770,11 +732,9 @@ TEST(KuberaMemory, AnExecutionHookMayAddAHookFromInsideItsOwnCallback) {
   EXPECT_EQ(added_calls, 1);
 }
 
-// step_impl decodes into a direct-mapped slot picked by (rip >> 1) & 8191 and then holds a
-// reference to that slot's instruction across every hook dispatch and the handler call itself. A
-// hook is allowed to re-enter the executor, and a nested step at any rip 0x4000 away lands on the
-// same slot and overwrites it. The outer frame then runs the handler it already picked from the
-// original opcode against whatever operands the nested instruction decoded to.
+// step_impl holds a reference to a direct-mapped decode slot across every hook dispatch and the
+// handler call. A nested step 0x4000 away lands on the same slot, so the outer frame runs the
+// handler it picked from the original opcode against the nested instruction's operands.
 
 TEST(KuberaMemory, AReentrantHookCannotSwapTheInstructionUnderTheOuterHandler) {
   seven::CpuState state{};
@@ -815,10 +775,8 @@ TEST(KuberaMemory, AReentrantHookCannotSwapTheInstructionUnderTheOuterHandler) {
   EXPECT_EQ(state.gpr[1], 100u) << "the nested instruction's operands must not leak into it";
 }
 
-// A passthrough embedder replaces Memory's page table wholesale, so nothing stamps a PageEntry and
-// page_code_epoch() read back 0 for every page forever. Neither the decode cache nor a compiled
-// block ever went stale, and self-modifying code through a passthrough kept running the bytes it
-// was first decoded from.
+// A passthrough replaces the page table wholesale, so nothing stamps a PageEntry and every page
+// reported epoch 0 forever. Self-modifying code kept running the bytes it was first decoded from.
 
 TEST(KuberaMemory, SelfModifyingCodeThroughAPassthroughInvalidatesTheDecodeCache) {
   std::array<std::uint8_t, 0x1000> backing{};
@@ -857,10 +815,8 @@ TEST(KuberaMemory, SelfModifyingCodeThroughAPassthroughInvalidatesTheDecodeCache
   EXPECT_EQ(state.gpr[0], 10u) << "the rewritten sub rax, rcx has to be what ran";
 }
 
-// page_code_epoch() gated on passthrough_read_ alone. A write-only passthrough is a legitimate
-// configuration (reads stay page-backed), and its writes bump only the global counter, never a
-// PageEntry -- so every page reported its stale per-entry epoch and a write through the passthrough
-// never looked like it changed anything.
+// page_code_epoch() gated on passthrough_read_ alone, but a write-only passthrough is legitimate and
+// its writes bump only the global counter, so a page kept reporting its stale per-entry epoch.
 TEST(KuberaMemory, AWriteOnlyPassthroughWriteMovesThePageEpoch) {
   seven::Memory memory{};
   memory.map(0x1000, 0x1000);
@@ -908,10 +864,8 @@ TEST(KuberaMemory, SelfModifyingCodeThroughAWriteOnlyPassthroughInvalidatesTheDe
   EXPECT_EQ(state.gpr[0], 10u) << "the rewritten sub rax, rcx has to be what ran";
 }
 
-// jit_bypass_eligible answers "is it safe for a codegen layer to run a span without going through
-// step() at all". It listed hooks, the trap flag and DR7, but not the context-sync callbacks --
-// which are per-instruction machinery in exactly the same sense, just not stored as hooks. A
-// bypassing consumer skipped them entirely, so a live-context bridge silently stopped mirroring.
+// jit_bypass_eligible listed hooks, the trap flag and DR7 but not the context-sync callbacks, which
+// are per-instruction machinery too, so a bypassing consumer silently stopped mirroring.
 
 TEST(KuberaMemory, ContextSyncCallbacksBlockTheCodegenBypass) {
   seven::CpuState state{};
@@ -1280,11 +1234,9 @@ TEST(KuberaMemory, StringSourceOperandHonoursASegmentOverride) {
   EXPECT_EQ(state.gpr[6], 0x1238u) << "rsi steps by the operand size, not the linear address";
 }
 
-// An access hook is free to call back into step(), and each level of that costs a host stack frame
-// plus a nested decode-scratch slot that is never released. A hook that re-enters unconditionally
-// therefore took the host process down by stack exhaustion, with no error anyone could act on.
-// The guest cannot reach this on its own -- only an embedder can install the hook -- but "the
-// embedder wrote a silly hook" should be a stop, not a crash.
+// Each level of a hook re-entering step() costs a host stack frame and a decode-scratch slot that is
+// never released, so one that re-enters unconditionally exhausted the host stack. Only an embedder
+// can reach it, but a silly hook should be a stop, not a crash.
 TEST(KuberaMemory, AnAccessHookThatReentersForeverStopsInsteadOfExhaustingTheStack) {
   constexpr std::uint64_t kBase = 0x1000;
   constexpr std::uint64_t kData = 0x4000;
@@ -1328,12 +1280,9 @@ TEST(KuberaMemory, AnAccessHookThatReentersForeverStopsInsteadOfExhaustingTheSta
       << "the re-entry ran deeper than the step-depth cap should ever allow";
 }
 
-// The cap above counts levels, but what has to actually fit on the host stack is bytes: one full
-// re-entry cycle (step -> step_impl -> handler -> Memory::read -> hook) times the cap. Nothing
-// checks that product, so the cap only stops a crash if the per-level cost stays small. It does not
-// on every build -- an AddressSanitizer build, which pads every local with redzones and stops
-// reusing slots between scopes, blows a default 1 MiB stack partway through the cap. This pins the
-// per-level cost to a measured number so a frame that grows quietly gets caught here first.
+// The cap counts levels, but what must fit is bytes: one re-entry cycle times the cap, a product
+// nothing checks. An ASan build, which pads every local, blows a 1 MiB stack partway through it.
+// This pins the per-level cost so a frame that grows quietly gets caught here.
 TEST(KuberaMemory, ReentrantStepCostsABoundedNumberOfStackBytesPerLevel) {
   constexpr std::uint64_t kBase = 0x1000;
   constexpr std::uint64_t kData = 0x4000;
@@ -1376,10 +1325,8 @@ TEST(KuberaMemory, ReentrantStepCostsABoundedNumberOfStackBytesPerLevel) {
   }
   ASSERT_GT(worst_level, 0) << "probes did not descend, so this measured nothing";
 
-  // What the guard promises: the whole re-entry descends no further than the byte budget, plus the
-  // single frame that was already entered when the check for it ran. Asserting the measured total
-  // rather than a projection from the level cap is the point -- the level cap on its own permitted
-  // roughly 950 KB here, which is what made a 1 MiB stack a coin toss.
+  // The whole descent stays inside the byte budget plus the frame already entered when the check
+  // ran. The level cap alone permitted about 950 KB, which made a 1 MiB stack a coin toss.
   const auto total = static_cast<std::size_t>(marks.front() - marks.back());
   const auto allowed = seven::Executor::kMaxStepStackBytes + static_cast<std::size_t>(worst_level);
   EXPECT_LE(total, allowed)

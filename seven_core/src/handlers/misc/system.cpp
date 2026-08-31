@@ -5,10 +5,8 @@ namespace seven::handlers {
 
 namespace {
 
-// CLI/STI are only unconditionally allowed at CPL0 -- at CPL>0 real hardware requires CPL <= IOPL
-// (rflags bits 12-13) and #GP(0)s otherwise. seven emulates ring 3 only (see POPFQ below), where
-// IOPL is always 0, so this reduces to CPL0-only in practice, but the real CPL<=IOPL comparison is
-// what's architecturally correct rather than a hardcoded CPL0 check.
+// Hardware allows CLI/STI when CPL <= IOPL and #GP(0)s otherwise. seven emulates ring 3 only, where
+// IOPL is 0, so this reduces to CPL0-only, but the real comparison is the correct one to write.
 [[nodiscard]] bool cli_sti_allowed(const CpuState& state) {
   const auto cpl = state.sreg[1] & 0x3u;
   const auto iopl = (state.rflags >> 12) & 0x3u;
@@ -80,13 +78,9 @@ ExecutionResult handle_code_POPFQ(ExecutionContext& ctx) {
   if (!ctx.memory.read(slot, &value, 8)) {
     return detail::memory_fault(ctx, slot);
   }
-  // seven emulates ring 3 only. At CPL 3 (IOPL 0) POPFQ CANNOT modify IF/IOPL/VIF/VIP/VM and it
-  // clears RF -- it never disables interrupts. Measured on an i9-11900K: user-mode POPF always
-  // leaves IF=1 regardless of the popped value. Blindly loading IF (as before) let it go to 0,
-  // which a naive flag check would then detect. Preserve the system bits, force IF=1, clear RF.
-  // kRflagsWritableMask drops the bits that do not exist: 3, 5, 15 and everything from 22 up read
-  // back as zero on hardware whatever was written, and this is one of only two instructions that
-  // can put a guest-chosen value into them.
+  // seven emulates ring 3 only, where POPFQ cannot touch IF/IOPL/VIF/VIP/VM and clears RF. Measured
+  // on an i9-11900K, user-mode POPF always leaves IF=1 whatever was popped. kRflagsWritableMask drops
+  // the bits that do not exist, since this is one of only two instructions that can write them.
   constexpr std::uint64_t kSysBits = kFlagIF | (3ull << 12) | (1ull << 17) | (1ull << 19) | (1ull << 20);
   constexpr std::uint64_t kRF = 1ull << 16;
   ctx.state.rflags = (value & kRflagsWritableMask & ~kSysBits & ~kRF) | (ctx.state.rflags & kSysBits);

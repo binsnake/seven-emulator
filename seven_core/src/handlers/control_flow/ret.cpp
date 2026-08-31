@@ -72,11 +72,9 @@ ExecutionResult iret_width(ExecutionContext& ctx, std::size_t offset_width, std:
   ctx.state.mode = mode_for_far_width(offset_width);
   ctx.state.sreg[1] = static_cast<std::uint16_t>(selector);
   ctx.state.rip = mask_instruction_pointer(ctx.state, target);
-  // IRET is the one instruction that can legitimately rewrite the system bits, but only from the
-  // privilege level entitled to each: IOPL only at CPL 0, IF only at CPL <= IOPL. Below that they
-  // stay as they were, which is the same thing POPFQ above already does unconditionally. Without
-  // this, ring 3 could hand itself IOPL 3 and then CLI/STI, which cli_sti_allowed gates on exactly
-  // this comparison. VM/VIF/VIP are preserved outright -- nothing here emulates virtual-8086.
+  // IRET can rewrite the system bits, but only from the level entitled to each: IOPL at CPL 0, IF at
+  // CPL <= IOPL. Without that, ring 3 hands itself IOPL 3 and then CLI/STI, which cli_sti_allowed
+  // gates on the same comparison. VM/VIF/VIP are preserved outright.
   std::uint64_t protected_bits = (1ull << 17) | (1ull << 19) | (1ull << 20);
   if (cpl != 0) {
     protected_bits |= 3ull << 12;

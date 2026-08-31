@@ -13,14 +13,9 @@
 #include "seven/flag_liveness.hpp"
 #include "seven/handler_helpers.hpp"
 
-// Regression tests for the flag-liveness masking soundness fix: masking a flag write because a
-// later instruction in the same lifted block "covers" it is only safe if that later instruction
-// is GUARANTEED to actually run before anything external can observe rflags. These tests target
-// the two runtime conditions (beyond the caller simply not continuing, which
-// KuberaScalar.ImulAndMulFlagSemantics / IncAndShiftEdgeCases already cover for a bare step()
-// call) that can interrupt a block mid-way even when driven through Executor::run(): a fault on
-// a later instruction, and the single-step trap flag. See Flag Liveness Execution Model
-// Problem.md.
+// Masking a flag write because a later instruction covers it is only safe if that instruction is
+// guaranteed to run first. These target the two things that can interrupt a block mid-way even
+// under run(): a fault on a later instruction, and the single-step trap flag.
 
 namespace {
 
@@ -61,11 +56,9 @@ TEST(KuberaLiveness, MaskedWriteSurvivesMidBlockFaultViaRun) {
   state.rip = kBase;
   state.gpr[4] = kStackTop;
   memory.map(0x4000, 0x2000);
-  // add rax, rbx (register-only, unconditional all-flags write) ; add [rdx], rcx (memory
-  // operand -- can page-fault). Without the can_fault liveness barrier, the first add's flags
-  // would be masked as "covered" by the second -- but the second never completes its write
-  // because it faults reading [rdx]. rax/rbx chosen so CF and ZF are unambiguous (unsigned
-  // wraparound to zero).
+  // add rax, rbx ; add [rdx], rcx. Without the can_fault barrier the first add's flags are masked
+  // as covered by the second, which never completes because it faults. rax/rbx wrap to zero so CF
+  // and ZF are unambiguous.
   write_bytes(memory, kBase, {0x48, 0x01, 0xD8, 0x48, 0x01, 0x0A});
   state.gpr[0] = 0xFFFFFFFFFFFFFFFFull;  // rax
   state.gpr[3] = 1ull;                   // rbx
@@ -92,13 +85,9 @@ TEST(KuberaLiveness, TrapFlagDisablesMaskingViaRun) {
   memory.map(kIdtBase, 0x1000);
   memory.map(kDbHandler, 0x1000);
   memory.map(0x4000, 0x2000);
-  // add rax, rbx ; add rcx, rdx -- both register-only, unconditional all-flags writes. The
-  // second would "cover" the first's write under plain liveness (no fault risk here), but TF
-  // means the CPU model must stop after exactly the first instruction, same as single-stepping
-  // -- the cover never runs before the debug interrupt fires and exposes rflags. The debug
-  // handler halts (rather than iretq-ing back) so execution stops cleanly right after the first
-  // instruction's interrupt instead of resuming into the second add (and then TF-trapping again,
-  // and so on) -- this test only needs to observe the state at that first stop.
+  // add rax, rbx ; add rcx, rdx. The second would cover the first under plain liveness, but TF
+  // stops after the first, so the cover never runs before the debug interrupt exposes rflags. The
+  // handler halts rather than iretq-ing back, so execution stops at that first trap.
   write_bytes(memory, kBase, {0x48, 0x01, 0xD8, 0x48, 0x01, 0xD1});
   const std::uint8_t hlt[] = {0xF4};
   (void)memory.write(kDbHandler, hlt, sizeof(hlt));
@@ -119,12 +108,9 @@ TEST(KuberaLiveness, TrapFlagDisablesMaskingViaRun) {
 }
 
 TEST(KuberaLiveness, MaskedWriteSurvivesMovCrUdFaultViaRun) {
-  // Same shape as MaskedWriteSurvivesMidBlockFaultViaRun, but the faulting second instruction is
-  // MOV r32, CR1 rather than a memory operand -- MOV to/from a control or debug register has two
-  // REGISTER-kind operands, so can_fault()'s operand-kind loop can't see it, and it needs its own
-  // explicit case (added alongside CALL/RET/PUSH/POP) or this add's flags would be wrongly masked
-  // as "covered" by an instruction that never actually completes. CR1 is architecturally reserved
-  // (real hardware only defines CR0/CR2/CR3/CR4/CR8), so this UDs before ever touching rax.
+  // Same shape, but the faulting instruction is MOV r32, CR1: two REGISTER-kind operands, so
+  // can_fault()'s operand loop cannot see it and it needs its own case. CR1 is reserved, so this
+  // UDs before touching rax.
   seven::CpuState state{};
   seven::Memory memory{};
   seven::Executor executor{};
@@ -143,10 +129,8 @@ TEST(KuberaLiveness, MaskedWriteSurvivesMovCrUdFaultViaRun) {
 }
 
 TEST(KuberaLiveness, MaskedWriteSurvivesWrmsrGpFaultViaRun) {
-  // Same shape as MaskedWriteSurvivesMovCrUdFaultViaRun, but for the CPL0-only system
-  // instructions (CLTS/SWAPGS/WRMSR*/RDMSR*/XSETBV) added to can_fault() alongside CR/DR --
-  // WRMSR reads its operands from fixed registers (ECX/EAX/EDX), never an OpKind::MEMORY operand,
-  // so it needs the same explicit can_fault() case. CPL 3 makes it #GP before ever writing the MSR.
+  // Same shape, for the CPL0-only system instructions. WRMSR reads fixed registers, never a memory
+  // operand, so it needs its own can_fault() case; CPL 3 makes it #GP before writing the MSR.
   seven::CpuState state{};
   seven::Memory memory{};
   seven::Executor executor{};
@@ -187,11 +171,9 @@ TEST(KuberaLiveness, MaskedWriteSurvivesCliGpFaultViaRun) {
   EXPECT_NE(state.rflags & seven::kFlagZF, 0u);
 }
 
-// INVD, WBINVD and HLT were the last three CPL0-only instructions with no privilege check. Their
-// bodies did nothing observable so it read as a fidelity gap, but the fuzzer's hardware oracle
-// disagrees loudly once its lanes run at the ring 3 they actually execute at: 159 divergences in
-// 20k iterations, all three of these. Same can_fault() requirement as the rest, since none of them
-// has a memory operand to be recognized by.
+// The last three CPL0-only instructions with no privilege check. Their bodies do nothing, so it
+// read as a fidelity gap until the hardware oracle ran its lanes at ring 3: 159 divergences in 20k
+// iterations, all three. Same can_fault() requirement, since none has a memory operand.
 TEST(KuberaLiveness, MaskedWriteSurvivesInvdGpFaultViaRun) {
   const std::vector<std::pair<std::vector<std::uint8_t>, const char*>> cases = {
       {{0x0F, 0x08}, "invd"},
@@ -236,12 +218,9 @@ TEST(KuberaLiveness, TheCpl0OnlyCacheInstructionsStillRunAtRing0) {
 }
 
 TEST(KuberaLiveness, JitBypassEligibleReflectsHooksAndTrapState) {
-  // jit_bypass_eligible() is a narrow public surface for an external native-codegen consumer (see
-  // seven-jit's JitExecutor) to ask "can I run my own code for a span of instructions without
-  // going through step()/step_impl() at all" -- it needs to say no for exactly the same reasons
-  // flag-liveness masking does: a hook that needs full per-instruction visibility, or a runtime
-  // condition (trap flag, active hardware breakpoint) that requires per-instruction stepping
-  // regardless of hooks.
+  // jit_bypass_eligible() lets an external codegen consumer ask whether it may run a span without
+  // going through step(). It has to say no for the same reasons masking does: a hook needing
+  // per-instruction visibility, or TF/DR7 requiring per-instruction stepping regardless.
   seven::CpuState state{};
   seven::Memory memory{};
   seven::Executor executor{};
@@ -266,12 +245,9 @@ TEST(KuberaLiveness, JitBypassEligibleReflectsHooksAndTrapState) {
   EXPECT_TRUE(executor.jit_bypass_eligible(state, memory));
 }
 
-// Cross-instruction masking rests on a branch always being the last instruction in a lifted span,
-// which the lifter enforces off flow_control(). That is a stub reporting NEXT for LOOP and JCXZ, so
-// a span could run straight through a branch and an instruction after it could cover a flag write
-// before it -- when the branch is taken the cover never runs and the guest reads a stale flag.
-//
-// jrcxz with rcx==0 jumps over the cmp, so only the add's elided write could have set ZF here.
+// Masking rests on a branch ending its lifted span, which the lifter took off flow_control(), a stub
+// reporting NEXT for LOOP and JCXZ. A span could then run through a branch and let a later
+// instruction cover a flag write that the taken branch skips.
 TEST(KuberaLiveness, TakenJrcxzIsABlockBoundarySoEarlierFlagWriteIsNotElided) {
   seven::Executor executor{};
   seven::CpuState state{};
@@ -279,10 +255,8 @@ TEST(KuberaLiveness, TakenJrcxzIsABlockBoundarySoEarlierFlagWriteIsNotElided) {
   state.mode = seven::ExecutionMode::long64;
   state.rip = kBase;
   memory.map(kBase, 0x1000);
-  //   add eax, ebx     <- writes ZF (0 + 0 == 0, so ZF must end up SET)
-  //   jrcxz +2         <- taken (rcx == 0), jumps to the hlt
-  //   cmp ecx, edx     <- the "cover"; skipped entirely by the taken branch
-  //   hlt              <- stops run() before anything else can touch flags
+  // add sets ZF, the taken jrcxz jumps over the cmp that was supposed to cover it, hlt stops run()
+  // before anything else touches flags.
   write_bytes(memory, kBase, seven::parse_hex_bytes("01 D8 E3 02 39 D1 F4"));
   state.gpr[0] = 0;   // rax
   state.gpr[3] = 0;   // rbx
@@ -298,21 +272,14 @@ TEST(KuberaLiveness, TakenJrcxzIsABlockBoundarySoEarlierFlagWriteIsNotElided) {
       << "add's ZF write was elided by a cmp that the taken jrcxz skipped over";
 }
 
-// can_fault() decides two separate things: whether flag liveness must stay conservative across an
-// instruction, and (in seven-jit) whether the JIT's callout bridge may inline it. Its operand loop
-// tests for OpKind::MEMORY, but iced gives the string instructions their own operand kinds --
-// MEMORY_SEG_RSI / MEMORY_ESRDI and the 16/32-bit variants, all distinct enum values from MEMORY --
-// so MOVS/CMPS/SCAS/STOS/LODS fell through to the explicit switch, which never listed them, and
-// can_fault() reported false for instructions whose whole purpose is touching guest memory. Exactly
-// the implicit-memory-access gap the CALL/RET and PUSH/POP entries in that switch already exist to
-// close.
+// can_fault() gates both liveness and JIT inlining, and its operand loop tested OpKind::MEMORY only,
+// which the string instructions do not use, so it reported false for instructions built to touch
+// guest memory.
 TEST(KuberaLiveness, StringInstructionsAreRecognizedAsFaultCapable) {
   struct Case { const char* name; const char* bytes; };
-  // rep-prefixed and bare forms both decode to the same underlying string Code. The maskmov pair
-  // is here for the same reason: their destination is an implicit ES:[rDI] operand, so they were
-  // reported as unable to fault while writing up to 16 bytes of guest memory, which also made them
-  // eligible for the JIT's callout bridge and let a self-modifying maskmovdqu leave the rest of a
-  // compiled block running the bytes it was compiled from.
+  // rep-prefixed and bare forms share a Code. The maskmov pair is here for the same reason: an
+  // implicit ES:[rDI] destination reported as unable to fault while writing 16 bytes, which also
+  // let a self-modifying maskmovdqu leave the rest of a block running stale bytes.
   const Case cases[] = {
       {"movsb", "A4"},   {"movsq", "48 A5"}, {"cmpsb", "A6"},   {"cmpsq", "48 A7"},
       {"scasb", "AE"},   {"scasq", "48 AF"}, {"stosb", "AA"},   {"stosq", "48 AB"},
@@ -330,12 +297,9 @@ TEST(KuberaLiveness, StringInstructionsAreRecognizedAsFaultCapable) {
   }
 }
 
-// InstructionExtensions::encoding() used to return EncodingKind::LEGACY unconditionally, with a
-// comment admitting it was a placeholder. Executor::simd_profile_allows() gates the AVX and AVX-512
-// build profiles on it, so both of those checks were dead code: a build configured with
-// SEVEN_ENABLE_AVX512=0 still accepted EVEX instructions. The surviving vector-width check hides
-// this for ZMM/YMM operands, so the case that actually slipped through was an EVEX-encoded
-// instruction on XMM registers, which is also where the opmask semantics live.
+// encoding() used to return LEGACY unconditionally, so simd_profile_allows()'s AVX and AVX-512
+// gates were dead code and SEVEN_ENABLE_AVX512=0 still accepted EVEX. The width check hides that
+// for ZMM/YMM, so what slipped through was EVEX on XMM, where the opmask semantics live.
 TEST(KuberaLiveness, InstructionEncodingIsClassifiedNotAssumedLegacy) {
   struct Case { const char* name; const char* bytes; iced_x86::EncodingKind expected; };
   const Case cases[] = {
@@ -355,10 +319,8 @@ TEST(KuberaLiveness, InstructionEncodingIsClassifiedNotAssumedLegacy) {
   }
 }
 
-// The dead-flags mask lives in one thread_local that step_impl assigns just before it dispatches a
-// handler. A handler's memory access can land on an MMIO device, and that host callback is free to
-// call run() again; the nested frame overwrote the mask and never put it back, so every flag write
-// the outer handler still had to do was filtered through the wrong block's liveness result.
+// The dead-flags mask is one thread_local set just before dispatch. An MMIO callback is free to call
+// run() again, and the nested frame overwrote the mask without restoring it.
 TEST(KuberaLiveness, ANestedRunFromAnMmioCallbackDoesNotClobberTheOuterMask) {
   constexpr std::uint64_t kMmioBase = 0x8000;
   constexpr std::uint64_t kNestedCode = 0x2000;
@@ -407,10 +369,8 @@ TEST(KuberaLiveness, ANestedRunFromAnMmioCallbackDoesNotClobberTheOuterMask) {
       << "the nested run left its own mask installed for the rest of the outer handler";
 }
 
-// The fault-capable boost used to apply only to writes made EARLIER in the block, leaving the
-// faulting instruction's own write unprotected. That is observable: handlers commit flags before
-// the write-back, so a faulting store still updates them and the instruction meant to overwrite
-// them never runs. A fuzz lane caught it as the two engines disagreeing after the same store.
+// The fault-capable boost covered earlier writes only, not the faulting instruction's own. Handlers
+// commit flags before the write-back, so a faulting store updates them and its cover never runs.
 TEST(KuberaLiveness, AFaultCapableInstructionKeepsItsOwnFlagWrite) {
   // xor [rbp+0x26], edx then sar rdi, 1. The sar overwrites every flag the xor writes, which is
   // exactly the reasoning that used to mark the xor's write dead.
@@ -459,10 +419,8 @@ TEST(KuberaLiveness, MaskedWriteSurvivesAnUnsupportedInstructionMidBlock) {
 }
 
 
-// The invariant the test above leans on. The flags table decides who may cover an earlier write;
-// handled_codes.def decides who can actually run. Nothing ties them together, so an entry for a code
-// with no handler would drop every flag write in front of it and then never execute. dead_flags_mask
-// over [add eax,ebx ; C] is exactly what liveness would drop, so a non-zero mask means C claims a cover.
+// The flags table decides who may cover an earlier write and handled_codes.def decides who can run,
+// with nothing tying them together, so an entry with no handler drops writes and never executes.
 TEST(KuberaLiveness, KeepsEveryFlagsTableEntryExecutable) {
   const std::vector<std::vector<std::uint8_t>> prefixes = {
       {}, {0x0F}, {0x66}, {0x66, 0x0F}, {0xF2}, {0xF3}, {0xF3, 0x0F},
@@ -527,10 +485,9 @@ TEST(KuberaLiveness, KeepsEveryFlagsTableEntryExecutable) {
       << (unrunnable.empty() ? std::string{} : unrunnable[0]);
 }
 
-// The context-sync callbacks hand the host a CpuState at every instruction boundary, which is the
-// same "something external observes rflags mid-span" hazard the hook checks cover. The JIT's gate
-// accounts for them; the masking gate did not, so a covered flag write was elided out from under a
-// callback that was watching for it.
+// The context-sync callbacks hand out a CpuState at every instruction boundary, the same mid-span
+// observation hazard the hook checks cover. The JIT's gate accounted for them, the masking gate did
+// not.
 TEST(KuberaLiveness, ContextSyncCallbacksSeeFlagsAtEveryBoundary) {
   const auto flags_after_first = [&](const std::vector<std::uint8_t>& code) {
     seven::Memory memory{};
@@ -564,11 +521,9 @@ TEST(KuberaLiveness, ContextSyncCallbacksSeeFlagsAtEveryBoundary) {
       << "the callback was handed flags the covering instruction had not written yet";
 }
 
-// A rep-prefixed SCAS reads back the ZF its own compare just wrote to decide whether to keep going.
-// The flags table declares that read, but `read` is folded into the live set only after the current
-// instruction's mask is computed, so it protects the instruction before it and not itself. CMPS is
-// covered by the memory-destination test; SCAS writes AL, so nothing was covering it and the loop
-// exited on a stale ZF after one element.
+// A rep-prefixed SCAS reads back the ZF its own compare wrote. The table declares that read, but
+// `read` folds into the live set only after the current mask is computed, so it protects the
+// instruction before it, not itself -- and SCAS writes AL, so nothing else covered it.
 TEST(KuberaLiveness, RepneScasKeepsTheZeroFlagItLoopsOn) {
   constexpr std::uint64_t kProg = 0x1000;
   constexpr std::uint64_t kData = 0x2000;
@@ -595,12 +550,9 @@ TEST(KuberaLiveness, RepneScasKeepsTheZeroFlagItLoopsOn) {
   EXPECT_EQ(state.gpr[7], kData + 16) << "rdi must have walked the whole buffer";
 }
 
-// AAM is the third divide-error source after DIV and IDIV -- `aam 0` divides AL by zero -- but it
-// was the only one missing from can_fault(), so nothing forced an earlier flag write to stay live
-// across it. Its flags entry declares an unconditional CF/AF/ZF/SF/PF write, which is what lets
-// liveness mask the add below, and on the #DE path the handler returns before writing any of them.
-// Same shape as MaskedWriteSurvivesMidBlockFaultViaRun, reached through the divide-error path
-// instead of a page fault. compat32 because AAM does not decode in long mode at all.
+// `aam 0` is the third divide-error source and the only one missing from can_fault(). Its flags entry
+// declares an unconditional write, which is what masks the add below, but on the #DE path the handler
+// returns before writing any of them. compat32 because AAM does not decode in long mode.
 TEST(KuberaLiveness, MaskedWriteSurvivesAamDivideErrorViaRun) {
   seven::CpuState state{};
   seven::Memory memory{};

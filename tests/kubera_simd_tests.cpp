@@ -18,10 +18,8 @@ namespace {
 
 using namespace kubera::test;
 
-// CMake ships three SIMD profiles and Executor::simd_profile_allows refuses any encoding or vector
-// width the configured one turned off. A test written around EVEX or a 256-bit operand has a
-// different correct answer in each, so the ones that cannot hold everywhere say so rather than
-// failing two of the three builds we ship.
+// CMake ships three SIMD profiles and simd_profile_allows refuses whatever the configured one turned
+// off, so a test written around EVEX has a different correct answer in each.
 constexpr bool kProfileHasAvx512 = SEVEN_ENABLE_AVX512 != 0;
 constexpr std::size_t kProfileVectorBytes = SEVEN_MAX_VECTOR_BYTES;
 
@@ -317,11 +315,9 @@ TEST(KuberaSimd, LegacyMovupsAllowsMisalignedMemoryOperand) {
   EXPECT_EQ(result.reason, seven::StopReason::none);
 }
 
-// "The VEX form never requires alignment" is true of exception classes 2 and 4 -- ADDPS, PAND and
-// the rest of the arithmetic families -- but not of class 1, which is where the explicitly-aligned
-// moves live. VMOVAPS keeps the requirement in every encoding, scaled to the operand width, which
-// is the whole reason a compiler still picks VMOVUPS when it cannot prove alignment even though
-// the two have run at the same speed since Sandy Bridge.
+// "The VEX form never requires alignment" holds for exception classes 2 and 4, not class 1, where
+// the explicitly-aligned moves live. VMOVAPS keeps the requirement in every encoding, which is why
+// a compiler still picks VMOVUPS when it cannot prove alignment.
 TEST(KuberaSimd, VexVmovapsFaultsOnMisalignedMemoryOperand) {
   std::vector<std::uint8_t> bytes;
   const auto mem = iced_x86::MemoryOperand::with_base_displ(iced_x86::Register::RAX, 0);
@@ -368,10 +364,9 @@ TEST(KuberaSimd, LegacyMovntpsFaultsOnMisalignedMemoryOperand) {
 }
 
 TEST(KuberaSimd, VexVshufpsSelectsCorrectLanesFromBothSources) {
-  // Regression for an orphaned handler: correct, but registered without the trailing _IMM8 the real
-  // Code has, so VSHUFPS hit unsupported_instruction until it was wired into handled_codes.def.
-  // Hand-encoded because get_immediate_op_kind() is a stub, so the factory produces an IMMEDIATE32
-  // the encoder then rejects. vshufps xmm0, xmm1, xmm2, 0xE4 -- VEX.128.0F.WIG C6 /r ib.
+  // An orphaned handler: correct, but registered without the trailing _IMM8 the real Code has, so
+  // VSHUFPS stopped as unsupported_instruction. Hand-encoded because get_immediate_op_kind() is a
+  // stub and the factory produces an IMMEDIATE32 the encoder rejects.
   const auto bytes = seven::parse_hex_bytes("C5 F0 C6 C2 E4");
 
   run_single(bytes,
@@ -389,12 +384,9 @@ TEST(KuberaSimd, VexVshufpsSelectsCorrectLanesFromBothSources) {
 
 TEST(KuberaSimd, VexVpslldYmmShiftsBothLanesByXmmSourcedCount) {
   if (kProfileVectorBytes < 32) GTEST_SKIP() << "256-bit operands are off in this SIMD profile";
-  // Regression for the same class of gap, plus the operand-width mismatch that made it: the real
-  // Code enum's count operand is XMM-width (VEX_VPSLLD_YMM_YMM_XMMM128), not YMM-width as the
-  // handler's original (wrong) name implied -- the SDM specifies the variable shift count for
-  // PSLL/PSRL/PSRA always comes from the low 64 bits of a 128-bit source even for the 256-bit
-  // destination form. Also verifies both 128-bit lanes of the YMM destination get shifted
-  // independently by the same count, per AVX's per-lane semantics for this instruction.
+  // Same class of gap, plus the width mismatch behind it: the count operand is XMM-width, since the
+  // SDM takes the variable shift count from the low 64 bits of a 128-bit source even for the 256-bit
+  // destination. Also checks both lanes shift independently by that same count.
   std::vector<std::uint8_t> bytes;
   const auto instr = iced_x86::InstructionFactory::with3(
       iced_x86::Code::VEX_VPSLLD_YMM_YMM_XMMM128,
@@ -458,10 +450,8 @@ TEST(KuberaSimd, Sse42Crc32MatchesCastagnoliReference) {
 
 }  // namespace
 
-// The gate itself, asserted from whichever side the build we are in happens to be on. This is the
-// only test of simd_profile_allows that means something in all three profiles, and the only one
-// that would have caught the gate being dead code back when the encoding lookup always answered
-// LEGACY.
+// The gate itself, asserted from whichever side this build is on. The only simd_profile_allows test
+// that means something in all three profiles, and the only one that catches the gate going dead.
 TEST(KuberaSimd, TheProfileGateRefusesExactlyTheEncodingsTheBuildDisabled) {
   const auto evex_zmm = seven::parse_hex_bytes("62 F1 75 48 FE C2");  // vpaddd zmm0, zmm1, zmm2
   const auto vex_ymm = seven::parse_hex_bytes("C5 F5 DB C2");         // vpand ymm0, ymm1, ymm2
@@ -483,12 +473,9 @@ TEST(KuberaSimd, EvexBroadcastRepeatsTheElementNotTheWholeOperand) {
   if (!kProfileHasAvx512) GTEST_SKIP() << "EVEX is off in this SIMD profile";
   constexpr std::uint64_t kData = 0x4000;
 
-  // 62 F1 75 58 FE 07 -- vpaddd zmm0, zmm1, dword ptr [rdi]{1to16}. The broadcast element is the
-  // packed operand's ELEMENT size, which lives in the raw MemorySize's element_size. The handler
-  // took memory_size() (already collapsed to the full 64-byte operand width) and ran that byte
-  // count back through get_size, reindexing the table to PACKED128_UINT8 and getting 16. So it
-  // read 16 bytes of guest memory instead of 4 and repeated that block 4 times instead of
-  // broadcasting one dword across all 16 lanes.
+  // vpaddd zmm0, zmm1, dword ptr [rdi]{1to16}. The broadcast element is the ELEMENT size, but the
+  // handler ran the already-collapsed 64-byte operand width back through get_size, reindexing the
+  // table to 16. It read 16 bytes and repeated them 4 times instead of broadcasting one dword.
   run_single(seven::parse_hex_bytes("62 F1 75 58 FE 07"),
              [kData](seven::CpuState& state, seven::Memory& memory) {
                memory.map(kData, 0x1000);
@@ -554,10 +541,8 @@ TEST(KuberaSimd, PackedSqrtRequiresAnAlignedMemoryOperand) {
   EXPECT_EQ(executor.step(state, memory).reason, seven::StopReason::general_protection);
 }
 
-// x86 MIN/MAX are defined as one compare with a fixed tie-break -- (SRC1 < SRC2) ? SRC1 : SRC2 --
-// so SRC2 wins whenever the comparison is false: either operand a NaN, or both operands zero of
-// whatever sign. std::fmin/std::fmax, which every MIN/MAX handler used, return the operand that is
-// NOT a NaN and pick a zero by value, so a guest reading a NaN back out of MINPS got the wrong lane.
+// x86 MIN/MAX are one compare with a fixed tie-break, so SRC2 wins whenever it is false: a NaN
+// operand, or two signed zeros. std::fmin/fmax prefer the non-NaN and pick a zero by value.
 
 TEST(KuberaSimd, MinpsFollowsX86OperandOrderForNanAndSignedZero) {
   std::vector<std::uint8_t> bytes;
@@ -615,11 +600,9 @@ TEST(KuberaSimd, ScalarMinsdAlsoTakesSrc2WhenEitherOperandIsNan) {
              });
 }
 
-// Executor::simd_profile_allows gates the AVX and AVX-512 build profiles on
-// InstructionExtensions::encoding(). That used to return LEGACY for everything, which silently
-// turned both gates into dead code: a build configured with AVX-512 off still ran EVEX
-// instructions. It reads the generated ENC_FLAGS3 table now, and this pins that it keeps doing so,
-// because nothing else in the suite would notice it regressing to a constant.
+// simd_profile_allows gates both build profiles on encoding(), which used to return LEGACY for
+// everything, so a build with AVX-512 off still ran EVEX. It reads ENC_FLAGS3 now, and nothing else
+// in the suite would notice it regressing to a constant.
 
 TEST(KuberaSimd, EncodingKindIsReadFromTheTableNotAssumedLegacy) {
   const auto encoding_of = [](const char* hex) {
@@ -636,10 +619,9 @@ TEST(KuberaSimd, EncodingKindIsReadFromTheTableNotAssumedLegacy) {
   EXPECT_EQ(encoding_of("62 F1 7C 48 58 C1"), iced_x86::EncodingKind::EVEX) << "vaddps zmm0, zmm0, zmm1";
 }
 
-// AVX-512 writemasking is implemented in exactly one file. The EVEX moves and the EVEX pack family
-// route through shared helpers that had no notion of it, so `vmovapd zmm0{k1}, zmm1` wrote every
-// lane no matter what k1 held. Stopping cleanly is what the EVEX forms with no handler at all
-// already do, and it is a great deal better than a silently wrong register.
+// Writemasking is implemented in one file, and the EVEX moves and pack family route through shared
+// helpers with no notion of it, so `vmovapd zmm0{k1}, zmm1` wrote every lane. Stopping cleanly is
+// what the unhandled EVEX forms already do and beats a silently wrong register.
 TEST(KuberaSimd, AnEvexMoveWithAMaskRegisterStopsInsteadOfIgnoringIt) {
   seven::Executor executor{};
   seven::CpuState state{};
@@ -678,11 +660,9 @@ TEST(KuberaSimd, TheSameEvexMoveWithNoMaskStillWorks) {
   EXPECT_EQ(state.vectors[0].value, seven::SimdUint(0x1234567890ABCDEFull));
 }
 
-// The half-register moves come in a two-operand legacy form and a three-operand VEX form, and the
-// handler table gave the legacy ones the VEX shape. MOVHPS xmm1, [rbx] then read operand slot 2,
-// which the instruction does not have -- an unwritten slot reads back as (REGISTER, NONE), which
-// resolves to register index zero -- so it merged RAX into the high half and never touched the
-// memory operand at all. Not even a page fault for an unmapped address.
+// The half-register moves have a two-operand legacy form and a three-operand VEX form, and the
+// table gave the legacy ones the VEX shape. MOVHPS xmm1, [rbx] then read a slot it does not have,
+// which resolves to register zero, so it merged RAX in and never touched memory at all.
 TEST(KuberaSimd, LegacyMovhpsMergesTheMemoryOperandIntoTheHighHalf) {
   seven::Executor executor{};
   seven::CpuState state{};
@@ -739,11 +719,9 @@ TEST(KuberaSimd, VmovlpsLoadsTheLowHalf) {
   EXPECT_EQ(xmm_u64(state, 1, 1), 0x3333'3333'3333'3333ull) << "high half from the merge source";
 }
 
-// This encoding is a three-operand VMOVHPS: high half from memory, low half from the merge
-// source. The decoder used to hand it the EVEX VMOVLHPS Code -- a register-only form -- because
-// the table derives the memory-form Code by counting one on from the register form and the two
-// are not adjacent in this enum. The handler then read a register out of a slot the decoder had
-// marked as memory, which resolves to XMM0, and the memory operand went untouched.
+// A three-operand VMOVHPS, which the decoder handed the register-only VMOVLHPS Code because the
+// table derives the memory form by counting one on from the register form and the two are not
+// adjacent. The handler then read a register from a slot marked memory, resolving to XMM0.
 TEST(KuberaSimd, VmovhpsWithAMemorySourceIsNotTheRegisterOnlyForm) {
   seven::Executor executor{};
   seven::CpuState state{};
@@ -827,10 +805,8 @@ TEST(KuberaSimd, TheSameEvexUnpackWithNoMaskStillWorks) {
   EXPECT_EQ(xmm_u64(state, 0, 1), 0x1707160615051404ull);
 }
 
-// The legacy-SSE 16-byte rule reached the arithmetic, logic, shift, pack and shuffle families but
-// stopped short of three more legacy m128 forms: CMPPD, the packed double-to-integer converts, and
-// the PCMPxSTRx string compares. All three are exception class 2 or 4, so real hardware raises
-// #GP(0) on a misaligned memory operand exactly like ADDPS does.
+// The legacy-SSE 16-byte rule stopped short of CMPPD, the packed double-to-integer converts and the
+// PCMPxSTRx compares. All three are exception class 2 or 4, so hardware #GP(0)s like ADDPS does.
 TEST(KuberaSimd, PackedCompareRequiresAnAlignedMemoryOperand) {
   seven::Executor executor{};
   seven::CpuState state{};
@@ -928,11 +904,9 @@ TEST(KuberaSimd, VexNonTemporalStoreRequiresAnAlignedMemoryOperand) {
   EXPECT_EQ(executor.step(state, memory).reason, seven::StopReason::general_protection);
 }
 
-// Every EVEX form in simd_shuffle.cpp and simd_pack.cpp was written, compiled and then never
-// reachable: each carried a function name that no Code enum value matches (a spurious source
-// operand on the three duplicating moves, a missing B32/B64 broadcast suffix on the rest), so none
-// of them was ever registered and every one of these instructions stopped as
-// unsupported_instruction with a working handler sitting behind the wrong name.
+// Every EVEX form in simd_shuffle.cpp and simd_pack.cpp carried a function name no Code enum value
+// matches, so none was ever registered and each stopped as unsupported_instruction with a working
+// handler behind the wrong name.
 TEST(KuberaSimd, TheEvexShuffleAndPackFormsAreReachableAndNotJustImplemented) {
   if (!kProfileHasAvx512) GTEST_SKIP() << "EVEX is off in this SIMD profile";
 
@@ -992,10 +966,8 @@ TEST(KuberaSimd, TheEvexShuffleBroadcastReadsOneElementNotTheWholeOperand) {
   if (!kProfileHasAvx512) GTEST_SKIP() << "EVEX is off in this SIMD profile";
   constexpr std::uint64_t kData = 0x4000;
 
-  // 62 F1 6C 18 C6 8F 00 00 00 00 90 -- vshufps xmm1, xmm2, dword ptr [rdi]{1to4}, 0x90.
-  // imm 0x90 takes lhs[0], lhs[0], rhs[1], rhs[2]. Reading one dword and repeating it makes both
-  // rhs lanes the first dword; reading all sixteen bytes would take the second and third instead,
-  // which is what the four distinct values in memory are there to expose.
+  // vshufps xmm1, xmm2, dword ptr [rdi]{1to4}, 0x90, which takes rhs[1] and rhs[2]. Broadcasting one
+  // dword makes both the first; reading all sixteen bytes takes the second and third instead.
   run_single(seven::parse_hex_bytes("62 F1 6C 18 C6 8F 00 00 00 00 90"),
              [kData](seven::CpuState& state, seven::Memory& memory) {
                memory.map(kData, 0x1000);

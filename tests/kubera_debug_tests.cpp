@@ -241,10 +241,8 @@ TEST(KuberaDebug, RepMovsbExecuteBreakpointRestarts) {
 }
 
 TEST(KuberaDebug, RepMovsbYieldsAfterIterationCapAndResumesCorrectly) {
-  // A guest-controlled RCX far above the per-call iteration cap must not run the whole
-  // rep movsb inside one uninterruptible step() call -- see kMaxRepIterationsPerCall's
-  // rationale comment in movs.cpp. This proves the yield-and-resume mechanism itself,
-  // with no debug registers involved at all.
+  // A huge guest RCX must not run the whole rep movsb inside one uninterruptible step(). This is
+  // the yield-and-resume mechanism on its own, no debug registers involved.
   constexpr std::uint64_t kSrc = 0x20000;
   constexpr std::uint64_t kDst = 0x30000;
   constexpr std::uint64_t kIterationCap = 4096;
@@ -289,10 +287,8 @@ TEST(KuberaDebug, RepMovsbYieldsAfterIterationCapAndResumesCorrectly) {
 }
 
 TEST(KuberaDebug, SingleSteppingARepTrapsAfterEachIterationNotAfterTheWholeLoop) {
-  // A rep is interruptible between iterations, so a guest with TF set gets one #DB per iteration
-  // and can watch RCX/RSI/RDI count down. Running the whole loop inside a single step() and
-  // trapping once at the end is directly observable, and seven-fuzzer's string family saw it
-  // against hardware on its very first run.
+  // A rep is interruptible between iterations, so TF gives one #DB per iteration. Running the whole
+  // loop in one step() and trapping at the end is directly observable, and the fuzzer saw it.
   constexpr std::uint64_t kSrc = 0x20000;
   constexpr std::uint64_t kDst = 0x30000;
   constexpr std::uint64_t kCount = 3;
@@ -675,10 +671,8 @@ TEST(KuberaDebug, DelayedDebugAfterMovSsEntersSoftwareInterruptHandlerFirst) {
   EXPECT_EQ(state.rip, kBase + 3);
 }
 
-// Integer overflow in debug_data_breakpoint_hits' overlap check: address is guest-controlled and
-// size reaches 64 bytes, so address + size wraps past zero near the top of the address space and the
-// non-wrapping interval test reads it as no overlap. That let a guest write exactly where a
-// watchpoint was set and not be seen.
+// Integer overflow in debug_data_breakpoint_hits' overlap check: address + size wraps near the top
+// of the address space and reads as no overlap, so a guest wrote onto a watchpoint unseen.
 TEST(KuberaDebug, DataBreakpointStillFiresOnWraparoundAccess) {
   seven::CpuState state{};
   // DR0 watches [0x8, 0x10): L0 enabled (bit 0), R/W0 = read-or-write (0b11 at bits 16-17), LEN0 =
@@ -815,10 +809,8 @@ TEST(KuberaDebug, DebugRegisterReservedBitsAndCanonicalChecks) {
   }
 }
 
-// The interrupt frame is three separate stores and any of them can fault. Committing rsp store by
-// store left the emulator half a frame in when one did: rsp lowered by the slots that landed, the
-// rest unwritten, and nothing in the returned fault to say how far it got. An embedder that maps
-// the page and restarts then builds a second frame underneath the first.
+// The interrupt frame is three stores and any can fault. Committing rsp store by store left rsp
+// lowered by the slots that landed, so a restart built a second frame underneath the first.
 TEST(KuberaDebug, AnInterruptFrameThatFaultsPartwayLeavesRspWhereItStarted) {
   seven::CpuState state{};
   seven::Memory memory{};
@@ -845,10 +837,8 @@ TEST(KuberaDebug, AnInterruptFrameThatFaultsPartwayLeavesRspWhereItStarted) {
   EXPECT_EQ(state.rip, kBase) << "the interrupt never took";
 }
 
-// The stack slot a pushfq writes and a popfq reads is implicit: it is not an operand, so the
-// executor's own watchpoint sweep over the operand list cannot see it. push/pop report theirs from
-// the handler for exactly this reason and these two did not, so a guest evaded a write watchpoint
-// just by pointing rsp at the watched address and pushing the flags onto it.
+// The slot pushfq writes is implicit, not an operand, so the watchpoint sweep over the operand list
+// cannot see it. push/pop report theirs from the handler; these two did not.
 TEST(KuberaDebug, PushfqCannotStepPastADataWatchpointOnItsOwnStackSlot) {
   seven::CpuState state{};
   seven::Memory memory{};
@@ -873,11 +863,9 @@ TEST(KuberaDebug, PushfqCannotStepPastADataWatchpointOnItsOwnStackSlot) {
   EXPECT_EQ(state.rip, kDbHandler);
 }
 
-// An instruction breakpoint is a fault, not a trap: the frame carries the breakpointed
-// instruction's own rip, so the handler's iret lands right back on it. RF in the saved rflags image
-// is the only thing that stops the same breakpoint firing again on that return, and the frame went
-// out without it. Any guest that arms DR0 on an instruction and whose #DB handler simply irets
-// never retires that instruction -- it re-delivers on every step, forever.
+// An instruction breakpoint is a fault, so the frame carries its own rip and the iret lands back on
+// it. RF in the saved image is the only thing stopping it firing again, and the frame went out
+// without it, so a guest whose #DB handler simply irets never retires the instruction.
 TEST(KuberaDebug, ExecuteBreakpointFrameSetsRfSoTheIretMakesProgress) {
   seven::CpuState state{};
   seven::Memory memory{};
@@ -918,10 +906,8 @@ TEST(KuberaDebug, ExecuteBreakpointFrameSetsRfSoTheIretMakesProgress) {
   EXPECT_EQ(state.rip, kBase + 1) << "the breakpoint re-delivered instead of retiring the nop";
 }
 
-// RF and the SS-load shadow are consumed at the top of the instruction, but an instruction that
-// faults never ran. A fault hook asking for a retry re-entered with both already spent, so the
-// second attempt fired the very execute breakpoint they exist to suppress -- and the guest's #DB
-// handler then irets back onto the same faulting instruction.
+// RF and the SS-load shadow are spent at the top of an instruction that then never ran, so a fault
+// hook's retry re-entered with both gone and fired the breakpoint they exist to suppress.
 TEST(KuberaDebug, AFaultRetryKeepsRfSuppressingTheExecuteBreakpoint) {
   seven::CpuState state{};
   seven::Memory memory{};

@@ -4,11 +4,9 @@ namespace seven::handlers {
 
 namespace {
 
-// See movs.cpp's identical constant for the full rationale: a rep-prefixed string instruction's
-// whole count otherwise runs inside one uninterruptible C++ loop, with no way for a caller's
-// cooperative stop request to interject mid-instruction. Capping iterations per call and yielding
-// back (rip left at this same instruction) reproduces real hardware's between-iterations
-// interrupt-checkability without any guest-visible effect.
+// See movs.cpp's identical constant: a rep-prefixed count otherwise runs in one uninterruptible loop
+// no stop request can interject. Capping and yielding with rip unchanged reproduces hardware's
+// between-iterations checkability with no guest-visible effect.
 constexpr std::uint64_t kMaxRepIterationsPerCall = 4096;
 
 // A single-stepping guest sees a #DB after every iteration of a rep, not one after the whole loop.

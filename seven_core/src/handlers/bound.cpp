@@ -2,10 +2,8 @@
 
 namespace seven::handlers {
 
-// Out of range is #BR, vector 5, not #GP. It is a fault, so the frame carries this instruction's
-// own rip rather than the next one, and it is hardware-generated, so the gate's DPL is not checked
-// the way INT n's is. A guest with no IDT still ends up with #GP, since that is what
-// dispatch_interrupt falls back to when the vector has no entry.
+// Out of range is #BR, vector 5, not #GP. It is a fault, so the frame carries this instruction's own
+// rip, and it is hardware-generated, so the gate's DPL is not checked the way INT n's is.
 ExecutionResult handle_code_BOUND_R16_M1616(ExecutionContext& ctx) {
   const auto destination = detail::read_register(ctx.state, ctx.instr.op_register(0));
 

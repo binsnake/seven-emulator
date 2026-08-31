@@ -90,20 +90,15 @@ inline bool issnan(Float80 x) noexcept {
     return (x.val.signif & 0xC000000000000000ULL) != 0xC000000000000000ULL;
 }
 
-// The 80-bit format carries its integer bit explicitly, so an encoding can contradict its own
-// exponent: unnormals, pseudo-NaNs and pseudo-infinities all clear the integer bit under an exponent
-// that says it should be set. Hardware does not treat those as numbers at all, which is why FXAM has
-// a class of its own for them rather than folding them into NaN or normal.
+// The 80-bit format carries its integer bit explicitly, so an encoding can contradict its exponent.
+// Hardware does not treat those as numbers, which is why FXAM gives them a class of their own.
 inline bool isunsupported(Float80 x) noexcept {
     if ((x.val.signExp & 0x7FFFu) == 0u) return false;  // zero, denormal, pseudo-denormal
     return (x.val.signif & 0x8000000000000000ULL) == 0u;
 }
 
-// The architectural tag is not a note of what a writer intended: hardware derives it from the
-// register's own bits every time, so anything that is not a plain normalized number reads back as
-// SPECIAL. Deriving it from the value here rather than from `value == 0` also keeps softfloat's
-// exception-flag global out of a path that has nothing to do with arithmetic.
-// 0 = valid, 1 = zero, 2 = special, 3 = empty.
+// Hardware derives the tag from the register's own bits every time, so anything not plainly
+// normalized reads back as SPECIAL. 0 = valid, 1 = zero, 2 = special, 3 = empty.
 inline std::uint8_t x87_tag_of(Float80 x) noexcept {
     const std::uint16_t exp = x.val.signExp & 0x7FFFu;
     if (exp == 0x7FFFu) return 2;                        // infinity, NaN, pseudo-NaN, pseudo-infinity
@@ -127,14 +122,9 @@ inline Float80 abs(Float80 x) noexcept {
 
 // -- rounding -----------------------------------------------------------------
 
-// SoftFloat takes the rounding mode for add/sub/mul/div/sqrt from a mutable global instead of an
-// argument, so honouring the guest's FCW.RC means writing that global around the call. Every write
-// is paired with a restore on the same scope exit, and the guard writes nothing at all when the
-// mode already matches, which covers every guest that leaves RC at round-to-nearest.
-//
-// The build defines THREAD_LOCAL for the softfloat target, so the global is per-thread and two
-// guests on separate host threads cannot interleave a save/restore pair and strand each other's
-// mode. Without that definition softfloat's headers fall back to an empty macro and they can.
+// SoftFloat takes its rounding mode from a mutable global, so honouring FCW.RC means owning that
+// global for the call and putting it back on scope exit. The build defines THREAD_LOCAL for the
+// softfloat target; without it two guests on separate threads strand each other's mode.
 class RoundingGuard {
 public:
     explicit RoundingGuard(uint_fast8_t mode) noexcept
@@ -152,11 +142,9 @@ private:
     bool changed_;
 };
 
-// The exceptions an operation raised come out of a second global, and softfloat only ever ORs into
-// it, so a reading means nothing unless it was cleared first. Same discipline as RoundingGuard: own
-// the global for the length of one operation, then put back whatever the caller had accumulated so
-// nothing outside the scope sees it move. raised() has to be read before the guard goes out of
-// scope, which is why with_exception_flags below is the way most callers reach it.
+// Raised exceptions come out of a second global that softfloat only ORs into, so a reading means
+// nothing unless it was cleared first. Same discipline as RoundingGuard, except raised() must be
+// read before the guard leaves scope, which is why most callers go through with_exception_flags.
 class ExceptionFlagGuard {
 public:
     ExceptionFlagGuard() noexcept : saved_(softfloat_exceptionFlags) { softfloat_exceptionFlags = 0; }
@@ -224,12 +212,9 @@ inline Float80 fmod(Float80 a, Float80 b) noexcept {
     // IEEE and x87 both give the finite value back unchanged. This used to fall through to the
     // quotient path below, where trunc(a/inf) is zero and zero times infinity is NaN.
     if (isinf(b)) return a;
-    // Built on the exact IEEE remainder rather than a - trunc(a/b)*b: once |a/b| needs more than 64
-    // significand bits the quotient's low bits are rounding noise and the subtraction returns
-    // something arbitrary. FPREM1 next door already used extF80_rem, so the two also disagreed with
-    // each other. The two differ only in how the quotient is rounded -- nearest for the IEEE
-    // remainder, toward zero for fmod -- so they are at most one b apart, and fmod is the one whose
-    // sign follows the dividend.
+    // Built on the exact IEEE remainder rather than a - trunc(a/b)*b, whose quotient turns to
+    // rounding noise past 64 significand bits. The two differ only in how the quotient rounds, so
+    // they are at most one b apart, and fmod is the one whose sign follows the dividend.
     const Float80 r = Float80(extF80_rem(a.val, b.val));
     if (r == Float80(0) || signbit(r) == signbit(a)) return r;
     return signbit(a) ? (r - abs(b)) : (r + abs(b));
@@ -237,11 +222,9 @@ inline Float80 fmod(Float80 a, Float80 b) noexcept {
 
 // -- exponent manipulation (exact, no precision loss) -------------------------
 
-// Entirely in the exponent/significand domain, with a 64-bit accumulator. The previous version
-// added `int n` to the biased exponent as an int, which overflows for a large n (FSCALE hands this
-// whatever the guest put in ST(1), up to INT_MAX), and fell back to std::ldexp on a double for the
-// subnormal and underflow cases -- but those are precisely the values that do not fit in a double,
-// so a result that should have been a representable denormal came back as infinity or zero.
+// Entirely in the exponent/significand domain with a 64-bit accumulator. Adding a guest-supplied n
+// to the biased exponent as an int overflows, and the std::ldexp fallback covered exactly the
+// subnormal cases a double cannot hold.
 inline Float80 ldexp(Float80 x, int n) noexcept {
     if (isnan(x) || isinf(x) || x == Float80(0)) return x;
 
@@ -335,10 +318,8 @@ inline Float80 pow(Float80 base, Float80 exp_) noexcept {
     return Float80(std::pow(static_cast<double>(base), static_cast<double>(exp_)));
 }
 
-// Split off the exponent before narrowing, unlike its neighbours above. The mantissa is always in
-// [0.5, 1) so the double round-trip only costs precision, whereas feeding the whole value through
-// turned anything outside double's exponent range into an infinity: FYL2X on 2^1100 answered
-// infinity rather than 1100.
+// Split off the exponent before narrowing: the mantissa stays in [0.5, 1) so the round trip only
+// costs precision, where the whole value turned FYL2X on 2^1100 into infinity rather than 1100.
 inline Float80 log2(Float80 x) noexcept {
     if (isnan(x) || isinf(x) || signbit(x) || x == Float80(0)) {
         return Float80(std::log2(static_cast<double>(x)));

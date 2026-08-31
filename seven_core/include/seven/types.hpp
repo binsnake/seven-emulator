@@ -130,10 +130,8 @@ struct CpuState {
   std::array<std::uint8_t, 8> x87_tags{0x3, 0x3, 0x3, 0x3, 0x3, 0x3, 0x3, 0x3};
   std::array<std::uint64_t, 8> opmask{};
   std::array<VectorRegister, 32> vectors{};
-  // Per-guest, deliberately. This used to be a function-local static inside the RDTSC handler,
-  // which meant every Executor in the process shared one counter: two guests that are supposed to
-  // be isolated could watch each other's progress through it, and two Executors on separate
-  // threads raced on the increment.
+  // Per-guest, deliberately. As a function-local static in the RDTSC handler every Executor in the
+  // process shared one counter, watching each other's progress and racing on the increment.
   std::uint64_t tsc = 0;
   std::uint8_t debug_suppression = 0;
   bool pending_single_step = false;
@@ -212,10 +210,8 @@ struct CpuState {
   }
 
   bool x87_pop() noexcept {
-    // Every other x87_tags access in the tree resolves its index through x87_phys_index or a
-    // literal bound; this was the one place that read x87_top raw and trusted every writer to have
-    // masked it. Masking here makes the 0..7 invariant hold at the point of use instead of being a
-    // contract each writer has to remember, which is a promise a deserializer has already broken.
+    // The one place that read x87_top raw and trusted every writer to have masked it. Masking here
+    // makes the 0..7 invariant hold at the point of use, which a deserializer has already broken.
     const auto phys = x87_phys_index(0);
     if (x87_tags[phys] == 0x3) {
       return false;
@@ -233,11 +229,9 @@ struct CpuState {
     std::swap(x87_tags[i0], x87_tags[iN]);
   }
 
-  // MM0-MM7 are not a register file of their own: they are the low 64 bits (the significand) of the
-  // PHYSICAL x87 registers R0-R7, which is why they are indexed without TOP. They used to live in a
-  // separate array, so FXSAVE/FNSAVE stored zeros for them and FXRSTOR/FRSTOR never brought them
-  // back. Writing one fills the aliased register's exponent and sign with ones, which is what makes
-  // the x87 side read the value back as a NaN.
+  // MM0-MM7 are the low 64 bits of the physical x87 registers R0-R7, not a file of their own, which
+  // is why they are indexed without TOP. A separate array meant FXSAVE stored zeros for them. Writing
+  // one fills the aliased exponent and sign with ones, so the x87 side reads it back as a NaN.
   [[nodiscard]] std::uint64_t mmx_get(std::size_t mm_index) const noexcept {
     return x87_stack[mmx_phys_index(mm_index)].val.signif;
   }
@@ -294,10 +288,8 @@ constexpr std::uint64_t kFlagRF = 1ull << 16;
 // dead-code-eliminated, only ever set explicitly by the instructions that own them.
 constexpr std::uint64_t kAluStatusFlagsMask = kFlagCF | kFlagPF | kFlagAF | kFlagZF | kFlagSF | kFlagOF;
 
-// The rflags bits that actually exist. Bit 1 reads back as 1 no matter what is written; bits 3, 5,
-// 15 and everything from 22 up read back as 0. POPF and IRET are the only two instructions that
-// load rflags wholesale from guest memory, so they are the only two that can smuggle a reserved bit
-// in, and both have to drop it on the way through.
+// The rflags bits that exist: bit 1 always reads 1, bits 3, 5, 15 and 22 up always read 0. POPF and
+// IRET load rflags wholesale from guest memory, so both have to drop the reserved bits.
 constexpr std::uint64_t kRflagsWritableMask = 0x00000000003F7FD5ull;
 constexpr std::uint64_t kRflagsReservedOnes = 0x0000000000000002ull;
 

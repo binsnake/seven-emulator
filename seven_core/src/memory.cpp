@@ -9,12 +9,9 @@ namespace seven {
 
 namespace {
 
-// Exclusive end page for [base, base+size), saturating instead of wrapping. Written as
-// `(base + size + kPageSize - 1) / kPageSize` this collapses to 0 whenever the range touches the
-// very top of the address space, which silently turned unmap() and reprotect() into no-ops there --
-// a revoke the caller believes happened but didn't. Both additions can overflow independently, so
-// neither is performed: a wrapped end means "through the last page", and the ceiling is taken with
-// a remainder test rather than a bias term.
+// Exclusive end page for [base, base+size), saturating instead of wrapping. The obvious
+// `(base + size + kPageSize - 1) / kPageSize` collapses to 0 at the top of the address space, which
+// silently turned unmap() and reprotect() into no-ops there.
 std::uint64_t page_range_end(std::uint64_t base, std::size_t size) noexcept {
   constexpr std::uint64_t kEndOfAddressSpace = (~std::uint64_t{0} / Memory::kPageSize) + 1;
   const auto end = base + size;
@@ -34,13 +31,8 @@ bool access_wraps(std::uint64_t base, std::size_t size) noexcept {
   return base + (static_cast<std::uint64_t>(size) - 1) < base;
 }
 
-// The exclusive end of a registered range, held at the top of the address space rather than
-// wrapping past it. Every range test below is a plain non-wrapping interval comparison, so an end
-// that folded back down to a small number would quietly stop matching: an mmio region would lose
-// its own addresses to the raw page path, and an access hook registered over that range would be
-// skipped entirely. For a write hook that is a bypass of whatever the hook enforces, since
-// access_allowed() runs before the page write. The guest-controlled side of these comparisons is
-// already guarded; this is the host-registered side.
+// Exclusive end of a registered range, held at the top rather than wrapping. Every range test below
+// is a non-wrapping comparison, so a folded-back end loses its own addresses and skips its hooks.
 std::uint64_t range_end_saturating(std::uint64_t base, std::size_t size) noexcept {
   const auto end = base + size;
   return end < base ? ~std::uint64_t{0} : end;
@@ -138,11 +130,8 @@ void Memory::map(std::uint64_t base, std::size_t size, MemoryPermissionMask perm
   if (size == 0) {
     return;
   }
-  // map() may insert new entries; std::unordered_map insertion can rehash and
-  // invalidate iterators, but does not invalidate references / pointers to
-  // existing elements. However, we still need to invalidate the TLB so that
-  // negative cache entries (slots holding nullptr for previously-unmapped
-  // pages) are refreshed.
+  // Insertion never invalidates pointers to existing elements, but the TLB still has to go: its
+  // negative entries (nullptr for previously-unmapped pages) are now wrong.
   invalidate_tlb();
   // jit_tlb also caches permissions (not just a pointer), which map() can change on an
   // already-mapped page (try_emplace below is a no-op then, but permissions still get
@@ -187,12 +176,8 @@ void Memory::reprotect(std::uint64_t base, std::size_t size, MemoryPermissionMas
   if (size == 0) {
     return;
   }
-  // Reprotect does not erase entries, so cached PageEntry* pointers stay
-  // valid. Permissions are read through the pointer, so we don't have to
-  // invalidate the TLB.
-  // jit_tlb caches permissions BY VALUE though (not read through host_data the way Memory's own
-  // tlb_ re-reads permissions through PageEntry* every time) -- a reprotect can flip the exact bit
-  // a cached slot's fast path would trust, so this one does need to clear it.
+  // tlb_ survives: it reads permissions back through PageEntry* every time. jit_tlb caches them by
+  // value, so a reprotect can flip the exact bit its fast path trusts.
   clear_jit_tlb();
   const auto first_page = base / kPageSize;
   const auto last_page = page_range_end(base, size);
@@ -304,12 +289,9 @@ bool Memory::read(std::uint64_t address, void* dst, std::size_t size, MemoryAcce
   }
 
   if (const auto* mmio = find_mmio_region(address, size)) {
-    // Take a copy of the callback and base before anything else runs. mmio points into
-    // mmio_regions_, and nothing defers MMIO mutation the way add/remove_access_hook is deferred --
-    // so a hook dispatched below calling map_mmio (push_back, may reallocate), unmap_mmio (erase,
-    // shifts every later element down) or clear_mmio_regions leaves that pointer naming a different
-    // device or freed storage, and the std::function read back out of it is then called. Copying
-    // also keeps the callable alive if the device reconfigures its own region from inside the call.
+    // Copy the callback and base first: mmio points into mmio_regions_ and MMIO mutation is not
+    // deferred, so a hook calling map_mmio or unmap_mmio below leaves it naming another device or
+    // freed storage. The copy also keeps the callable alive across a self-reconfiguring device.
     auto on_read = mmio->on_read;
     const auto region_base = mmio->base;
     if (!access_allowed(MemoryAccessEvent{kind, address, size, nullptr, 0})) {
@@ -319,14 +301,8 @@ bool Memory::read(std::uint64_t address, void* dst, std::size_t size, MemoryAcce
     ++device_dispatch_count_;
     return on_read(address - region_base, dst, size);
   }
-  // Not contained in one region, but still touching one: the bytes are partly the device's, and
-  // falling through would serve all of them out of whatever page sits underneath it without the
-  // device ever being asked. Refuse rather than answer on its behalf.
-  //
-  // A fetch is the exception, and deliberately so: it asks for a fixed 15 bytes regardless of how
-  // long the instruction actually is, so its window reaching a device says nothing about whether the
-  // instruction does. Refusing here would fault every fetch within 15 bytes of a device edge. A
-  // fetch landing inside a region is still served by it, since that is a contained access.
+  // Touching a region without being contained in one would serve the device's bytes out of the page
+  // underneath. A fetch is exempt since it always asks for 15 bytes regardless of length.
   if (kind != MemoryAccessKind::instruction_fetch && mmio_overlaps(address, size)) {
     return false;
   }
@@ -436,11 +412,9 @@ bool Memory::read_code_page(std::uint64_t page_base, void* dst) const {
 
 bool Memory::write(std::uint64_t address, const void* src, std::size_t size, MemoryAccessKind kind) {
   if (passthrough_write_) {
-    // read() rejects a wrapping range before it ever reaches passthrough_read_, and a passthrough
-    // is an embedder's whole memory implementation rather than a hook with something to veto -- it
-    // should never be handed an (address, size) pair the read side is guaranteed never to see. The
-    // documented bridge in examples/live_memory_windows.hpp forwards both straight to
-    // Read/WriteProcessMemory.
+    // read() rejects a wrapping range before passthrough_read_ ever sees it, and a passthrough is
+    // the embedder's whole memory implementation, so the write side must not hand it a pair the read
+    // side is guaranteed never to see.
     if (access_wraps(address, size)) {
       return false;
     }
@@ -455,10 +429,8 @@ bool Memory::write(std::uint64_t address, const void* src, std::size_t size, Mem
     if (!fn(address, src, size)) {
       return false;
     }
-    // A passthrough can't tell us whether what it just wrote was executable, so every write has to
-    // count as one that might have rewritten code. page_code_epoch() reports this counter for every
-    // page while a passthrough is installed, which is what makes cached decodes and compiled blocks
-    // go stale at all in that configuration.
+    // A passthrough cannot say whether what it wrote was executable, so every write counts as one
+    // that might have rewritten code. This counter is what page_code_epoch() reports under one.
     ++code_epoch_;
     return true;
   }
@@ -486,10 +458,8 @@ bool Memory::write(std::uint64_t address, const void* src, std::size_t size, Mem
   if (!access_allowed(MemoryAccessEvent{kind, address, size, src, size})) {
     return false;
   }
-  // Deliberately after access_allowed rather than at the top of the function: a range-scoped write
-  // hook has to keep getting the chance to see and veto a wrapping access, which is the property
-  // the overlap-check fix relies on. The single-page fast path above cannot be reached by a
-  // wrapping access anyway, since one always straddles the last page boundary.
+  // After access_allowed, not at the top: a range-scoped write hook still has to get the chance to
+  // veto a wrapping access. The fast path above cannot be reached by one anyway.
   if (access_wraps(address, size)) {
     return false;
   }
@@ -622,10 +592,8 @@ void Memory::refresh_access_hook_state() noexcept {
 }
 
 void Memory::refresh_jit_fast_path_blocked() noexcept {
-  // Both halves of the passthrough matter. set_passthrough takes them independently, so a
-  // write-only passthrough used to leave this false: reads went through the page path and
-  // warmed jit_tlb slots, then compiled writes stored straight into PageEntry::data and never
-  // called passthrough_write_ at all, diverging from what Memory::write itself would do.
+  // Both halves matter: a write-only passthrough left this false, so reads warmed jit_tlb slots and
+  // compiled writes then stored into PageEntry::data without ever calling passthrough_write_.
   jit_fast_path_blocked = has_any_access_hooks_ || !mmio_regions_.empty() ||
                           passthrough_read_ != nullptr || passthrough_write_ != nullptr;
 }
@@ -784,12 +752,9 @@ const Memory::MmioRegion* Memory::find_mmio_region(std::uint64_t address, std::s
     return nullptr;
   }
   const auto end = address + static_cast<std::uint64_t>(size);
-  // A guest-chosen address near the top of the address space plus size can wrap end back down
-  // past zero. Left unchecked, that wrapped (small) end could pass the mmio_max_end_ pre-check
-  // and then the per-region range check below despite address itself being nowhere near any
-  // registered region -- a false match whose "address - region.base" offset (see read()/write())
-  // would be a huge, effectively guest-controlled index into whatever the region's callback
-  // trusts that offset to bound. Reject the wrap outright rather than let it reach that check.
+  // A guest address near the top of the space wraps end back past zero, and the wrapped value can
+  // pass both range checks while address is nowhere near any region. The resulting offset is a huge
+  // guest-controlled index handed to a callback that trusts it to be bounded.
   if (end < address) {
     return nullptr;
   }
@@ -825,11 +790,9 @@ bool Memory::access_allowed(const MemoryAccessEvent& event) const {
   }
   auto& self = const_cast<Memory&>(*this);
 
-  // Save and restore rather than assign. A hook callback is free to touch guest memory, which
-  // re-enters here; if the nested call cleared the flag on its way out, the outer loop below would
-  // carry on iterating access_hooks_ with deferral switched off, so a later hook calling
-  // remove_access_hook would erase from the vector mid-iteration and leave this range-for walking
-  // freed std::function storage. Same reason the pending queue is only flushed at depth 0.
+  // Save and restore, not assign: a callback touching guest memory re-enters here, and a nested
+  // call clearing the flag would leave the outer loop walking access_hooks_ with deferral off, so a
+  // later remove_access_hook would erase mid-iteration.
   const bool was_dispatching = self.dispatching_access_hooks_;
   const auto finish_dispatch = [&self, was_dispatching] {
     self.dispatching_access_hooks_ = was_dispatching;
@@ -843,10 +806,8 @@ bool Memory::access_allowed(const MemoryAccessEvent& event) const {
     if ((hook.kinds & bit(event.kind)) == 0) {
       continue;
     }
-    // Only the ERASE is deferred (this loop is walking the vector it would erase from) -- the
-    // removal itself takes effect at once. remove_access_hook has already returned true to whoever
-    // asked, and that caller is entitled to have destroyed whatever the hook captured, so calling
-    // it again for the rest of this access is a call into storage its owner was told it could drop.
+    // Only the erase is deferred, not the removal: remove_access_hook already returned true, so the
+    // caller may have destroyed whatever the hook captured.
     if (!pending_removed_access_hooks_.empty() &&
         std::find(pending_removed_access_hooks_.begin(), pending_removed_access_hooks_.end(), hook.id) !=
             pending_removed_access_hooks_.end()) {
@@ -856,15 +817,8 @@ bool Memory::access_allowed(const MemoryAccessEvent& event) const {
       const auto range_base = hook.range->base;
       const auto range_end = range_end_saturating(range_base, hook.range->size);
       const auto access_end = event.address + event.size;
-      // event.address is guest-controlled (unlike range_base/size, which the host set up when
-      // registering the hook) -- a guest picking an address near ~0ull can make access_end wrap
-      // back down past zero. A plain non-wrapping interval test against that wrapped value can
-      // then wrongly decide "no overlap" for an access whose real (wrapping) span does touch
-      // [range_base, range_end), letting it skip a hook meant to see every access to that range
-      // -- for a write hook specifically, access_allowed() runs before the underlying page write,
-      // so a skipped hook here is a real bypass of whatever the hook enforces, not just a missed
-      // notification. Treat the wrap itself as "can't rule out overlap" and fall through to call
-      // the hook rather than risk a false negative.
+      // A guest-controlled address can wrap access_end past zero, which a non-wrapping test reads as
+      // no overlap. That skips a write hook before the page write, so treat a wrap as overlapping.
       const bool access_wraps = access_end < event.address;
       if (!access_wraps && (event.address >= range_end || access_end <= range_base)) {
         continue;

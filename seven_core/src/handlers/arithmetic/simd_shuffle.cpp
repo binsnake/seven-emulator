@@ -97,12 +97,9 @@ big_uint read_operand(ExecutionContext& ctx, std::uint32_t operand_index, std::s
     return read_vec(ctx.state, reg) & mask(width);
   }
   if (kind == iced_x86::OpKind::MEMORY) {
-    // An EVEX memory source can carry {1toN}: one element is read and repeated across the whole
-    // operand. The element size has to come from the raw MemorySize's element_size, not from
-    // memory_size() -- that has already collapsed to the full operand width, and feeding the byte
-    // count back through the size table looks up an unrelated entry (64 comes back as 16), so a
-    // dword broadcast would read 16 bytes of guest memory and lay down the wrong lane count. Same
-    // reasoning, and the same fix, as simd_int.cpp's copy of this function.
+    // An EVEX {1toN} source reads one element and repeats it, and that element size lives in the raw
+    // MemorySize. memory_size() has collapsed to the operand width, and feeding the byte count back
+    // through the size table reindexes to an unrelated entry. Same fix as simd_int.cpp's copy.
     if (ctx.instr.is_broadcast()) {
       const auto element_width = iced_x86::memory_size_ext::get_element_size(ctx.instr.memory_size_enum());
       if (element_width == 0 || element_width > width) {
@@ -175,10 +172,8 @@ ExecutionResult legacy_binary_lanewise(ExecutionContext& ctx, std::size_t lane_b
   return {};
 }
 
-// Nothing in this file implements writemasking, and the EVEX handlers below share these VEX
-// helpers, so a named mask register has to stop the instruction rather than be ignored. None of
-// those EVEX codes is in handled_codes.def today, so this changes nothing until one is added --
-// which is exactly when a silently wrong destination register would be hardest to spot.
+// Nothing here implements writemasking and the EVEX handlers share these VEX helpers, so a named
+// mask has to stop the instruction rather than be ignored. Moot until one of those codes is added.
 template <typename T, std::size_t N, typename Fn>
 ExecutionResult vex_binary_lanewise(ExecutionContext& ctx, std::size_t lane_bytes, Fn&& fn, bool zero_upper = true) {
   if (detail::has_active_opmask(ctx.instr)) return detail::unsupported_opmask(ctx);
@@ -207,12 +202,8 @@ ExecutionResult legacy_unary_lanewise(ExecutionContext& ctx, std::size_t lane_by
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
-  // Legacy (non-VEX) form: real hardware requires the m128 source aligned to 16 bytes, #GP(0)
-  // otherwise. Confirmed empirically on real hardware that this covers MOVSLDUP/MOVSHDUP too --
-  // despite reading like MOVDDUP's "duplicate" family, MOVDDUP's memory operand is m64
-  // (genuinely unaligned-safe), but MOVSLDUP/MOVSHDUP's is a full m128 per the SDM, with no
-  // unaligned-safe exception the way MOVUPS/MOVDQU/LDDQU have. Don't assume otherwise again
-  // without a real-hardware check -- see the empirical probe writeup in the roadmap notes.
+  // Legacy form: hardware wants the m128 source 16-byte aligned. Confirmed on hardware that this
+  // covers MOVSLDUP/MOVSHDUP too, whose operand is a full m128 unlike MOVDDUP's m64.
   if (auto fault = detail::require_aligned_memory_operand(ctx, 1, 0xFULL)) return *fault;
   bool ok = false;
   const auto dst_reg = ctx.instr.op_register(0);

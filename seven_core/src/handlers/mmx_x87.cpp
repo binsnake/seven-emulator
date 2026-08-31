@@ -31,11 +31,8 @@ std::size_t vector_index(iced_x86::Register reg) {
 }
 
 ExecutionResult validate_memory_span(ExecutionContext& ctx, std::uint64_t base, std::size_t size, seven::MemoryAccessKind kind) {
-  // The whole point of this function is that the callers get to check the entire image before they
-  // touch any of it. base + offset below is plain uint64 arithmetic, so a span starting near the top
-  // of the address space wrapped around and validated page 0 instead, and then the store itself
-  // faulted partway through on Memory::read/write's own wrap check. Reject it here, the same way
-  // Memory::access_wraps does.
+  // Callers check the whole image before touching any of it, but base + offset is plain uint64, so a
+  // span near the top of the address space wrapped and validated page 0 before faulting mid-store.
   if (size != 0 && base + (static_cast<std::uint64_t>(size) - 1u) < base) {
     return detail::memory_fault(ctx, base);
   }
@@ -157,12 +154,9 @@ uint8_t x87_ftw(const CpuState& state) {
   return ftw;
 }
 
-// FNSTENV/FLDENV and FNSAVE/FRSTOR each come in a 16-bit form with a 14-byte environment and a
-// 32-bit form with a 28-byte one, and the two lay their fields out at different offsets. FNSAVE
-// follows the environment with ST0..ST7 as eight 10-byte ext80 slots, which is what makes the
-// images exactly 94 and 108 bytes. The environment's tag word is two bits per PHYSICAL register
-// while the data slots are top-relative; crossing those two conventions is what used to lose
-// registers across a save/restore whenever TOP was not 0.
+// These come in a 16-bit form with a 14-byte environment and a 32-bit form with a 28-byte one, laid
+// out at different offsets; FNSAVE adds eight 10-byte slots for 94 and 108 total. The tag word is
+// per physical register while the data slots are top-relative, and crossing the two loses registers.
 constexpr std::size_t kX87Slots = 8;
 constexpr std::size_t kX87SlotBytes = 10;
 
@@ -267,10 +261,8 @@ ExecutionResult write_fpu_state(ExecutionContext& ctx, std::uint64_t base, std::
 ExecutionResult fsave(ExecutionContext& ctx, std::size_t image_size) {
   const auto base = detail::memory_address(ctx);
   const auto env_size = image_size - (kX87Slots * kX87SlotBytes);
-  // No alignment requirement: FSAVE/FNSAVE/FRSTOR take any address on real hardware.
-  // Validate the whole image before touching anything, the same way fxsave does. Hardware faults
-  // before any of the store happens, and the x87_reset() below must not wipe guest FPU state for a
-  // save that never landed.
+  // No alignment requirement on hardware. Validate the whole image first, since hardware faults
+  // before any of the store and the x87_reset() below must not wipe state for a save that failed.
   if (const auto span = validate_memory_span(ctx, base, image_size, seven::MemoryAccessKind::data_write); !span.ok()) {
     return span;
   }
@@ -645,10 +637,9 @@ ExecutionResult handle_code_F2XM1(ExecutionContext& ctx) {
   if (ctx.state.x87_is_empty(0)) return x87_stack_underflow_into(ctx, 0);
   const X87Scalar value = ctx.state.x87_get(0);
   if (auto answer = x87_reject_operand(ctx, value); answer.has_value()) return *answer;
-  // The SDM calls the result undefined outside [-1, 1] and lists #IA; this machine raises nothing
-  // and just evaluates 2^x - 1, which is how F2XM1 of -infinity answers -1 rather than faulting.
-  // Silicon wins. Below 2^-64 the -1 cancels every bit of 2^x that the format could hold, leaving
-  // x*ln2; going through a host double there answered a flat zero for a whole denormal range.
+  // The SDM calls the result undefined outside [-1, 1], but silicon just evaluates 2^x - 1, so
+  // F2XM1 of -infinity answers -1. Below 2^-64 the answer is x*ln2, which a host double flattens
+  // to zero across a whole denormal range.
   const X87Scalar result = x87_tiny_argument(value)
                                ? value * x87_ln2()
                                : seven::pow(X87Scalar(2), value) - X87Scalar(1);
@@ -746,10 +737,9 @@ ExecutionResult handle_code_FSCALE(ExecutionContext& ctx) {
       return {};
     }
   }
-  // ST(1) is whatever the guest left there, including an infinity or something past 64 bits, and the
-  // narrowing conversion below is only defined inside int's range. Clamping is not a fudge here:
-  // ldexp saturates to an infinity or a zero long before the clamp, so ST(1) = +inf and ST(1) = 2^70
-  // both give the answer hardware gives, where the raw cast was landing on 0 and returning ST(0).
+  // ST(1) is whatever the guest left there and the narrowing below is only defined inside int's
+  // range. ldexp saturates long before the clamp bites, so +inf and 2^70 both answer as hardware
+  // does, where the raw cast landed on 0 and returned ST(0) unchanged.
   const X87Scalar truncated = seven::trunc(b);
   constexpr int kMaxShift = 0x7FFFFFFF;
   int shift = 0;

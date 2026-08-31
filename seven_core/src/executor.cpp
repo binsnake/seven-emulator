@@ -94,12 +94,9 @@ constexpr std::size_t kZmmWidth = 64;
   }
 }
 
-// Instructions that redirect or stop control flow but that this fork's flow_control() stub reports
-// as NEXT, since it only knows Jcc/JMP/CALL/RET/INT3. The lifter ends liveness spans on that answer,
-// and masking depends on a branch being the span's last instruction -- LOOP and JCXZ slipping
-// through let a span run past a branch, so an instruction that never executes could cover a flag
-// write and leave the guest a stale flag. Supplemented here rather than in the stub, since this is
-// the consumer that depends on the answer and being conservative only costs a shorter lift.
+// Control flow the flow_control() stub still reports as NEXT, since it only knows
+// Jcc/JMP/CALL/RET/INT3. Masking depends on a branch ending the span, so LOOP and JCXZ slipping
+// through let an instruction that never runs cover a flag write.
 [[nodiscard]] bool ends_lifted_block(const iced_x86::Instruction& instr) noexcept {
   switch (instr.code()) {
     case iced_x86::Code::LOOP_REL8_16_CX: case iced_x86::Code::LOOP_REL8_32_CX:
@@ -277,9 +274,8 @@ struct DebugMemoryAccess {
 }  // namespace
 
 constexpr std::size_t Executor::stop_reason_to_index(StopReason reason) noexcept {
-  // stop_reason_counts_ is sized from the last enumerator, but two of the reasons this indexes with
-  // come straight out of an embedder hook's ExecutionResult, so the value is not guaranteed to be
-  // one of them. Bucket anything outside the enum at `none` rather than write past the vector.
+  // Two of these reasons come straight out of an embedder hook, so the value is not guaranteed to
+  // be a real enumerator. Bucket anything outside the enum rather than write past the vector.
   const auto index = static_cast<std::size_t>(reason);
   return index < kStopReasonCount ? index : 0;
 }
@@ -350,22 +346,15 @@ StopReason Executor::violation_reason() const noexcept {
   return violation_reason_;
 }
 
-// Cross-instruction masking is only sound if the later instruction that overwrites a flag write is
-// guaranteed to run before anything external observes rflags. Three things break that, all handled:
-// a caller that never steps again (masking is only applied from run()'s own loop), a fault partway
-// through the span (can_fault() instructions are treated as reading every flag), and TF/DR7 or a
-// hook registered after caching (re-checked at every dispatch, see masking_safe_now).
-//
-// Accepted residual: an async request_stop() landing mid-span can still surface a stale masked
-// value on that abort path.
+// Masking is sound only if the covering instruction is guaranteed to run. Three things break that,
+// all handled: a caller that never steps again, a mid-span fault, and TF/DR7 or a hook registered
+// after caching. An async request_stop() landing mid-span is the accepted residual.
 constexpr bool kFlagLivenessTablesTrustworthy = true;
 
 bool Executor::block_liveness_eligible(const Memory& memory) const noexcept {
-  // Instruction/code hooks and memory-access hooks get full ExecutionContext (state.rflags)
-  // access at points mid-block that iced's per-instruction rflags tables don't know about -- see
-  // flag_liveness.hpp. Trap and execution hooks don't have
-  // that problem (execution hooks only ever get an address, not state; trap-kind instructions are
-  // always block-terminal under the boundary rules below) and are deliberately not checked here.
+  // Instruction, code and access hooks see rflags mid-block at points the per-instruction tables
+  // do not know about. Trap and execution hooks cannot: one gets only an address, and the other is
+  // always block-terminal.
   return !has_instruction_hooks_ && !has_code_hooks_ &&
          !has_execution_hooks_ && !has_execution_address_hooks_ &&
          !memory.has_access_hooks();
@@ -376,30 +365,21 @@ ExecutionResult Executor::step(CpuState& state, Memory& memory) {
 }
 
 bool Executor::jit_bypass_eligible(const CpuState& state, const Memory& memory) const noexcept {
-  // Reuses block_liveness_eligible's hook check, which already asks whether anything can skip
-  // step_impl's per-instruction machinery. TF and DR7 gate it for the same reason they gate
-  // masking_safe_now: single-stepping has to land on every boundary regardless of hooks.
-  //
-  // Context-sync callbacks are per-instruction machinery too -- step_impl pulls state in and pushes
-  // it back out around the handler. A bypassing consumer calls neither, so a compiled span ran
-  // against a CpuState nobody refreshed and every register write it made was discarded.
+  // Reuses block_liveness_eligible's hook check, and the context-sync callbacks count as the same
+  // per-instruction machinery: a bypassing consumer ran against a CpuState nobody refreshed.
   return (state.rflags & kFlagTF) == 0 && !has_enabled_breakpoints(state) && !context_read_cb_ && !context_write_cb_ &&
          block_liveness_eligible(memory);
 }
 
 ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_masking) {
   StepDepthScope depth_scope{*this};
-  // Each level here is an embedder callback re-entering step(), costing a host stack frame and a
-  // nested_decode_scratch_ slot that is never given back. The guest cannot drive this on its own,
-  // but nothing bounded it either, so a hook that re-enters unconditionally took the host down by
-  // stack exhaustion instead of returning something the embedder could act on.
+  // Each level is an embedder callback re-entering step(). Nothing bounded it, so a hook that
+  // re-enters unconditionally exhausted the host stack instead of returning something actionable.
   if (step_depth_ > kMaxStepDepth) {
     return {StopReason::execution_limit, 0, std::nullopt, std::nullopt};
   }
-  // The level cap above says nothing about how many bytes a level costs, and this frame is large
-  // enough that the two disagree badly -- see kMaxStepStackBytes. Measure the descent instead of
-  // assuming it. The probe is volatile so it keeps an address to compare rather than being folded
-  // away, and the comparison is by magnitude so it does not bake in which way the stack grows.
+  // The level cap says nothing about bytes per level, so measure the descent instead. Volatile so
+  // the probe keeps an address, and compared by magnitude so it assumes no stack direction.
   volatile char stack_probe = 0;
   const auto probe_here = reinterpret_cast<std::uintptr_t>(const_cast<const char*>(&stack_probe));
   if (step_depth_ == 1) {
@@ -411,24 +391,15 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
       return {StopReason::execution_limit, 0, std::nullopt, std::nullopt};
     }
   }
-  // A hook callback is free to call back into step()/run(), and the decode cache is direct-mapped
-  // on (rip >> 1), so a nested step at any rip 0x4000 away from the outer one lands on the exact
-  // same slot. The outer frame is still holding a reference into that slot -- ExecutionContext's
-  // `instr` -- across hook dispatch and the handler call, while the opcode it already picked its
-  // handler from is a copy. Overwriting the slot therefore runs the outer instruction's handler
-  // against the nested instruction's operands: an `add rax, rbx` executing as `add rcx, rdx`.
-  // Nested frames get their own private slot instead and never touch the shared array.
+  // The decode cache is direct-mapped on (rip >> 1), so a nested step 0x4000 away lands on the outer
+  // frame's live slot and runs its handler against the nested operands. Nested frames get their own.
   const bool nested = step_depth_ > 1;
-  // Nested frames are excluded because they use neither cache (see can_use_decode_cache and the
-  // scratch slot above), so claiming ownership on their behalf only mislabels what the outer frame
-  // has cached. A hook re-entering with a second Memory used to leave the tag naming that one while
-  // the outer frame carried on filling entries decoded from the first, and the next step against the
-  // second Memory then found them and ran the wrong guest's bytes.
+  // Nested frames use neither cache, so tagging on their behalf only mislabels what the outer frame
+  // cached: a hook re-entering with a second Memory left the tag naming it while the outer frame
+  // kept filling entries from the first, and the next step then ran the wrong guest's bytes.
   if (!nested && cache_memory_instance_ != memory.instance_id()) [[unlikely]] {
-    // Both caches below are validated on (rip, page epoch, mode) alone, and those epochs come from
-    // a per-Memory counter that every Memory starts near zero. An Executor reused across two of them
-    // -- separate guests, or one guest rebuilt in a loop -- would find a cached decode from the
-    // first that matched the second's epoch and execute the first's bytes at that address.
+    // Both caches validate on (rip, page epoch, mode), and epochs come from a per-Memory counter
+    // starting near zero, so an Executor reused across two would run the first one's bytes.
     for (auto& entry : *decode_cache_) entry.valid = false;
     for (auto& entry : *code_page_cache_) entry.valid = false;
     cache_memory_instance_ = memory.instance_id();
@@ -441,10 +412,8 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
     notify_stop_hooks(state, memory, stopped, state.rip);
     return stopped;
   }
-  // Both go through a local copy for the same reason the MMIO dispatch does: these are
-  // host-supplied callables owned by this Executor, and set_context_*_callback assigns the member
-  // outright. One that reinstalls itself from inside its own body would destroy the functor whose
-  // operator() is still on the stack.
+  // Copied locally like the MMIO dispatch: a callback that reinstalls itself from inside its own
+  // body would destroy the functor whose operator() is still on the stack.
   if (auto read_cb = context_read_cb_) read_cb(state);
   struct WriteSync {
     Executor& self; CpuState& state;
@@ -472,10 +441,8 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
     return fallback;
   };
 
-  // RF and the SS-load shadow are spent at the top of an attempt, but an instruction that faults
-  // never ran, so a fault hook asking for a retry has to get them back. Without that the second
-  // attempt fires the very execute breakpoint they exist to suppress, and the guest's #DB handler
-  // irets straight back onto the same faulting instruction.
+  // RF and the SS-load shadow are spent per attempt, but a faulting instruction never ran, so a
+  // retry has to get them back or it fires the breakpoint they exist to suppress.
   bool rf_consumed = false;
   std::uint8_t debug_suppression_consumed = 0;
 
@@ -526,9 +493,8 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
 
     const auto rip_page = state.rip / Memory::kPageSize;
     const auto rip_page_epoch = memory.page_code_epoch(rip_page);
-    // Epoch of the page holding an instruction's final byte. Only differs from rip's own page for
-    // one that straddles a boundary, which is the only case worth a second lookup; `spans` is false
-    // when the span runs off the end of the address space, which is never cacheable.
+    // Epoch of the page holding the final byte, which only differs across a boundary. `spans` is
+    // false when the instruction runs off the end of the address space, which is never cacheable.
     const auto last_byte_epoch = [&](std::uint32_t length, bool& spans) -> std::uint64_t {
       const auto last_byte = state.rip + (length - 1);
       spans = last_byte >= state.rip;
@@ -591,12 +557,8 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
       bool truncated_to_page = false;
       if (!fetched) {
         if (!memory.read(state.rip, bytes.data(), bytes.size(), MemoryAccessKind::instruction_fetch)) {
-          // A fetch only faults on the bytes the instruction actually needs. Asking for a full
-          // 15 bytes unconditionally means a one-byte instruction in the last stretch of a page
-          // faults whenever the next page happens to be unmapped or non-executable, which real
-          // code hits constantly (the last instruction before a guard page) and which also hands
-          // the guest a way to probe the host's mapping layout without touching it. Retry with
-          // just what this page holds and let the decoder say whether the rest was ever needed.
+          // A fetch only faults on the bytes the instruction needs. Retry with what this page holds
+          // and let the decoder say whether that was enough.
           const auto in_page =
               static_cast<std::size_t>(Memory::kPageSize - (state.rip % Memory::kPageSize));
           truncated_to_page = in_page < bytes.size() &&
@@ -623,10 +585,8 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
       const auto decoded = decoder.decode();
       if (!decoded.has_value() && truncated_to_page &&
           decoded.error().error == iced_x86::DecoderError::NO_MORE_BYTES) {
-        // The instruction really does run into the next page, so the fetch fault the truncated
-        // retry above suppressed was the right answer after all.
-        // Wraps to zero for an instruction on the very last page, which is not a page it ran into
-        // but the end of the address space. That is a #GP against the instruction itself.
+        // The instruction really does run into the next page, so the suppressed fetch fault was
+        // right after all. Wraps to zero on the last page, which is #GP, not a page fault.
         const auto next_page = (state.rip | (Memory::kPageSize - 1)) + 1;
         const auto reason = next_page == 0 ? StopReason::general_protection : StopReason::page_fault;
         const auto fault_rip = next_page == 0 ? state.rip : next_page;
@@ -681,11 +641,8 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
       cache_entry.valid = can_use_decode_cache && fits_in_address_space;
       cache_entry.dead_flags_mask = 0;
 
-      // Opportunistically lift the rest of this basic block (straight-line run up to the first
-      // control-flow/trap/hooked-address boundary) so the backward flag liveness pass has more
-      // than one instruction to work with. This only pre-populates decode_cache_ entries for
-      // instructions step() would decode-cache anyway on its next few calls; it doesn't change
-      // what gets executed now or batch dispatch in any way.
+      // Lift the rest of the block so the backward liveness pass has more than one instruction.
+      // Only pre-populates decode entries step() would fill anyway; nothing about dispatch changes.
       if (fetched && cache_entry.valid && cache_entry.trap_kind == 0xFFu && cache_entry.simd_allowed &&
           !ends_lifted_block(cache_entry.instr)) {
         std::array<std::size_t, kMaxBlockLiftLength> lifted_indices{};
@@ -701,11 +658,9 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
             break;
           }
           const auto next_index = static_cast<std::size_t>((next_rip >> 1) & (kDecodeCacheSize - 1));
-          // The cache index folds two consecutive addresses (rip, rip+1) onto the same slot
-          // whenever rip is even, so a short enough run of 1-byte instructions can collide with
-          // a slot already claimed earlier in *this* lift -- including slot 0, which is
-          // cache_entry itself, still pending dispatch below. Stop rather than let a later
-          // instruction overwrite an earlier one's entry out from under it.
+          // The index folds rip and rip+1 onto one slot, so a run of 1-byte instructions can
+          // collide with a slot this same lift already claimed -- including cache_entry itself,
+          // still pending dispatch below.
           bool collides = false;
           for (std::size_t i = 0; i < lifted_count; ++i) {
             if (lifted_indices[i] == next_index) {
@@ -716,9 +671,8 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
           if (collides) {
             break;
           }
-          // The lift only runs off the page cache, and that path is gated on the whole 15-byte
-          // fetch window fitting inside one page, so every instruction it decodes lives on rip's
-          // page and shares its epoch. Bail rather than stamp the wrong one if that ever changes.
+          // The lift runs off the page cache, gated on the whole fetch window fitting one page, so
+          // every instruction shares rip's epoch. Bail rather than stamp the wrong one.
           const auto next_last_byte = next_rip + (next_decoded.value().length() - 1);
           if (next_rip / Memory::kPageSize != rip_page || next_last_byte < next_rip ||
               next_last_byte / Memory::kPageSize != rip_page) {
@@ -824,10 +778,8 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
       if (exec_hit_bits != 0) {
         state.dr[6] |= exec_hit_bits;
         ExecutionContext db_ctx{state, memory, instr, next_rip, false};
-        // An instruction breakpoint is a fault, so the frame carries the breakpointed instruction's
-        // own rip and the handler's iret lands right back on it. RF in the saved rflags image is the
-        // only thing that stops the breakpoint firing again on that return -- without it the guest
-        // never retires the instruction.
+        // An instruction breakpoint is a fault, so the frame carries its own rip and the iret lands
+        // back on it. RF in the saved image is the only thing stopping it firing forever.
         const auto db_result = detail::dispatch_interrupt(db_ctx, 1u, instruction_start_rip, std::nullopt, true);
         if (db_result.reason != StopReason::none) {
           if (try_recover_fault(db_result, fault_address_of(db_result, state.rip))) {
@@ -876,10 +828,9 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
 
     ExecutionContext ctx{state, memory, instr, next_rip, false};
     if (has_execution_hooks_ || has_execution_address_hooks_) {
-      // One scope across both loops: a hook in the first is just as free to remove one from the
-      // second. Without this these two were the only dispatches in the class that ran unguarded, so
-      // a hook that removed itself -- a one-shot breakpoint, the obvious use for an execution hook --
-      // erased from the vector this range-for is walking and left it reading destroyed storage.
+      // One scope across both loops, since a hook in the first can remove one from the second.
+      // These were the only unguarded dispatches, so a self-removing one-shot breakpoint erased
+      // from the vector its own range-for was walking.
       HookDispatchScope scope{*this};
       if (has_execution_hooks_) {
         for (auto& [id, hook] : execution_hooks_) {
@@ -932,25 +883,19 @@ ExecutionResult Executor::step_impl(CpuState& state, Memory& memory, bool allow_
     }
 
     ExecutionResult result{};
-    // Dispatch on the NORMALIZED code, not the raw iced code. iced reports `68 imm32` / `6a imm8` as
-    // PUSHD_IMM32 / PUSHD_IMM8 (dword operand size), but in 64-bit mode PUSH imm defaults to a 64-bit
-    // stack slot (rsp -= 8). normalize_reported_code maps those to the PUSHQ_* forms; previously that
-    // mapping only affected the *reported* code while dispatch used the raw code, so seven executed the
-    // 4-byte handler (rsp -= 4) -- corrupting the stack for any guest code that pushes an imm.
+    // Dispatch on the normalized code: iced reports PUSH imm as the dword form, but in 64-bit mode
+    // it takes a 64-bit stack slot. Dispatching on the raw code ran the 4-byte handler and corrupted
+    // the stack for any guest that pushes an immediate.
     const auto code = reported_code;
-    // The mask is only trustworthy if the caller keeps draining the block (only run() promises
-    // that), TF is clear, no debug register is armed, and no hook was registered after this block
-    // was lifted -- a cached mask outlives the one lift-time check. Context-sync callbacks belong
-    // here too: the write side hands the host a CpuState at every instruction boundary, so a flag
-    // write the span meant to cover later has already been seen missing.
+    // The mask is only trustworthy if the caller keeps draining the block, TF is clear, no debug
+    // register is armed, and no hook arrived after the lift -- a cached mask outlives that one
+    // check. Context-sync counts too: it hands the host a CpuState at every boundary.
     const bool masking_safe_now = allow_masking && (state.rflags & kFlagTF) == 0 &&
                                    !has_enabled_breakpoints(state) && !context_read_cb_ && !context_write_cb_ &&
                                    block_liveness_eligible(memory);
-    // Saved and put back rather than plain assigned. A handler's memory access can land on an
-    // MMIO device or a passthrough, and that host callback is free to re-enter run(); the nested
-    // frame installs a mask for its own block and would otherwise leave it in place. Everything
-    // this handler writes after the callback returns would then be filtered by the wrong block's
-    // mask, which can drop a flag write that is genuinely live here.
+    // Saved and put back, not assigned: a handler's access can reach a device callback that
+    // re-enters run(), and the nested frame's mask would otherwise stay installed and filter
+    // everything this handler writes afterwards.
     const struct DeadFlagsMaskScope {
       std::uint64_t saved;
       ~DeadFlagsMaskScope() { detail::set_dead_flags_mask(saved); }
@@ -1029,10 +974,8 @@ ExecutionResult Executor::run(CpuState& state, Memory& memory, std::size_t max_i
       notify_stop_hooks(state, memory, stopped, state.rip);
       return stopped;
     }
-    // Only allow masking when there's enough budget left that ANY lifted block started now
-    // (bounded by kMaxBlockLiftLength) is guaranteed to finish inside this call, so run() never
-    // returns to its own caller mid-span -- see step_impl's masking_safe_now. Near the tail of
-    // the budget this falls back to the same always-safe unmasked dispatch a bare step() gets.
+    // Mask only with enough budget left that any block started now finishes inside this call, so
+    // run() never returns mid-span. Near the tail it falls back to the unmasked dispatch.
     const bool allow_masking = (max_instructions - i) >= kMaxBlockLiftLength;
     last = step_impl(state, memory, allow_masking);
     if (last.reason != StopReason::none) {
@@ -1231,10 +1174,8 @@ void Executor::clear_hooks() {
 }
 
 InstructionHookAction Executor::run_instruction_hooks(InstructionHookContext& ctx, ExecutionResult& stop_result) {
-  // Only at depth 0. Re-entered from inside a callback, this would run queued mutations while an
-  // OUTER dispatch is still walking instruction_hooks_/code_hooks_ -- a queued emplace_back
-  // reallocates the vector that outer range-for is iterating. The outermost HookDispatchScope
-  // flushes the queue on its way out, which is the only safe point.
+  // Only at depth 0: a queued emplace_back run from inside a callback reallocates the vector an
+  // outer dispatch is still walking. The outermost scope flushing on its way out is the safe point.
   if (!dispatching_hooks_ && !pending_hook_mutations_.empty()) {
     apply_pending_hook_mutations();
   }

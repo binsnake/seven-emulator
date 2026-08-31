@@ -61,12 +61,9 @@ bool write_msr(CpuState& state, std::uint32_t index, std::uint64_t value) {
     it->second = value;
     return true;
   }
-  // Accepting any index at all turns this map into 4 billion slots of host-heap storage that a
-  // CPL0 guest can fill by walking ECX through a wrmsr loop -- on the order of 200 GB before the
-  // counter even wraps, with nothing else in the emulator able to interrupt or bound it. Real
-  // hardware implements a few hundred MSRs and #GPs on everything else, so a ceiling well above
-  // any plausible guest keeps the permissive behaviour where it matters and gives back the fault
-  // an unimplemented MSR would have raised. Writes to an index already present never fail.
+  // Any index at all makes this 4 billion slots of host heap a guest can fill with a wrmsr loop,
+  // around 200 GB, with nothing able to bound it. Hardware implements a few hundred and #GPs on the
+  // rest. Writes to an index already present never fail.
   constexpr std::size_t kMaxTrackedMsrs = 4096;
   if (state.msr.size() >= kMaxTrackedMsrs) {
     return false;
@@ -130,11 +127,9 @@ std::uint64_t sign_extend(std::uint64_t value, std::size_t width) {
 }
 
 ExecutionResult memory_fault(ExecutionContext& ctx, std::uint64_t address) {
-  // A non-canonical linear address always faults #GP(0), checked before any page walk, never #PF.
-  // Confirmed against real hardware with a standalone probe; this is what seven-fuzzer's BT/BTS/BTR/
-  // BTC findings turned out to be, since a huge register bit index extends the effective address per
-  // the SDM and routinely lands non-canonical. The inline {StopReason::page_fault} sites that used
-  // to bypass this were later swept across every handler, so the check is universal now.
+  // A non-canonical address always faults #GP(0), before any page walk, never #PF. This is what
+  // seven-fuzzer's BT/BTS/BTR/BTC findings turned out to be: a huge register bit index extends the
+  // effective address per the SDM and routinely lands non-canonical.
   if (!is_canonical_address(address)) {
     return {StopReason::general_protection, 0, ExceptionInfo{StopReason::general_protection, address, 0}, ctx.instr.code()};
   }
@@ -193,13 +188,9 @@ std::uint64_t debug_data_breakpoint_hits(CpuState& state, std::uint64_t address,
   };
   auto ranges_overlap = [](std::uint64_t a_base, std::size_t a_size, std::uint64_t b_base, std::size_t b_size) noexcept {
     if (a_size == 0 || b_size == 0) return false;
-    // b_base/b_size is the instruction's own memory access -- fully guest-controlled via register
-    // values, unlike the watchpoint side. A guest picking an address near the top of the address
-    // space (e.g. a 64-byte ZMM store) can make b_base + b_size wrap back down past zero, which
-    // the plain non-wrapping comparison below would then read as "no overlap" even when the
-    // access's real (wrapping) span does touch the watched range -- silently evading a hardware
-    // data breakpoint. Same risk on the a side in principle, so guard both: treat either wrap as
-    // "can't rule out overlap" rather than risk a false negative on a debug/security watchpoint.
+    // b_base/b_size is the guest-controlled access, so a 64-byte store near the top of the address
+    // space wraps past zero and the non-wrapping comparison reads "no overlap" for a span that does
+    // touch the watched range, evading the breakpoint. Guard both sides.
     const auto a_end = a_base + static_cast<std::uint64_t>(a_size);
     const auto b_end = b_base + static_cast<std::uint64_t>(b_size);
     if (a_end < a_base || b_end < b_base) return true;
@@ -223,12 +214,8 @@ std::uint64_t debug_data_breakpoint_hits(CpuState& state, std::uint64_t address,
 }
 
 
-// The gate's code selector lands in sreg[1] at the bottom of this function, and sreg[1] is the only
-// thing in the tree that records the current privilege level. The DPL check below is what stops a
-// guest the embedder placed at ring 3 from walking into an arbitrary vector and coming back out at
-// ring 0. It only covers the descriptor's own DPL: there is no supervisor bit in this memory model,
-// so an embedder that maps the IDT somewhere the guest can write has handed it the ability to
-// author its own gate, exactly as it would on hardware.
+// The gate's code selector lands in sreg[1], the only record of privilege level, so the DPL check
+// below is what stops a ring-3 guest entering a vector and returning at ring 0.
 ExecutionResult dispatch_interrupt(ExecutionContext& ctx, std::uint8_t vector, std::uint64_t return_rip,
                                    std::optional<std::uint32_t> error_code, bool push_rf_in_frame,
                                    bool software_interrupt) {
@@ -349,11 +336,9 @@ ExecutionResult dispatch_interrupt(ExecutionContext& ctx, std::uint8_t vector, s
   const auto return_width = instruction_pointer_width(ctx.state.mode);
   const auto flags_width = instruction_pointer_width(ctx.state.mode);
   const auto pushed_rflags = push_rf_in_frame ? (ctx.state.rflags | kFlagRF) : ctx.state.rflags;
-  // The frame either lands whole or rsp goes back where it started. A guest that points rsp at a
-  // guard page and then takes an exception used to leave the emulator half a frame in: rsp lowered
-  // by the slots that did land, the rest unwritten, and the fault returned to the embedder with no
-  // way to tell how far it got. An embedder that maps the page and restarts then builds a second
-  // frame underneath the first.
+  // The frame lands whole or rsp goes back where it started. A guest pointing rsp at a guard page
+  // used to leave it half a frame in, with no way for the embedder to tell how far it got, so
+  // mapping the page and restarting built a second frame under the first.
   const auto entry_sp = ctx.state.gpr[4];
   const auto push_frame = [&]() -> ExecutionResult {
     if (auto result = push_width(pushed_rflags, flags_width); !result.ok()) {
@@ -427,11 +412,9 @@ std::size_t operand_width(const iced_x86::Instruction& instr, std::uint32_t oper
     return register_width(instr.op_register(operand_index));
   }
   if (kind == iced_x86::OpKind::MEMORY) {
-    // This iced port's memory_size() already resolves to a size in BYTES, unlike upstream's, which
-    // returns the MemorySize enum. Casting it back into the enum and looking it up a second time
-    // reindexed the table: 4 became UINT52 (8 bytes) and 8 became UINT512 (64), so a `crc32 r64,
-    // qword ptr [mem]` asked read_operand for 64 bytes and overran its 8-byte stack local. 1 and 2
-    // happened to land on UINT8/UINT16 and stayed correct, which is why only the wider forms broke.
+    // This port's memory_size() already returns BYTES, unlike upstream's enum. Casting it back and
+    // looking it up again reindexed the table, so `crc32 r64, qword ptr [mem]` asked for 64 bytes
+    // and overran an 8-byte local. 1 and 2 happened to stay correct, which hid it.
     return instr.memory_size();
   }
   switch (kind) {
@@ -453,12 +436,9 @@ std::size_t operand_width(const iced_x86::Instruction& instr, std::uint32_t oper
   }
 }
 
-// An address-size prefix leaves the base and index registers narrower than the mode, and the
-// effective address wraps within that width before any segment base is added: [eax-0x10] with
-// eax=8 is 0xFFFFFFF8, not a sign-extended 64-bit value. iced records the size nowhere except in
-// which register family it picked, so read it back from there. Neither a base nor an index means
-// a bare displacement, which the decoder has already truncated, since nothing here could tell a
-// 32-bit address apart from a 64-bit one.
+// An address-size prefix narrows the base and index, and the address wraps within that width before
+// any segment base is added: [eax-0x10] with eax=8 is 0xFFFFFFF8. iced records the size only in which
+// register family it picked, and a bare displacement is already truncated by the decoder.
 [[nodiscard]] std::uint64_t effective_address_mask(const iced_x86::Instruction& instr) {
   const auto reg = instr.memory_base() != iced_x86::Register::NONE ? instr.memory_base()
                                                                    : instr.memory_index();
@@ -790,15 +770,9 @@ void set_sub_flags(CpuState& state, std::uint64_t lhs, std::uint64_t rhs, std::u
   rhs &= mask;
   result &= mask;
   const auto borrow = static_cast<std::uint64_t>(borrow_in ? 1 : 0);
-  // At width==8, rhs+borrow can overflow the uint64_t container itself
-  // (rhs==UINT64_MAX with borrow_in set) and silently wrap to 0, making the
-  // comparison below always false regardless of lhs. The effective
-  // (unbounded) subtrahend there is 2^64, which always exceeds any 64-bit
-  // lhs, so a borrow is unconditionally required -- mirrors set_add_flags's
-  // analogous handling of carry_in overflowing the container for ADD/ADC.
-  // Not reachable for width<8: rhs+borrow is at most 2^32, which never
-  // overflows a 64-bit container. Hardware-confirmed via seven-fuzzer
-  // (SBB RM64,R64 with rhs=UINT64_MAX, incoming CF=1).
+  // At width 8 rhs+borrow can wrap the container to 0 and make the comparison below always false.
+  // The real subtrahend is 2^64, which exceeds any 64-bit lhs, so the borrow is unconditional.
+  // Unreachable below width 8, and hardware-confirmed via seven-fuzzer.
   const bool subtrahend_overflowed = width == 8 && borrow_in && rhs == mask;
   set_flag(state.rflags, kFlagCF, subtrahend_overflowed || (lhs < (rhs + borrow)));
   set_flag(state.rflags, kFlagAF, ((lhs ^ rhs ^ result) & 0x10) != 0);

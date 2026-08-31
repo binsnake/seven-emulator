@@ -99,13 +99,10 @@ big_uint read_operand(ExecutionContext& ctx, std::uint32_t operand_index, std::s
   }
   if (kind == iced_x86::OpKind::MEMORY) {
     if (ctx.instr.is_broadcast()) {
-      // The broadcast element is the packed operand's ELEMENT size, which lives in the raw
-      // MemorySize's element_size. memory_size() has already collapsed that to the full operand
-      // width (64 for a zmm form), and running that byte count back through get_size looks the
-      // table up a second time on an index that means nothing: 64 reindexed to PACKED128_UINT8 and
-      // came back as 16, so a {1to16} dword broadcast read 16 bytes of guest memory instead of 4
-      // and then laid down 4 lanes instead of 16. The xmm forms reindexed to 4 and were right by
-      // accident. A zero would be worse still -- the lane loop advances by this.
+      // The broadcast element size lives in the raw MemorySize. memory_size() has collapsed it to the
+      // full operand width, and running that byte count back through get_size reindexes the table on
+      // a meaningless index: 64 came back as 16, so a {1to16} dword broadcast read 16 bytes and laid
+      // down 4 lanes. The xmm forms were right by accident, and a zero would hang the lane loop.
       const auto element_width = iced_x86::memory_size_ext::get_element_size(ctx.instr.memory_size_enum());
       if (element_width == 0 || element_width > width) {
         if (ok) *ok = false;
@@ -394,12 +391,9 @@ ExecutionResult legacy_shift_reg(ExecutionContext& ctx, Fn&& fn, bool zero_upper
   if (ctx.instr.op_kind(0) != iced_x86::OpKind::REGISTER || !is_vector_register(ctx.instr.op_register(0))) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
-  // The count source (operand 1) is xmm-or-m128 for the legacy 2-operand
-  // form, not register-only -- read_operand() handles both, matching every
-  // sibling *_reg function in this file. A prior register-only check here
-  // rejected the valid memory form outright and faulted on a mapped address.
-  // Legacy (non-VEX) form: real hardware also requires that m128 count source aligned to 16
-  // bytes, #GP(0) otherwise -- see require_aligned_memory_operand's own doc comment.
+  // The count source is xmm-or-m128 for the legacy 2-operand form, not register-only, and a prior
+  // register-only check rejected the valid memory form. Hardware also wants that m128 16-byte
+  // aligned.
   if (auto fault = detail::require_aligned_memory_operand(ctx, 1, 0xFULL)) return *fault;
   bool ok = false;
   const auto dst_reg = ctx.instr.op_register(0);

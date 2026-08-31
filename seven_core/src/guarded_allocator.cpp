@@ -27,10 +27,9 @@ std::size_t guarded_page_size() noexcept {
 
 namespace {
 
-// Which pages are guards, so a fault handler can answer the question without guessing. Address
-// space gets reused, so this has to be kept exact rather than approximated by a low/high range.
-// Both are leaked on purpose. A fault can arrive during static destruction, and a handler that
-// reaches a destroyed mutex or set turns a useful finding into a second crash.
+// Which pages are guards, kept exact rather than approximated by a range since address space gets
+// reused. Both are leaked on purpose: a fault during static destruction reaching a destroyed mutex
+// would turn a useful finding into a second crash.
 std::mutex& registry_lock() {
   static auto* lock = new std::mutex();
   return *lock;

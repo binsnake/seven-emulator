@@ -24,9 +24,8 @@ constexpr std::uint16_t kX87ExceptionPrecision = 0x0020u;
 constexpr std::uint16_t kX87ExceptionStackFault = 0x0040u;
 constexpr std::uint16_t kX87ExceptionMask = 0x003Fu;
 
-// An enabled underflow trap is handed a result whose exponent has been biased back into range
-// rather than the tiny one the masked path would store. IEEE 754-2019 7.5 and SDM 4.9.1.5 agree on
-// 24576 for the 80-bit format.
+// An enabled underflow trap gets its exponent biased back into range rather than the tiny masked
+// result. IEEE 754-2019 7.5 and SDM 4.9.1.5 agree on 24576 for the 80-bit format.
 constexpr int kX87UnderflowTrapBias = 24576;
 
 inline bool x87_exceptions_masked(const CpuState& state, std::uint16_t exceptions);
@@ -47,12 +46,8 @@ inline X87Scalar x87_indefinite() {
   return X87Scalar(v);
 }
 
-// FLDPI and its neighbours load an irrational, so the 64-bit significand is always a rounding of a
-// value with infinitely many bits left over, and hardware does that rounding under the guest's RC
-// rather than baking one answer in. Measured on this machine: every one of the five matches the
-// correctly-rounded result for all four RC settings, so the table below carries the truncated
-// significand plus the single bit that says which way round-to-nearest goes (none of them is a tie).
-// The old code went through Float80(double), which threw away 11 bits before RC could matter.
+// These load irrationals, so hardware rounds under the guest's RC rather than baking one answer in.
+// Float80(double) threw away 11 bits before RC could matter.
 inline X87Scalar x87_constant(const CpuState& state, std::uint16_t biased_exp, std::uint64_t truncated,
                               bool nearest_rounds_up) {
   bool increment = false;
@@ -71,10 +66,8 @@ inline std::size_t x87_st_index(iced_x86::Register reg) {
   return static_cast<std::size_t>(static_cast<std::uint32_t>(reg) - static_cast<std::uint32_t>(iced_x86::Register::ST0));
 }
 
-// A masked stack underflow does not skip the instruction: hardware still retires the pop. x87_pop()
-// deliberately refuses to move TOP while ST(0) is empty, which is right everywhere else, so the
-// indefinite goes into ST(0) first and the ordinary pop then leaves exactly what hardware leaves --
-// TOP advanced, the vacated register tagged empty.
+// A masked stack underflow still retires the pop, but x87_pop() refuses to move TOP while ST(0) is
+// empty, so the indefinite goes in first and the ordinary pop then matches hardware.
 inline void x87_underflow_pop(CpuState& state) {
   state.x87_set(0, x87_indefinite());
   (void)state.x87_pop();
@@ -99,9 +92,8 @@ inline uint_fast8_t x87_softfloat_rounding_mode(const CpuState& state) {
   }
 }
 
-// softfloat names the five IEEE exceptions and the x87 status word names six, in a different order.
-// The sixth, #D, has no softfloat counterpart because no IEEE format needs one -- it is a question
-// about the operands, which is why x87_operand_exceptions below asks it separately.
+// softfloat has five IEEE exceptions, the x87 status word six, in a different order. The extra one,
+// #D, is a question about the operands, which x87_operand_exceptions asks separately.
 inline std::uint16_t x87_exceptions_from_softfloat(uint_fast8_t flags) {
   std::uint16_t exceptions = 0;
   if ((flags & softfloat_flag_invalid) != 0) exceptions |= kX87ExceptionInvalid;
@@ -135,12 +127,9 @@ inline std::uint16_t x87_operand_exceptions(const X87Scalar& lhs, const X87Scala
   return 0;
 }
 
-// The answer every x87 operation gives to the operand shapes it cannot compute with, decided before
-// it ever looks at the value: an encoding the format does not support is #IA with the indefinite, a
-// signalling NaN is #IA with that same NaN quietened, and a quiet NaN passes straight through
-// raising nothing. Only the last of the three used to happen outside the softfloat-backed
-// arithmetic, so FSCALE of a signalling NaN handed the guest back a signalling NaN and FYL2X of an
-// unnormal computed a logarithm of it. Returns true when `out` holds the answer.
+// What x87 answers for operand shapes it cannot compute with: unsupported encoding is #IA with the
+// indefinite, a signalling NaN is #IA quietened, a quiet NaN passes through raising nothing. Only
+// the last used to happen outside the softfloat arithmetic.
 inline bool x87_special_result(const X87Scalar& value, X87Scalar& out, std::uint16_t& exceptions) {
   if (seven::isunsupported(value)) {
     exceptions |= kX87ExceptionInvalid;
@@ -184,11 +173,8 @@ inline bool x87_special_result(const X87Scalar& a, const X87Scalar& b, X87Scalar
   return false;
 }
 
-// C1 is not something an instruction may leave alone. Every x87 operation with a defined C1 writes
-// it, and the meanings never overlap: 1 for a stack overflow, 0 for a stack underflow, and otherwise
-// "the rounding moved the result away from zero", which only says anything when #P fired. Everything
-// else clears it. seven wrote C1 from the compares and the stack faults and nowhere else, so an
-// ordinary FADD left whatever the guest happened to be carrying.
+// C1 is never left alone: 1 for stack overflow, 0 for underflow, otherwise "rounding moved away
+// from zero", cleared by everything else. seven only wrote it from compares and stack faults.
 inline void x87_set_c1(ExecutionContext& ctx, bool value) {
   auto sw = ctx.state.get_x87_status_word();
   sw = value ? static_cast<std::uint16_t>(sw | 0x0200u) : static_cast<std::uint16_t>(sw & ~0x0200u);
@@ -206,10 +192,9 @@ struct X87MemOperand {
   std::uint16_t exceptions;
 };
 
-// A single- or double-precision operand has to be classified in ITS OWN format, before widening: an
-// m32 denormal is a perfectly ordinary 80-bit normal once it arrives, so asking the widened value
-// afterwards can never see the #D hardware raises. The same widening used to go through the host's
-// float/double, which quietens a signalling NaN before anything can report the #IA.
+// A narrow operand must be classified in its own format: an m32 denormal is an ordinary 80-bit
+// normal once widened, so the #D is unobservable afterwards. Widening through host float/double also
+// quietens a signalling NaN before anything can report the #IA.
 inline X87MemOperand x87_operand_from_f32(std::uint32_t bits) {
   std::uint16_t exceptions = 0;
   const std::uint32_t exponent = (bits >> 23) & 0xFFu;
@@ -232,11 +217,8 @@ inline X87MemOperand x87_operand_from_f64(std::uint64_t bits) {
   return {seven::from_f64_bits(bits), exceptions};
 }
 
-// One x87 operation, run under the guest's rounding control, with the exceptions read off softfloat
-// rather than inferred from the answer afterwards. SoftFloat takes both the rounding mode and the
-// flags through globals, so each needs owning for the length of the call and putting back after.
-// An unsupported operand never reaches the arithmetic: there is no value to compute with, and the
-// masked answer is the indefinite.
+// One x87 operation under the guest's rounding control, with exceptions read off softfloat rather
+// than inferred. Both travel through globals, so each is owned for the call and put back.
 template <typename Fn>
 inline X87Computed x87_evaluate(const CpuState& state, const X87Scalar& lhs, const X87Scalar& rhs, Fn&& fn) {
   const std::uint16_t operands = x87_operand_exceptions(lhs, rhs);
@@ -249,9 +231,8 @@ inline X87Computed x87_evaluate(const CpuState& state, const X87Scalar& lhs, con
       static_cast<std::uint16_t>(operands | x87_exceptions_from_softfloat(computed.flags));
   bool rounded_up = false;
   if ((exceptions & kX87ExceptionPrecision) != 0) {
-    // softfloat says the answer was inexact but not which way it went, and C1 wants the direction.
-    // Running it again with rounding truncated gives the neighbour on the toward-zero side; the two
-    // differ exactly when the guest's mode pushed the result away from zero.
+    // softfloat reports inexact but not the direction C1 wants. Re-running truncated gives the
+    // toward-zero neighbour, and the two differ exactly when rounding went away from zero.
     seven::RoundingGuard truncating(softfloat_round_minMag);
     const auto toward_zero = seven::with_exception_flags([&] { return fn(lhs, rhs); });
     rounded_up = toward_zero.value.val.signExp != computed.value.val.signExp ||
@@ -260,10 +241,8 @@ inline X87Computed x87_evaluate(const CpuState& state, const X87Scalar& lhs, con
   return {computed.value, exceptions, rounded_up};
 }
 
-// Common tail for the forms whose destination is a stack register. A masked exception does not stop
-// the write, and an unmasked one does -- except for #U, which both IEEE 754-2019 7.5 and SDM 4.9.1.5
-// deliver to the handler as a result with the exponent biased back into range, rather than leaving
-// the destination holding whatever was there before.
+// Common tail for stack-register destinations. A masked exception does not stop the write and an
+// unmasked one does, except #U, which is delivered with the exponent biased back into range.
 inline ExecutionResult x87_finish(ExecutionContext& ctx, std::size_t dst_index, const X87Computed& computed) {
   x87_set_c1(ctx, computed.rounded_up);
   if (computed.exceptions != 0) {
@@ -306,10 +285,8 @@ inline X87Narrowed<Narrow> x87_narrow(const CpuState& state, const X87Scalar& va
   return {narrowed.value, exceptions, rounded_up};
 }
 
-// FCHS and FABS are the only callers and both are pure sign-bit edits, which is why the SDM gives
-// them #IS and nothing else -- not even the #IA a signalling NaN or an unsupported encoding raises
-// everywhere else. Running them through the result classifier read a denormal operand back as an
-// underflow.
+// FCHS and FABS are pure sign-bit edits, so the SDM gives them #IS and nothing else, not even the
+// #IA a signalling NaN raises everywhere else. The result classifier read a denormal as underflow.
 template <typename Fn>
 inline ExecutionResult x87_unary_st0(ExecutionContext& ctx, Fn&& fn) {
   x87_set_c1(ctx, false);
@@ -384,12 +361,8 @@ inline ExecutionResult x87_binary_mem_int_st0(ExecutionContext& ctx, std::size_t
   return x87_finish(ctx, 0, x87_evaluate(ctx.state, lhs, rhs, std::forward<Fn>(fn)));
 }
 
-// iced's decoder value-initializes Instruction, and OpKind::REGISTER and Register::NONE are both
-// zero, so an operand slot the decoder never wrote reads back as a REGISTER named NONE -- which
-// sails straight through an `op_kind(i) != REGISTER` check. Several handlers below are reached by
-// instructions carrying fewer operands than they ask for, and x87_st_index(NONE) then underflows to
-// a huge value that x87_phys_index quietly masks down to ST(7). Ask the instruction how many
-// operands it actually has before touching one.
+// REGISTER and NONE are both zero, so an operand the decoder never wrote passes an
+// `op_kind(i) != REGISTER` check and x87_st_index(NONE) underflows into ST(7).
 [[nodiscard]] inline bool x87_operand_is_st(const ExecutionContext& ctx, std::uint32_t op) {
   if (op >= ctx.instr.op_count() || ctx.instr.op_kind(op) != iced_x86::OpKind::REGISTER) {
     return false;
@@ -531,9 +504,8 @@ inline ExecutionResult x87_store_integer(ExecutionContext& ctx, std::size_t widt
   X87Scalar stored = lower;
   if (!underflowed) {
     const auto value = ctx.state.x87_get(0);
-    // A NaN, an infinity and an unnormal have no integer at all, so hardware raises #IA, stores the
-    // integer indefinite and stops. It does not also report #P: nothing was rounded. seven used to
-    // round the NaN first, which set #P and could set C1 with it.
+    // These have no integer at all, so hardware raises #IA, stores the indefinite and stops without
+    // reporting #P. seven rounded first, which set #P and could set C1 with it.
     if (seven::isnan(value) || seven::isinf(value) || seven::isunsupported(value)) {
       exceptions |= kX87ExceptionInvalid;
     } else {
@@ -646,9 +618,8 @@ inline void x87_set_c2(ExecutionContext& ctx, bool value) {
   ctx.state.set_x87_status_word(sw);
 }
 
-// FPREM/FPREM1 hand back the low three bits of the quotient, and not in register order: Q2 goes to
-// C0, Q1 to C3, Q0 to C1. A guest reducing an argument by pi/4 reads them to work out which octant
-// it landed in, so getting the pairing wrong is silently wrong trigonometry rather than a fault.
+// FPREM/FPREM1 return the low three quotient bits out of order: Q2 to C0, Q1 to C3, Q0 to C1. A
+// guest reducing by pi/4 reads them for the octant, so a wrong pairing is silently wrong trig.
 inline void x87_set_quotient_bits(ExecutionContext& ctx, std::uint64_t quotient) {
   auto sw = ctx.state.get_x87_status_word();
   sw &= static_cast<std::uint16_t>(~0x4300u);
@@ -674,10 +645,9 @@ inline X87Scalar x87_ln2() {
   return X87Scalar(v);
 }
 
-// Below 2^-64 the first term of a Taylor series is the whole answer at this width: sin x and tan x
-// are x, cos x is 1, and 2^x - 1 is x ln 2. Worth special-casing because the host double these are
-// otherwise computed through cannot hold an operand that small at all, so it answered zero or one
-// for an entire denormal range that hardware fills in properly.
+// Below 2^-64 the first Taylor term is the whole answer at this width. Worth special-casing because
+// the host double these go through cannot hold an operand that small, so it answered zero or one for
+// a whole denormal range.
 inline bool x87_tiny_argument(const X87Scalar& value) {
   if (value == X87Scalar(0) || seven::isnan(value) || seven::isinf(value)) return false;
   return (value.val.signExp & 0x7FFFu) < (0x3FFFu - 64u);
@@ -753,9 +723,8 @@ inline ExecutionResult x87_compare_mem(ExecutionContext& ctx, std::size_t width,
   } else {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
-  // An empty operand has nothing to compare, so the unordered answer above IS the answer: falling
-  // through to x87_cmp overwrote it with an ordinary comparison of whatever stale bits were still
-  // in the register. It is also #IS, not a bare #IA, so SF has to be set with it.
+  // An empty operand has nothing to compare, so the unordered answer above is the answer; falling
+  // through compared whatever stale bits were left. It is #IS, not a bare #IA, so SF goes with it.
   if (ctx.state.x87_is_empty(0)) {
     if (eflags) x87_set_eflags_cmp(ctx, -2);
     else x87_set_cmp_flags(ctx, -2);
@@ -888,9 +857,8 @@ inline ExecutionResult x87_store_bcd(ExecutionContext& ctx) {
 
 inline ExecutionResult x87_store_st0_to_sti(ExecutionContext& ctx, bool pop) {
   x87_set_c1(ctx, false);
-  // FSTP ST(i) and friends carry exactly one operand, the destination. Reading operand 1 here got
-  // Register::NONE for every one of them, so `fstp st(0)` -- the ordinary way to drop the top of
-  // the stack -- wrote to ST(7) and left it tagged valid.
+  // These carry one operand. Reading operand 1 got Register::NONE, so `fstp st(0)` wrote to ST(7)
+  // and left it tagged valid.
   if (!x87_operand_is_st(ctx, 0)) return detail::memory_fault(ctx, detail::memory_address(ctx));
   const auto idx = x87_st_index(ctx.instr.op_register(0));
   if (ctx.state.x87_is_empty(0)) {
@@ -910,9 +878,8 @@ inline ExecutionResult x87_free_sti(ExecutionContext& ctx, bool pop) {
   if (!x87_operand_is_st(ctx, 0)) return detail::memory_fault(ctx, detail::memory_address(ctx));
   const auto reg = ctx.instr.op_register(0);
   ctx.state.x87_mark_empty(x87_st_index(reg));
-  // FFREEP marks a register empty and then advances TOP, and neither half asks whether anything was
-  // there. Going through x87_pop() meant `ffreep st(0)` freed ST(0), found it empty, and reported a
-  // stack underflow that hardware never raises.
+  // FFREEP frees then advances TOP, neither half asking what was there. x87_pop() reported a stack
+  // underflow hardware never raises.
   if (pop) {
     ctx.state.set_x87_top(static_cast<std::uint8_t>((ctx.state.get_x87_top() + 1) & 0x7));
   }
@@ -971,26 +938,21 @@ inline bool x87_exceptions_masked(const CpuState& state, std::uint16_t exception
   return (exceptions & ~state.get_x87_control_word() & kX87ExceptionMask) == 0;
 }
 
-// The last resort, for the transcendentals only. FSIN and its neighbours are computed by narrowing
-// to a host double and calling libm, so softfloat never sees the operation and has no flags to
-// report; everything else now reads them out of x87_evaluate instead of guessing here. The one
-// guess left is the underflow below: a transcendental landing in the denormal range is inexact in
-// every case that matters, so tininess stands in for tininess-and-inexactness.
+// Transcendentals only: they narrow to a host double and call libm, so softfloat has no flags to
+// report. The one guess left is underflow, where tininess stands in for tininess-and-inexactness.
 inline std::uint16_t x87_classify_result(const X87Scalar& result, const X87Scalar& lhs, const X87Scalar& rhs) {
   std::uint16_t exceptions = x87_operand_exceptions(lhs, rhs);
   if (seven::isnan(result)) {
-    // A NaN that walked in as an operand propagates quietly: QNaN + 1 is a QNaN and raises nothing.
-    // #IA belongs to the operations that MADE one -- a signalling operand being quieted, or a form
-    // with no answer at all like inf - inf, whose operands are not NaNs to begin with.
+    // A NaN operand propagates quietly. #IA belongs to operations that MADE one: a quietened
+    // signalling operand, or a form with no answer at all like inf - inf.
     const bool propagated = seven::isnan(lhs) || seven::isnan(rhs);
     if (!propagated || seven::issnan(lhs) || seven::issnan(rhs)) {
       exceptions |= kX87ExceptionInvalid;
     }
   }
-  // Overflow means the exact answer was finite and too large to represent. An infinity handed in as
-  // an operand is not that (inf + 1 is inf, quietly), and neither is the infinity a division by zero
-  // produces -- that is #Z, which the divide helper reports itself. A zero operand is what separates
-  // the second case from a real overflow, since none of add, sub or mul can overflow through one.
+  // Overflow means the exact answer was finite and too large to represent, which an infinity operand
+  // is not, and neither is the infinity from a divide by zero. A zero operand separates the two,
+  // since add, sub and mul cannot overflow through one.
   if (seven::isinf(result) && !seven::isinf(lhs) && !seven::isinf(rhs) && lhs != 0 && rhs != 0) {
     exceptions |= kX87ExceptionOverflow;
   }

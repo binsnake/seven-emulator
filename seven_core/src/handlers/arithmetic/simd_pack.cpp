@@ -97,12 +97,9 @@ big_uint read_operand(ExecutionContext& ctx, std::uint32_t operand_index, std::s
     return read_vec(ctx.state, reg) & mask(width);
   }
   if (kind == iced_x86::OpKind::MEMORY) {
-    // An EVEX memory source can carry {1toN}: one element is read and repeated across the whole
-    // operand. The element size has to come from the raw MemorySize's element_size, not from
-    // memory_size() -- that has already collapsed to the full operand width, and feeding the byte
-    // count back through the size table looks up an unrelated entry (64 comes back as 16), so a
-    // dword broadcast would read 16 bytes of guest memory and lay down the wrong lane count. Same
-    // reasoning, and the same fix, as simd_int.cpp's copy of this function.
+    // An EVEX {1toN} source reads one element and repeats it, and that element size lives in the raw
+    // MemorySize. memory_size() has collapsed to the operand width, and feeding the byte count back
+    // through the size table reindexes to an unrelated entry. Same fix as simd_int.cpp's copy.
     if (ctx.instr.is_broadcast()) {
       const auto element_width = iced_x86::memory_size_ext::get_element_size(ctx.instr.memory_size_enum());
       if (element_width == 0 || element_width > width) {

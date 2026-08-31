@@ -54,20 +54,16 @@ ExecutionResult unsupported_instruction(ExecutionContext& ctx) {
   return {StopReason::unsupported_instruction, 0, ExceptionInfo{StopReason::unsupported_instruction, ctx.state.rip, 0}, ctx.instr.code()};
 }
 
-// RET, IRET and the indirect near branches take their target from guest data, so the target is the
-// one place a guest can put a non-canonical value into rip without a memory operand ever being
-// involved. Hardware #GP(0)s at the branch itself. Letting it through instead reached the executor's
-// fetch-path check on the NEXT step, which reports the fault against the bad address rather than
-// against the instruction that produced it, and counts the branch as retired on the way.
+// RET, IRET and the indirect near branches take their target from guest data, the one way a
+// non-canonical value reaches rip with no memory operand involved. Hardware #GP(0)s at the branch;
+// deferring to the next step's fetch check blames the wrong instruction and retires the branch.
 [[nodiscard]] ExecutionResult branch_target_fault(ExecutionContext& ctx, std::uint64_t target) {
   return {StopReason::general_protection, 0,
           ExceptionInfo{StopReason::general_protection, target, 0}, ctx.instr.code()};
 }
 
-// rsp only moves once the slot is actually written. A #PF here is a fault, not a trap: hardware
-// aborts the push and leaves rsp exactly where it was, which is what makes a guard page work at all
-// -- the handler maps the page and the same push runs again. Committing the decrement first meant a
-// fault hook answering restart_instruction re-ran the push against an already-lowered rsp and
+// rsp only moves once the slot is written. A #PF is a fault, so hardware leaves rsp where it was and
+// the retry works, which is what lets a guard page grow a stack. Committing the decrement first
 // walked the stack pointer down one slot per retry.
 ExecutionResult push_width(ExecutionContext& ctx, std::uint64_t value, std::size_t width) {
   const auto slot = mask_stack_pointer(ctx.state, ctx.state.gpr[4] - width);
@@ -241,15 +237,10 @@ ExecutionResult call_rm_width(ExecutionContext& ctx, std::size_t width) {
   return {};
 }
 
-// sreg[1] is the only thing in this emulator that records the current privilege level -- every CPL
-// gate in the tree, and cli_sti_allowed's IOPL comparison, reads it and nothing else. The far
-// branches all load it straight from a guest-supplied selector (off the stack, out of memory, or
-// out of the instruction's own bytes), so without this one RETF or IRET puts the guest at CPL 0 and
-// voids all of those at once. On hardware a far transfer may keep the current privilege level or
-// move outward, never inward; gaining privilege needs a call gate or SYSCALL/SYSENTER, each of
-// which validates through a descriptor table. There are no descriptor tables here -- gdtr is
-// host-written and read nowhere -- so the selector's RPL is all there is to check, but it is the
-// half that matters.
+// sreg[1] is the only record of privilege level here, and the far branches load it straight from a
+// guest-supplied selector, so one RETF or IRET would otherwise put the guest at CPL 0. Hardware lets
+// a far transfer move outward but never inward, and gaining privilege needs a validated call gate.
+// There are no descriptor tables here, so the selector's RPL is all there is to check.
 [[nodiscard]] inline bool far_transfer_allowed(const CpuState& state, std::uint64_t selector) noexcept {
   return (selector & 0x3u) >= (state.sreg[1] & 0x3u);
 }

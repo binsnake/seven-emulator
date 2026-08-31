@@ -3,12 +3,10 @@
 namespace seven::handlers {
 namespace {
 
-// Intel's order is TEMP := SRC + DEST; SRC := DEST; DEST := TEMP -- the destination write lands
-// last. That only matters when both operands name the same register, where writing the source
-// afterwards puts the stale value back and the exchange vanishes entirely (`xadd r15, r15` left
-// r15 untouched instead of doubling it). A memory destination can't alias the source register, and
-// writing it first is what keeps a faulting store from committing the source write, so the
-// aliasing case is handled by skipping the now-redundant source write rather than by reordering.
+// Intel writes the destination last, which only matters when both operands name the same register:
+// writing the source afterwards puts the stale value back and the exchange vanishes. A memory
+// destination cannot alias, and writing it first is what stops a faulting store from committing the
+// source write, so the aliasing case skips the redundant source write instead of reordering.
 ExecutionResult xadd_width(ExecutionContext& ctx, std::size_t width) {
   bool dst_ok = false;
   const auto lhs = detail::read_operand(ctx, 0, width, &dst_ok);

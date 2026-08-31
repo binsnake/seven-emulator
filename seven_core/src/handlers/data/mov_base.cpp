@@ -47,10 +47,8 @@ constexpr std::uint64_t kCr4DeBit = 1ull << 3;
   return index;
 }
 
-// SDM Vol 3, 17.2: DR0-DR3 hold linear addresses, so a non-canonical one is #GP the same way any
-// other non-canonical linear address is. DR6/DR7 are 32 bits of architectural state whose reserved
-// bits read back fixed no matter what is written, and setting any bit above 31 is #GP in 64-bit
-// mode. Returns the value to store, or nothing if the write faults.
+// DR0-DR3 hold linear addresses, so a non-canonical one is #GP. DR6/DR7 are 32 bits with fixed
+// reserved bits, and setting anything above bit 31 is #GP in 64-bit mode (SDM Vol 3, 17.2).
 [[nodiscard]] std::optional<std::uint64_t> debug_register_write_value(std::uint32_t index, std::uint64_t value) {
   if (index <= 3u) {
     constexpr int kShift = 16;  // 64 - 48
@@ -67,11 +65,9 @@ constexpr std::uint64_t kCr4DeBit = 1ull << 3;
   return (value & kDr7WritableMask) | kDr7ReservedOnes;
 }
 
-// SDM Vol 3, 2.5: MOV to/from a control register requires the reg field to name CR0, CR2, CR3,
-// CR4, or (64-bit mode only) CR8 -- any other encoding (CR1, CR5-CR7, CR9-CR15) is #UD on real
-// hardware. `state.cr` is sized to cover CR0-CR15 so an unfiltered index never reads/writes out
-// of bounds, but leaving these reserved encodings live lets a guest treat nonexistent registers
-// (including CR9-CR15, which don't exist in silicon at all) as ordinary read/write storage.
+// Only CR0, CR2, CR3, CR4 and (64-bit only) CR8 are valid; the rest are #UD (SDM Vol 3, 2.5).
+// state.cr covers all 16 so an unfiltered index is never out of bounds, but leaving the reserved
+// encodings live lets a guest use registers that do not exist in silicon as read/write storage.
 [[nodiscard]] std::optional<std::uint32_t> resolve_control_index(iced_x86::Register reg) {
   if (reg < iced_x86::Register::CR0 || reg > iced_x86::Register::CR15) {
     return std::nullopt;
@@ -184,10 +180,8 @@ ExecutionResult handle_code_MOV_RAX_MOFFS64(ExecutionContext& ctx) {
   return {};
 }
 
-// A2/A3 store the accumulator TO the absolute address, the opposite direction from the A0/A1
-// loads above. These had the loads' shape with the operand indices swapped, which just makes
-// them load as well: the store never landed and the accumulator was overwritten with whatever
-// the address held.
+// A2/A3 store the accumulator to the absolute address, the opposite of the A0/A1 loads above. Given
+// the loads' shape with the indices swapped they loaded too, clobbering the accumulator.
 ExecutionResult handle_code_MOV_MOFFS8_AL(ExecutionContext& ctx) {
   const auto value = detail::read_register(ctx.state, ctx.instr.op_register(1));
   if (!detail::write_operand(ctx, 0, value, 1)) {
@@ -343,10 +337,8 @@ ExecutionResult load_sreg(ExecutionContext& ctx, std::size_t register_width) {
     return detail::memory_fault(ctx, detail::memory_address(ctx));
   }
   const auto dst_reg = ctx.instr.op_register(0);
-  // MOV to CS has no encoding on hardware, and write_register would put the value straight into
-  // sreg[1], which is the only record of the current privilege level in this emulator. iced does
-  // reject the encoding today, so this is belt and braces rather than a live hole, but the cost of
-  // being wrong about the decoder here is a guest reaching ring 0 in two bytes.
+  // MOV to CS has no hardware encoding, and write_register would drop the value into sreg[1], the
+  // only record of privilege level here. iced rejects it today, so this is belt and braces.
   if (dst_reg == iced_x86::Register::CS) {
     return ud_fault(ctx);
   }

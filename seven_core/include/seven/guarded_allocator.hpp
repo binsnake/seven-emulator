@@ -1,15 +1,10 @@
 #pragma once
 
-// A hardware oracle for out-of-bounds accesses to guest page bytes, for the accesses no sanitizer
-// can see: the JIT reaches guest memory from code it emitted itself, so an emitted access running
-// off the end of a page silently hits whatever the allocator put next.
-//
-// This reserves one page more than each map node needs, commits all but the last, and positions the
-// node so its final byte sits against the reserved page. PageEntry keeps its bytes last (there is a
-// static_assert in memory.hpp), so one past the end of a page IS the guard and the access faults.
-//
-// Off by default, where this is plain std::allocator. The guarded build costs a page of address
-// space per guest page and is meant for tests and fuzzing.
+// A hardware oracle for out-of-bounds accesses to guest pages, which the JIT reaches from code it
+// emitted itself and no sanitizer can instrument. Each map node is reserved a page larger than it
+// needs and positioned so its final byte sits against that uncommitted page; PageEntry keeps its
+// bytes last, so one past the end of a guest page is the guard. Off by default, where this is plain
+// std::allocator; the guarded build costs a page of address space per guest page.
 
 #include <cstddef>
 #include <cstdint>

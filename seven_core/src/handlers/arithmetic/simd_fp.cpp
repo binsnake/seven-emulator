@@ -186,13 +186,9 @@ void set_sse_cmp_flags(CpuState& state, int relation) {
   state.rflags = rf;
 }
 
-// x86 MIN/MAX are not IEEE minNum/maxNum and not std::fmin/fmax. The SDM spells them out as a
-// single compare with a fixed tie-break: DEST := (SRC1 < SRC2) ? SRC1 : SRC2, which falls to SRC2
-// whenever the comparison is false -- when either operand is a NaN, and when both are zeros of
-// whatever sign. std::fmin does the opposite for NaN (it returns the operand that is NOT a NaN), so
-// a guest that fed a NaN in as the second source read back the first one instead of the NaN, and
-// min(+0.0, -0.0) picked by value rather than by operand order. Every MIN/MAX in the file, legacy,
-// VEX and EVEX alike, went through those two.
+// x86 MIN/MAX are not IEEE minNum/maxNum and not std::fmin/fmax. The SDM defines one compare with a
+// fixed tie-break, so SRC2 wins whenever it is false: a NaN operand, or two signed zeros. std::fmin
+// does the opposite for NaN and picks a zero by value, and every MIN/MAX here went through it.
 template <typename T>
 [[nodiscard]] T x86_min(T src1, T src2) noexcept {
   return src1 < src2 ? src1 : src2;
@@ -236,10 +232,8 @@ ExecutionResult packed_binary(ExecutionContext& ctx, Fn&& fn, bool zero_upper = 
   return {};
 }
 
-// Nothing in this file implements writemasking, and the EVEX handlers at the bottom share these VEX
-// helpers, so a named mask register has to stop the instruction rather than be ignored. None of
-// those EVEX codes is in handled_codes.def today, so this changes nothing until one is added --
-// which is exactly when a silently wrong destination register would be hardest to spot.
+// Nothing here implements writemasking and the EVEX handlers share these VEX helpers, so a named
+// mask has to stop the instruction rather than be ignored. Moot until one of those codes is added.
 template <typename T, typename Fn>
 ExecutionResult vex_packed_binary(ExecutionContext& ctx, Fn&& fn, bool zero_upper = true) {
   if (detail::has_active_opmask(ctx.instr)) return detail::unsupported_opmask(ctx);

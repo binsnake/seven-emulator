@@ -13,12 +13,9 @@
 #include "seven/handler_helpers.hpp"
 #include "seven/memory.hpp"
 
-// The x86 decoder here is a hand-written C++ port of the Rust iced_x86 crate, and the emulator
-// makes real decisions from what it reports: which register a SIMD operand names, whether an
-// operand is memory, which Code a byte sequence is. A handler that fills in the wrong register or
-// leaves an operand slot untouched does not fail loudly -- OpKind::REGISTER and Register::NONE are
-// both zero, so an unwritten slot reads back as a plausible register operand. These pin the cases
-// that were getting it wrong.
+// The decoder is a hand-written port of iced_x86, and the emulator makes real decisions from what
+// it reports. A handler that fills the wrong register or leaves a slot untouched fails quietly,
+// since REGISTER and NONE are both zero and an unwritten slot reads back as a plausible operand.
 
 namespace {
 
@@ -36,11 +33,9 @@ namespace {
 
 }  // namespace
 
-// EVEX carries the r/m register's high bits in two places: B is bit 3 of the index and X is bit 4.
-// The decoder packs both into extra_base_register_base_evex and B alone into
-// extra_base_register_base (which the SIB path wants), and the EVEX handlers were adding both, so
-// B counted twice. Anything with B set named a register 8 slots too high, and past 31 that walks
-// straight out of the vector file into whatever enum values follow it.
+// EVEX carries the r/m register's high bits in two places, and the handlers added both packings, so
+// B counted twice. Anything with B set named a register 8 slots too high, and past 31 that walks out
+// of the vector file entirely.
 TEST(KuberaDecoder, EvexRegisterIndexDoesNotCountTheBBitTwice) {
   struct Case { const char* name; const char* bytes; std::uint32_t operand; iced_x86::Register expected; };
   const Case cases[] = {
@@ -59,13 +54,8 @@ TEST(KuberaDecoder, EvexRegisterIndexDoesNotCountTheBBitTwice) {
   }
 }
 
-// The same double count reached the memory base, which was missed because the fix above only
-// touched the register operands. A memory base is four bits wide, rm plus EVEX.B; EVEX.X extends
-// the SIB index and nothing else, and read_sib already applies it there. Adding
-// extra_base_register_base_evex (which packs B and X together) on top of extra_base_register_base
-// counted B twice and folded X in on top, so vmovups zmm0, [r8] named EIP as its base and every
-// AVX-512 access through r8-r15 addressed off the wrong register. Past RIP the index walks on into
-// the segment registers and the vector file.
+// The same double count reached the memory base. Counting B twice and folding in X, which extends
+// the SIB index only, made vmovups zmm0, [r8] name EIP.
 TEST(KuberaDecoder, EvexMemoryBaseDoesNotCountTheBBitTwice) {
   struct Case { const char* name; const char* bytes; iced_x86::Register expected; };
   const Case cases[] = {
@@ -88,10 +78,8 @@ TEST(KuberaDecoder, EvexMemoryBaseDoesNotCountTheBBitTwice) {
   }
 }
 
-// 0F 20/22 are the control-register moves and 0F 21/23 the debug-register ones, but both pairs land
-// in the same two handlers and those handlers hardcoded Register::CR0 as the base. So MOV r64, DR2
-// reported CR2, and resolve_debug_index rejected it -- the DR0-DR3 watchpoint emulation could not
-// be reached through MOV DR at all.
+// The CR and DR moves share two handlers that hardcoded Register::CR0 as the base, so MOV r64, DR2
+// reported CR2 and the DR0-DR3 watchpoint emulation was unreachable through MOV DR.
 TEST(KuberaDecoder, DebugRegisterMovesNameDebugRegisters) {
   const auto read = decode("0F 21 11");  // mov rcx, dr2
   EXPECT_EQ(read.code(), iced_x86::Code::MOV_R64_DR);
@@ -117,10 +105,8 @@ TEST(KuberaDecoder, MovntqNamesItsSourceRegister) {
   EXPECT_EQ(instr.op1_register(), iced_x86::Register::MM2);
 }
 
-// These opcodes mean one instruction with a register operand and a different one with a memory
-// operand. The handler carries both Codes but only ever set the first, so a memory-form encoding
-// came back wearing the register form's Code: the operand set says memory while the Code says
-// otherwise, and anything dispatching on Code runs the wrong semantics.
+// These opcodes mean different instructions for register and memory operands. The handler carries
+// both Codes but only set the first, so anything dispatching on Code ran the wrong semantics.
 TEST(KuberaDecoder, TheMemoryFormsOfMovlpsAndMovhpsGetTheirOwnCode) {
   const auto movlps = decode("0F 12 11");  // movlps xmm2, [rcx]
   EXPECT_EQ(movlps.op1_kind(), iced_x86::OpKind::MEMORY);
@@ -135,11 +121,9 @@ TEST(KuberaDecoder, TheMemoryFormsOfMovlpsAndMovhpsGetTheirOwnCode) {
   EXPECT_EQ(decode("0F 16 D1").code(), iced_x86::Code::MOVLHPS_XMM_XMM);
 }
 
-// PUSH/POP FS and GS, ENTER, and the descriptor-table stores all default to a 64-bit operand size
-// in long mode -- there is no 32-bit encoding for them there, only 16 via a 66 prefix. The handlers
-// indexed their code array by state().operand_size, which reflects prefixes alone and reads "32"
-// when there are none, so every unprefixed encoding picked the 32-bit form. That is not cosmetic:
-// the emulator takes the number of bytes it pushes straight from the Code.
+// These default to a 64-bit operand size in long mode, with no 32-bit encoding at all. The handlers
+// indexed by operand_size, which reflects prefixes alone and reads 32 when there are none, so every
+// unprefixed encoding picked the 32-bit form -- and the emulator takes its push width from the Code.
 TEST(KuberaDecoder, DefaultSixtyFourBitOperandsPickTheSixtyFourBitCode) {
   struct Case { const char* name; const char* bytes; iced_x86::Code expected; };
   const Case cases[] = {
@@ -164,10 +148,8 @@ TEST(KuberaDecoder, DefaultSixtyFourBitOperandsPickTheSixtyFourBitCode) {
   }
 }
 
-// VEX.vvvv is four bits wide in long mode but the mask register file only has eight entries, so a
-// mask operand taken from it has to be narrowed. Most of the mask handlers here do that; the two
-// three-operand ones did not, and K0 + 15 lands on CR3. A decoded operand naming a register outside
-// its own class is how an index walks out of the array it is about to be used to subscript.
+// VEX.vvvv is four bits but the mask file has eight entries, so it has to be narrowed. The two
+// three-operand mask handlers did not, and K0 + 15 lands on CR3.
 TEST(KuberaDecoder, MaskOperandsStayInTheMaskRegisterFile) {
   struct Case { const char* name; const char* bytes; std::uint32_t operand; };
   const Case cases[] = {
@@ -197,11 +179,9 @@ TEST(KuberaDecoder, MaskOperandsStayInTheMaskRegisterFile) {
   EXPECT_EQ(ok.op2_register(), iced_x86::Register::K3);
 }
 
-// VEX.L is ignored by the scalar instructions (the LIG group), and the tables already dispatch the
-// length-sensitive ones to a separate handler per L before the operands are read. get_vec_reg threw
-// the handler's own register class away and re-derived it from the vector length, so vmovss with
-// L set came back naming YMM registers for an instruction that only ever touches the low 32 bits.
-// The length-dispatched cases are here too, since they are what the re-derivation was there for.
+// Scalar instructions ignore VEX.L, and the tables already dispatch length-sensitive ones per L.
+// get_vec_reg discarded the handler's register class and re-derived it from the length, so vmovss
+// with L set named YMM registers. The length-dispatched cases are here too.
 TEST(KuberaDecoder, VectorLengthDoesNotPromoteScalarOperands) {
   struct Case { const char* name; const char* bytes; iced_x86::Register op0; };
   const Case cases[] = {
@@ -230,11 +210,9 @@ TEST(KuberaDecoder, VectorLengthDoesNotPromoteScalarOperands) {
   }
 }
 
-// Where a Code's operand table says register-only, the decoder must never hand back memory: when it
-// does, the Code is wrong for the encoding and its handler reads a register slot never filled in.
-// Two causes here -- the serialized tables count Codes off a group base, which lands on an unrelated
-// instruction wherever the enum is not contiguous, and a handler that read memory instead of
-// rejecting mod != 3.
+// Where a Code's operand table says register-only the decoder must never return memory, or the
+// handler reads a register slot nothing filled in. Two causes: the tables count Codes off a group
+// base and the enum is not contiguous, and a handler that read memory instead of rejecting mod != 3.
 namespace {
 
 [[nodiscard]] bool operand_kind_is_register_only(iced_x86::OpCodeOperandKind kind) {
@@ -387,12 +365,8 @@ TEST(KuberaDecoder, ASegmentOverrideStillAppliesToARipRelativeOperand) {
   EXPECT_EQ(state.gpr[0], marker);
 }
 
-// Outside 64-bit mode, C4, C5 and 62 are only a VEX or EVEX prefix when the byte after them has
-// mod == 3. With mod != 3 they are LES, LDS and BOUND. The three prefix handlers each carry a
-// handler_mem for exactly that case and all three ignored it and decoded as a prefix regardless,
-// so those instructions were undecodable in the two modes that have them -- BOUND's handler was
-// sitting there unreachable -- and the reported length was wrong on top of it, which desynchronises
-// everything walking the stream afterwards.
+// Outside 64-bit mode C4, C5 and 62 are prefixes only when the next byte has mod == 3; otherwise
+// they are LES, LDS and BOUND. All three ignored handler_mem, so the reported length was wrong too.
 TEST(KuberaDecoder, TheLegacyFormsOfTheVexAndEvexOpcodesStillDecode) {
   struct Case { const char* name; std::uint8_t op; iced_x86::Code in16; iced_x86::Code in32; };
   const Case cases[] = {
@@ -427,12 +401,9 @@ TEST(KuberaDecoder, TheLegacyFormsOfTheVexAndEvexOpcodesStillDecode) {
   EXPECT_EQ(decoded->code(), iced_x86::Code::VEX_VMOVD_XMM_RM32);
 }
 
-// The C4/C5/62 handlers dispatch to a handler_mem for the legacy (mod != 3) forms, and until
-// recently that field was stored and never called, so the whole path was dead. Enabling it means
-// every one of those table entries is now reachable from guest bytes. read_handler's own "assert
-// not null" comment has no assert behind it, so this walks every ModRM value in both modes that
-// have the legacy forms and checks the decoder comes back with something sane rather than calling
-// through whatever the table happened to hold.
+// handler_mem was stored and never called until recently, so enabling it made every one of those
+// table entries reachable from guest bytes. read_handler's "assert not null" comment has no assert
+// behind it, so this walks every ModRM value in both affected modes.
 TEST(KuberaDecoder, EveryModrmForTheVexAndEvexOpcodesDecodesSafely) {
   for (const std::uint8_t op : {0x62, 0xC4, 0xC5}) {
     for (const std::uint32_t bitness : {16u, 32u, 64u}) {
@@ -462,13 +433,9 @@ TEST(KuberaDecoder, EveryModrmForTheVexAndEvexOpcodesDecodesSafely) {
   }
 }
 
-// EVEX encodes a disp8 as a count of operand-sized units, not bytes, so the decoder has to scale it
-// back by N. N comes from the instruction's tuple type paired with the broadcast bit, and the
-// decoder was multiplying by the raw TupleType enum value instead -- which is an index, not a size,
-// so an N16 form scaled by 4 and an N64 form by 6. Every EVEX memory operand written with a disp8
-// therefore resolved to an address the guest never asked for, and did it quietly: the result was
-// still a plausible displacement, just the wrong one. Found by the fuzzer's new EVEX lane, as six
-// aligned-move divergences against hardware that all turned out to be this.
+// EVEX encodes a disp8 in operand-sized units, so the decoder scales it by N, which comes from the
+// tuple type and the broadcast bit. It multiplied by the raw TupleType enum value instead, an index
+// rather than a size, so every EVEX disp8 operand resolved to a plausible but wrong address.
 TEST(KuberaDecoder, EvexDisp8IsScaledByTheTupleTypeNotItsEnumValue) {
   struct Case { const char* name; const char* bytes; std::uint64_t expected; bool broadcast; };
   const Case cases[] = {

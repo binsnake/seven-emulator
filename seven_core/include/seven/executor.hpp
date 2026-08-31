@@ -58,20 +58,14 @@ class Executor {
   [[nodiscard]] HookId add_trap_hook(TrapKind kind, TrapHook hook);
   // How many times step() will let a fault hook ask for the same instruction again before giving up.
   static constexpr std::size_t kMaxFaultRetries = 8;
-  // How deep an embedder callback may re-enter step() before it stops instead of running out of
-  // host stack. Legitimate nesting is a couple of frames (a device callback inside a fault handler
-  // inside a step is three).
+  // How deep an embedder callback may re-enter step(). Three is legitimate: a device callback
+  // inside a fault handler inside a step.
   static constexpr std::size_t kMaxStepDepth = 8;
-  // Counting levels does not bound bytes unless the per-level cost is known, and it is not small:
-  // one re-entry cycle measures about 105 KB optimized, so the level cap alone permits roughly
-  // 950 KB of a 1 MB stack. Re-entry is therefore also bounded by how far the stack has actually
-  // descended since the outermost step. Sized to still admit the three legitimate levels above while
-  // capping the worst case near a third of the stack.
+  // Levels alone do not bound bytes: one re-entry cycle costs ~105 KB, so the level cap permits
+  // ~950 KB of a 1 MB stack. Bounded by actual descent as well.
   static constexpr std::size_t kMaxStepStackBytes = 256u * 1024u;
-  // The fault path step() runs, for an execution engine (see seven_jit) that raised the fault in its
-  // own generated code instead of going through step(). state.rip must already point at the faulting
-  // instruction. Returns true if a fault hook wants that instruction attempted again; otherwise it
-  // has recorded the violation and notified the stop hooks, and the caller should report the fault.
+  // step()'s fault path, for an engine that raised the fault in its own generated code. state.rip
+  // must already point at the faulting instruction. True means a hook wants it retried.
   [[nodiscard]] bool report_external_fault(CpuState& state, Memory& memory, const ExecutionResult& fault,
                                            std::uint64_t fault_address);
   [[nodiscard]] bool remove_hook(HookId id);
@@ -82,30 +76,18 @@ class Executor {
   [[nodiscard]] std::uint64_t total_steps() const noexcept;
   [[nodiscard]] std::uint64_t total_retired() const noexcept;
   void reset_stats();
-  // True if it's currently safe for an external consumer (e.g. a native-codegen layer sitting on
-  // top of this Executor) to run its own code for a span of instructions starting at `state.rip`
-  // without going through step()/step_impl() at all -- meaning no hook that needs full
-  // per-instruction visibility is registered, and the CPU isn't in a state (trap flag set, active
-  // hardware execute breakpoint) that requires per-instruction interpreter dispatch regardless of
-  // hooks. If this returns false, every instruction in that span must go through step() so hooks
-  // and traps keep firing at the granularity callers already depend on.
+  // Whether an external engine may run a span from state.rip without going through step() at all.
+  // False means every instruction must, so hooks and traps keep firing at the expected granularity.
   [[nodiscard]] bool jit_bypass_eligible(const CpuState& state, const Memory& memory) const noexcept;
-  // Same per-opcode dispatch step_impl() uses, for external callers that want to run one
-  // instruction through the real handler instead of reimplementing it. Just runs the handler --
-  // caller sets detail::set_dead_flags_mask() beforehand and commits rip/rsp afterward itself.
+  // step_impl()'s own per-opcode dispatch, exposed so an external caller can run the real handler.
+  // Runs only the handler: the caller sets the dead-flags mask and commits rip/rsp itself.
   [[nodiscard]] static ExecutionResult dispatch_handler(ExecutionContext& ctx, iced_x86::Code code);
-  // True for SYSCALL/CPUID/RDTSC/RDTSCP/INT* -- codes step_impl() routes to a trap hook instead of
-  // dispatch_handler(). An external caller doing its own dispatch_handler() call needs this to
-  // know which codes it can't just hand off the same way.
+  // Codes step_impl() routes to a trap hook rather than dispatch_handler(), so an external caller
+  // knows which ones it cannot hand off the same way.
   [[nodiscard]] static bool is_trap_instruction(iced_x86::Code code) noexcept;
-  // True if this instruction's SIMD encoding/register width is allowed under the compiled-in
-  // AVX/AVX-512/max-vector-width profile (SEVEN_ENABLE_AVX, SEVEN_ENABLE_AVX512,
-  // SEVEN_MAX_VECTOR_BYTES) -- the same gate step_impl() applies before ever calling
-  // dispatch_handler() for a SIMD instruction (see kEnableAvx/kEnableAvx512/kVectorBytes in
-  // executor.cpp). dispatch_handler() itself does NOT re-check this internally, so an external
-  // caller invoking it directly for a vector-register instruction (e.g. a native-codegen callout
-  // bridge) MUST call this first, the same way step_impl() does, or a disabled/oversized SIMD op
-  // would silently run anyway.
+  // Whether this SIMD encoding and width are allowed under the compiled-in profile, the same gate
+  // step_impl() applies. dispatch_handler() does NOT re-check it, so an external caller running a
+  // vector instruction directly must call this first or a disabled op runs anyway.
   [[nodiscard]] static bool simd_profile_allows(const iced_x86::Instruction& instr) noexcept;
 
  private:
@@ -120,11 +102,9 @@ class Executor {
   void notify_stop_hooks(CpuState& state, Memory& memory, const ExecutionResult& result, std::uint64_t fault_address) const;
   void apply_pending_hook_mutations();
   void refresh_hook_flags() noexcept;
-  // Held for the duration of any hook dispatch, so add/remove/clear queue themselves instead of
-  // mutating a container that is currently being walked. Saved and restored rather than assigned,
-  // for the reason Memory::access_allowed spells out for its own dispatch: a hook callback may
-  // re-enter the executor, and a nested dispatch that cleared the flag on the way out would leave
-  // the outer loop iterating with deferral switched off. Only the outermost scope flushes the queue.
+  // Held across hook dispatch so add/remove/clear queue instead of mutating a container being
+  // walked. Saved and restored, not assigned: a callback may re-enter, and a nested dispatch
+  // clearing the flag would leave the outer loop walking with deferral off.
   struct HookDispatchScope {
     explicit HookDispatchScope(Executor& executor) noexcept;
     ~HookDispatchScope();
@@ -134,8 +114,7 @@ class Executor {
     Executor& self;
     bool was_dispatching;
   };
-  // Counts step_impl frames currently on the stack, so a nested one knows to keep its hands off
-  // the shared decode cache -- see step_impl's `nested` for what goes wrong otherwise.
+  // Counts step_impl frames on the stack, so a nested one leaves the shared decode cache alone.
   struct StepDepthScope {
     explicit StepDepthScope(Executor& executor) noexcept;
     ~StepDepthScope();
@@ -146,28 +125,23 @@ class Executor {
   };
 
   static ExecutionResult unsupported(ExecutionContext& ctx);
-  // The shared dispatch core behind both step() and run()'s internal loop. `allow_masking` gates
-  // whether a cached block's precomputed dead_flags_mask may actually be applied -- see its call
-  // sites for why this can never just be "trust the
-  // cache": a bare step() call never guarantees the caller will keep advancing through the rest of
-  // a lifted block, so the public step() always passes false. Only run()'s own internal loop,
-  // which does guarantee that (given enough budget headroom), passes true.
+  // Shared dispatch core behind step() and run(). allow_masking gates whether a cached block's
+  // dead_flags_mask may be applied: only run()'s loop guarantees it will keep advancing through the
+  // block, so public step() always passes false.
   [[nodiscard]] ExecutionResult step_impl(CpuState& state, Memory& memory, bool allow_masking);
   static constexpr std::size_t kDecodeCacheSize = 8192;
   static constexpr std::size_t kCodePageCacheSize = 64;
   struct CachedCodePageEntry {
     std::uint64_t page_base = 0;
-    // Memory::page_code_epoch() for this page, not the process-wide Memory::code_epoch(). The
-    // global counter moves on a write to ANY executable page, so keying on it meant one guest store
-    // anywhere threw away all 64 cached pages and all 8192 decodes below along with them.
+    // Per-page, not the process-wide code_epoch(): that moves on a write to any executable page,
+    // so one guest store anywhere threw away every cached page and decode.
     std::uint64_t page_epoch = 0;
     bool valid = false;
     std::array<std::uint8_t, Memory::kPageSize> bytes{};
   };
   struct DecodedInstructionCacheEntry {
     std::uint64_t rip = 0;
-    // Page epochs for the first and last byte of this instruction -- the two can differ only when
-    // it straddles a page boundary, and both have to still match for the decode to be reusable.
+    // First and last byte's page epochs, which differ only across a page boundary. Both must match.
     std::uint64_t page_epoch = 0;
     std::uint64_t last_page_epoch = 0;
     ExecutionMode mode = ExecutionMode::long64;
@@ -177,9 +151,8 @@ class Executor {
     std::uint32_t instruction_length = 0;
     iced_x86::Code reported_code = iced_x86::Code::INVALID;
     iced_x86::Instruction instr{};
-    // ALU status flags (subset of kAluStatusFlagsMask) this instruction writes that the block
-    // liveness pass proved dead -- see seven/flag_liveness.hpp. 0 for every instruction outside a
-    // liveness-eligible block (the correct, always-safe default: compute every flag).
+    // Flags this instruction writes that the liveness pass proved dead. 0 outside an eligible
+    // block, which is the safe default of computing every flag.
     std::uint64_t dead_flags_mask = 0;
   };
   static constexpr std::size_t kMaxBlockLiftLength = 64;
@@ -194,8 +167,7 @@ class Executor {
   std::vector<std::pair<HookId, StopHook>> stop_hooks_;
   std::vector<std::pair<HookId, FaultHook>> fault_hooks_;
   std::unordered_map<TrapKind, std::vector<std::pair<HookId, TrapHook>>> trap_hooks_;
-  // Heap-allocated to avoid stack pressure -- the combined size (~1 MB) would
-  // blow Windows' default 1 MB thread stack if Executors are stack-allocated.
+  // Heap-allocated: ~1 MB combined would blow a default thread stack.
   std::unique_ptr<std::array<CachedCodePageEntry, kCodePageCacheSize>> code_page_cache_ =
       std::make_unique<std::array<CachedCodePageEntry, kCodePageCacheSize>>();
   std::unique_ptr<std::array<DecodedInstructionCacheEntry, kDecodeCacheSize>> decode_cache_ =
@@ -204,8 +176,7 @@ class Executor {
   std::unordered_map<std::uint64_t, std::vector<std::pair<HookId, std::function<void(std::uint64_t)>>>> execution_address_hooks_;
   bool dispatching_hooks_ = false;
   std::vector<std::function<void()>> pending_hook_mutations_;
-  // Cached emptiness flags so the per-step hot path can short-circuit hook
-  // dispatch without touching any of the underlying containers.
+  // Cached emptiness so the hot path can skip hook dispatch without touching the containers.
   bool has_instruction_hooks_ = false;
   bool has_code_hooks_ = false;
   bool has_execution_hooks_ = false;
@@ -216,19 +187,16 @@ class Executor {
   // Tracing flags resolved once at construction.
   bool trace_semantics_ = false;
   bool collect_code_stats_ = false;
-  // Resolved once at construction, not per-dispatch: std::getenv() is not a cheap call (measured
-  // ~2.4us on this machine, backed by a linear scan and possibly a lock in some CRTs) and this used
-  // to be evaluated on every single step_impl() dispatch, dwarfing the actual cost of decoding and
-  // executing an instruction.
+  // Resolved at construction: std::getenv() measures ~2.4us here, and this used to run on every
+  // dispatch, dwarfing the instruction itself.
   bool decode_cache_disabled_by_env_ = false;
-  // Which Memory the decode and code-page caches were filled from -- see step_impl. 0 is never a
-  // real instance id, so the first step always refills.
+  // Which Memory the decode caches were filled from. 0 is never a real id, so the first step
+  // always refills.
   std::uint64_t cache_memory_instance_ = 0;
-  // Depth of step_impl frames on the stack, and one private decode slot per nested depth. Held by
-  // unique_ptr so an outer frame's reference into its slot survives this vector growing.
+  // One private decode slot per nesting depth, by unique_ptr so an outer frame's reference into
+  // its slot survives this vector growing.
   std::size_t step_depth_ = 0;
-  // Where the outermost step_impl frame sat, so a nested one can tell how much stack the re-entry
-  // has eaten. Only meaningful while step_depth_ is non-zero.
+  // Where the outermost step_impl frame sat, so a nested one can measure the descent.
   std::uintptr_t step_stack_base_ = 0;
   std::vector<std::unique_ptr<DecodedInstructionCacheEntry>> nested_decode_scratch_;
   ContextSyncCallback context_read_cb_{};

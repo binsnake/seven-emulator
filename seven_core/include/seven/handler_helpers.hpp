@@ -18,10 +18,8 @@ void set_flag(std::uint64_t& rflags, std::uint64_t bit, bool value);
 // current mask. A bit may only be marked dead when nothing between it and the next write to the same
 // bit can observe it. Scoped to the six ALU status bits, and defaults to masking nothing.
 
-// AVX-512 writemasking exists in exactly one place, simd_int.cpp's apply_masked_lanes. Elsewhere an
-// EVEX form naming a mask register would write every lane regardless, which is silently wrong rather
-// than missing, so handlers that cannot honour a mask ask this first and stop cleanly. K0 and NONE
-// both mean no masking, the common case for these shared helpers.
+// Writemasking exists only in simd_int.cpp's apply_masked_lanes, so elsewhere an EVEX form naming a
+// mask would write every lane, silently wrong rather than missing. K0 and NONE both mean no mask.
 [[nodiscard]] inline bool has_active_opmask(const iced_x86::Instruction& instr) noexcept {
   const auto opmask = instr.op_mask();
   return opmask != iced_x86::Register::NONE && opmask != iced_x86::Register::K0;
@@ -45,12 +43,9 @@ std::uint64_t truncate(std::uint64_t value, std::size_t width);
 bool even_parity(std::uint8_t value);
 std::uint64_t sign_extend(std::uint64_t value, std::size_t width);
 ExecutionResult memory_fault(ExecutionContext& ctx, std::uint64_t address);
-// Legacy (non-VEX) SSE/SSE2/SSE3/SSE4 instructions with a full 128-bit (m128) memory operand
-// require it 16-byte aligned, raising #GP(0) if not -- unlike VEX-encoded forms of the same
-// operation, which never impose this. Returns the #GP ExecutionResult when operand_index names a
-// misaligned memory operand, or std::nullopt when there's nothing to fault on (operand is a
-// register, or the memory operand is already aligned) -- callers still do their own read/write
-// afterward, this only gates entry to it.
+// Legacy SSE forms with a full m128 memory operand require it 16-byte aligned and #GP(0) if not,
+// unlike the VEX encodings of the same operations. Returns the #GP when operand_index names a
+// misaligned memory operand; callers still do their own access afterwards.
 [[nodiscard]] std::optional<ExecutionResult> require_aligned_memory_operand(ExecutionContext& ctx,
                                                                              std::uint32_t operand_index,
                                                                              std::uint64_t alignment_mask);
@@ -68,10 +63,8 @@ ExecutionResult dispatch_interrupt(ExecutionContext& ctx, std::uint8_t vector, s
 
 std::uint64_t debug_data_breakpoint_hits(CpuState& state, std::uint64_t address, std::size_t size, bool is_read, bool is_write) noexcept;
 
-// The stack slot a push writes and a pop reads is implicit, so it never appears in the
-// instruction's operand list and the executor's generic watchpoint sweep cannot see it. Report it
-// from the handler instead, or a guest evades a data breakpoint just by pointing rsp at the watched
-// address and pushing.
+// The slot a push writes is implicit and never appears in the operand list, so the executor's
+// watchpoint sweep cannot see it. Report it from the handler or a guest evades a data breakpoint.
 inline void note_stack_access(ExecutionContext& ctx, std::uint64_t slot, std::size_t width, bool is_write) {
   if (ctx.state.dr[7] == 0) {
     return;
@@ -138,10 +131,8 @@ ExecutionResult divide_fault(ExecutionContext& ctx);
   return {};
 }
 
-// How wide a string instruction's index and count registers are. Only an address-size prefix
-// changes it, and iced records that in the operand kind rather than the Code (STOSB is one Code for
-// all three sizes), so this is the only place to read it from. Masking on entry and after every step
-// is enough, since writing back to a 64-bit register zero-extends anyway.
+// How wide a string instruction's index and count registers are. Only an address-size prefix changes
+// it, and iced records that in the operand kind rather than the Code, so this is where to read it.
 
 // A string instruction's DS:rSI source takes a segment override; its ES:rDI destination does not,
 // which is why only the source-reading handlers ask. The override applies to the linear address

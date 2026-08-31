@@ -168,11 +168,8 @@ void emulate_cpuid_defaults(seven::CpuState& state) {
 
 bool ranges_overlap(uint64_t a_base, uint64_t a_size, uint64_t b_base, uint64_t b_size) {
   if (a_size == 0 || b_size == 0) return false;
-  // a_base/a_size is a decoded instruction's own memory access -- guest-controlled via register
-  // values, so a_base + a_size can wrap past the top of the address space for a high enough
-  // address. A plain non-wrapping comparison against the wrapped value would then misclassify
-  // which access actually caused a fault, so treat either side wrapping as "can't rule out
-  // overlap" rather than risk silently attributing a violation to the wrong operand.
+  // A decoded access is guest-controlled, so a_base + a_size can wrap past the top of the address
+  // space and a non-wrapping comparison would attribute the fault to the wrong operand.
   const auto a_end = a_base + a_size;
   const auto b_end = b_base + b_size;
   if (a_end < a_base || b_end < b_base) return true;
@@ -249,13 +246,9 @@ std::optional<int> interrupt_vector_from_instruction(const seven::TrapHookContex
 }
 
 std::optional<iced_x86::Instruction> decode_instruction_at(const seven::CpuState& state, const seven::Memory& memory, const uint64_t rip) {
-  // This is advisory decoding for block metadata, so it must not have side effects. Memory::read
-  // (and read_unchecked) route a fully-contained access to an MMIO region's on_read callback, and
-  // summarize_basic_block below walks forward past instructions the guest may never execute -- so
-  // without this guard a code page adjacent to a device range makes speculative fetches fire real
-  // device reads (clear-on-read status, FIFO pops) for instructions that never run. is_mapped()
-  // only consults the page table, so it is false for exactly the MMIO-backed addresses that would
-  // have dispatched a callback.
+  // Advisory decoding for block metadata, so it must not have side effects. Memory::read routes a
+  // contained access to an MMIO on_read callback, and the walk below runs past instructions the guest
+  // may never execute, so a device range next to a code page would see real speculative reads.
   if (!memory.is_mapped(rip, 1)) {
     return std::nullopt;
   }
@@ -271,12 +264,9 @@ std::optional<iced_x86::Instruction> decode_instruction_at(const seven::CpuState
   return decoded.value();
 }
 
-// InstructionExtensions::flow_control() in this fork is a hand-rolled partial table that only knows
-// Jcc/JMP/CALL/RET/INT3; LOOP/LOOPcc, JCXZ/JECXZ/JRCXZ, SYSCALL and friends, IRET, HLT, UD0-UD2 and
-// XBEGIN all fall through to NEXT. Relying on it alone both mis-sizes any block ending in one of
-// those and, worse, lets the walk below run its full 256-instruction budget for a block that really
-// ends after one instruction -- a guest that alternates two always-taken jrcxz instructions makes
-// every single retired instruction pay for 256 decodes plus 256 fifteen-byte reads.
+// flow_control() here is a partial table knowing only Jcc/JMP/CALL/RET/INT3, so LOOP, JRCXZ,
+// SYSCALL, IRET, HLT, UD and XBEGIN all fall through to NEXT. That mis-sizes a block ending in one
+// and lets the walk below spend its full 256-instruction budget on a block one instruction long.
 bool terminates_basic_block(const iced_x86::Instruction& instr) {
   switch (instr.code()) {
     case iced_x86::Code::LOOP_REL8_16_CX: case iced_x86::Code::LOOP_REL8_32_CX:
@@ -824,11 +814,9 @@ class seven_x86_64_emulator final : public x86_64_emulator {
       }
     }
 
-    // Memory::map_mmio always APPENDS and find_mmio_region returns the FIRST match, so re-mapping a
-    // range without removing the old region leaves the ORIGINAL callbacks servicing every guest
-    // access to it. Those capture whatever device owned them, so once the host tears that device
-    // down and re-maps the range the guest is driving a dangling std::function with an offset, size
-    // and payload of its own choosing. Drop the previous region before installing the replacement.
+    // map_mmio appends and find_mmio_region returns the first match, so re-mapping without removing
+    // leaves the original callbacks servicing the range. Once the host tears that device down the
+    // guest is driving a dangling std::function with an offset and payload of its own choosing.
     if (existing != nullptr && existing->region_id != 0) {
       (void)memory_.unmap_mmio(existing->region_id);
       existing->region_id = 0;
@@ -906,10 +894,8 @@ class seven_x86_64_emulator final : public x86_64_emulator {
       if (ctx.kind == seven::TrapKind::syscall &&
           action == instruction_hook_continuation::skip_instruction &&
           ctx.state.rip != trap_rip) {
-        // SOGEN's shared syscall helpers rewrite RIP as if the backend will still
-        // advance past the syscall instruction after the hook returns. Unicorn
-        // does that for us; seven handles the trap entirely in the hook, so we
-        // must apply the same advance here to preserve the existing contract.
+        // The shared syscall helpers rewrite RIP expecting the backend to advance past the syscall
+        // afterwards, which Unicorn does and seven does not, so apply it here.
         ctx.state.rip += static_cast<std::uint64_t>(ctx.instr.length());
       }
       return result;
@@ -1097,14 +1083,9 @@ class seven_x86_64_emulator final : public x86_64_emulator {
       return std::nullopt;
     });
 
-    // `memory_ = {}` above threw away Memory's access-hook table along with the pages, but every
-    // emulator_hook handle already handed out stays live and still looks valid to the caller, so
-    // without this the hooks silently stop firing after a restore and accesses they were meant to
-    // intercept go straight through. It also resets Memory's shared hook-id counter, so the ids the
-    // surviving handles carry become available for reuse -- a later delete_hook() on one of them
-    // would then remove an unrelated, newly registered hook. Re-registering here rebinds each handle
-    // to a fresh id. Deliberately after restore_mmio_regions, which advances that counter past the
-    // restored region ids, so the new access-hook ids cannot collide with them either.
+    // `memory_ = {}` dropped the access-hook table while every handle stays live, so hooks silently
+    // stop firing after a restore, and it frees hook ids those handles still carry for reuse.
+    // Re-registering runs after restore_mmio_regions so the fresh ids cannot collide.
     for (auto& hook : hooks_) {
       if (hook->hook_kind != hook_object::kind::memory || !hook->memory_hook) {
         continue;

@@ -9,12 +9,9 @@ using X87Scalar = ::seven::X87Scalar;
 
 namespace {
 
-// FPREM and FPREM1 are partial remainders: one execution is only guaranteed to make progress when
-// the two exponents are within 64 of each other. Past that the instruction reduces by an
-// implementation-chosen amount, raises C2 to say it is not finished, and expects the guest to run it
-// again. seven computed the whole remainder in one shot and never touched a condition code, so a
-// guest looping on C2 spun forever and one reading the quotient bits read stale flags. Both take
-// their operands implicitly from ST(0) and ST(1).
+// FPREM and FPREM1 are partial remainders: past 64 exponents apart they reduce by an
+// implementation-chosen amount, raise C2 and expect to be run again. Computing the whole remainder
+// in one shot without touching a condition code left a guest looping on C2 spinning forever.
 ExecutionResult x87_partial_remainder(ExecutionContext& ctx, bool round_to_nearest) {
   if (ctx.state.x87_is_empty(0) || ctx.state.x87_is_empty(1)) {
     auto result = x87_stack_underflow_into(ctx, 0);

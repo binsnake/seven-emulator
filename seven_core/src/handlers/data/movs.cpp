@@ -4,12 +4,10 @@ namespace seven::handlers {
 
 namespace {
 
-// A rep-prefixed string op runs its whole count in one handler call, and ExecutionContext has no
-// way back to the Executor, so nothing can poll for a cooperative stop mid-loop. A huge guest RCX
-// therefore hangs step_impl with no chance for request_stop() or a watchdog to fire. Hardware stays
-// preemptible by checking interrupts between iterations; capping iterations per call and yielding
-// with rip unchanged reproduces that, and is guest-invisible since RCX/RSI/RDI already reflect the
-// partial progress.
+// A rep-prefixed string op runs its whole count in one handler call with no way back to the Executor,
+// so a huge guest RCX hangs step_impl past any request_stop() or watchdog. Hardware stays preemptible
+// between iterations; capping and yielding with rip unchanged reproduces that, invisibly to the guest
+// since RCX/RSI/RDI already carry the partial progress.
 constexpr std::uint64_t kMaxRepIterationsPerCall = 4096;
 
 // A single-stepping guest sees a #DB after every iteration of a rep, not one after the whole loop.
@@ -77,10 +75,8 @@ ExecutionResult movs_impl(ExecutionContext& ctx, const std::size_t width) {
       return {};
     }
 
-    // See kMaxRepIterationsPerCall's comment above: yield back to the caller after a bounded
-    // number of iterations rather than let a huge RCX run this whole loop uninterruptibly. rip
-    // stays at this same instruction (control_flow_taken=true, state.rip left untouched) so the
-    // next step() call simply continues the same rep from exactly where it left off.
+    // Yield after a bounded number of iterations rather than run a huge RCX uninterruptibly. rip
+    // stays on this instruction, so the next step() continues the same rep where it left off.
     if (rep && remaining > 0 && (i + 1) >= rep_iterations_per_call(ctx)) {
       ctx.state.gpr[6] = rsi;
       ctx.state.gpr[7] = rdi;

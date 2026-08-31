@@ -266,12 +266,9 @@ TEST(KuberaScalar, FxrstorReadsWritablePages) {
 
 
 TEST(KuberaScalar, BtsWithHugeBitIndexFaultsGeneralProtectionNotPageFault) {
-  // bts [rdi], r8 -- the register-sourced bit index extends the effective address by
-  // (index >> 6) * 8 per the SDM, so a huge index (as seven-fuzzer's random register generation
-  // produces routinely) pushes the real access into non-canonical territory. Real hardware raises
-  // #GP(0) for that, checked before any page walk -- confirmed via a standalone probe. Before this
-  // fix, seven_core had no canonical-address check anywhere, so this came back as a generic
-  // page_fault instead, a real divergence from hardware seven-fuzzer's BT-family findings caught.
+  // bts [rdi], r8 -- a register bit index extends the effective address per the SDM, so a huge one
+  // lands non-canonical, which hardware raises #GP(0) for before any page walk. seven_core had no
+  // canonical check at all and reported page_fault.
   seven::Executor executor{};
   seven::CpuState state{};
   seven::Memory memory{};
@@ -307,11 +304,9 @@ TEST(KuberaScalar, BtsWithSmallBitIndexStillWorksAfterCanonicalCheck) {
 }
 
 TEST(KuberaScalar, FnstenvToUnmappedMemoryFaultsInsteadOfReportingSuccess) {
-  // store_x87_env() returned void and threw away all seven of its ctx.memory.write() results, and
-  // both FNSTENV handlers ignored it and returned {} unconditionally -- so an FNSTENV aimed at
-  // unmapped memory silently "succeeded" with nothing written. The ~400-site memory_fault() sweep
-  // missed this family because the helpers return void, so there was no `if (!...read/write)` shape
-  // to match on.
+  // store_x87_env() returned void and dropped all seven write results, so FNSTENV to unmapped
+  // memory silently succeeded having written nothing. The memory_fault() sweep missed this family
+  // because a void helper has no `if (!write)` shape to match.
   seven::Executor executor{};
   seven::CpuState state{};
   seven::Memory memory{};
@@ -326,13 +321,8 @@ TEST(KuberaScalar, FnstenvToUnmappedMemoryFaultsInsteadOfReportingSuccess) {
 }
 
 TEST(KuberaScalar, FnsaveToUnmappedMemoryFaultsAndLeavesFpuStateIntact) {
-  // Same void-helper gap as above, plus a second-order bug: fsave() ran x87_reset() unconditionally
-  // after the (silently failed) stores, so a save that never landed still wiped the guest's FPU
-  // stack. Validating the whole 160-byte footprint up front -- the way fxsave already did -- makes
-  // the fault happen before any state is touched, which is also what real hardware does.
-  // Doubles as the regression test for the orphaned-handler half of this fix: DD /6 decodes to
-  // FNSAVE_M108BYTE, which was never registered, so this instruction previously stopped as
-  // unsupported_instruction and fsave() was unreachable dead code.
+  // Same void-helper gap, plus an unconditional x87_reset() afterwards, so a save that never landed
+  // still wiped the stack. DD /6 was also never registered, leaving fsave() unreachable.
   seven::Executor executor{};
   seven::CpuState state{};
   seven::Memory memory{};
@@ -367,11 +357,8 @@ TEST(KuberaScalar, FnstenvToNonCanonicalAddressFaultsGeneralProtection) {
 }
 
 TEST(KuberaScalar, NonCanonicalAddressFaultsGeneralProtectionNotPageFault) {
-  // mov rax, [rbx] with rbx pointing at a non-canonical address. Every handler's memory-fault
-  // path now funnels through detail::memory_fault(), which checks canonicality before treating
-  // the access as an ordinary page_fault -- previously only the ~169 sites that already called
-  // memory_fault() got this for free, while ~400 other sites (including this MOV handler)
-  // constructed the page_fault ExecutionResult inline and skipped the check entirely.
+  // mov rax, [rbx] with rbx non-canonical. Every fault path funnels through memory_fault() now;
+  // before, ~400 sites built the page_fault result inline and skipped the canonical check.
   seven::Executor executor{};
   seven::CpuState state{};
   seven::Memory memory{};
@@ -386,10 +373,8 @@ TEST(KuberaScalar, NonCanonicalAddressFaultsGeneralProtectionNotPageFault) {
 }
 
 TEST(KuberaScalar, MovCrRejectsReservedControlRegisterIndex) {
-  // Real hardware only defines CR0, CR2, CR3, CR4, and (64-bit mode) CR8 as valid MOV CR
-  // operands -- CR1, CR5-CR7, CR9-CR15 #UD. state.cr is sized to cover all 16 possible encodings
-  // so an unfiltered access would never go out of bounds, but it would let a guest treat a
-  // register that doesn't exist in silicon at all as ordinary read/write storage.
+  // Only CR0/2/3/4/8 exist; the rest #UD. state.cr covers all 16 encodings so this was never out of
+  // bounds, just a guest using registers that do not exist in silicon as read/write storage.
   seven::Executor executor{};
   seven::CpuState state{};
   seven::Memory memory{};
@@ -582,10 +567,8 @@ TEST(KuberaScalar, WrmsrnsTakesItsIndexFromEcx) {
   EXPECT_FALSE(state.msr.contains(0x11112222u)) << "index came from eax";
 }
 
-// SYSRET and SYSEXIT are the kernel's way back out to user code and are CPL0-only on hardware.
-// None of the four forms checked, and SYSRETQ additionally loaded rflags wholesale out of R11 --
-// so a ring 3 guest could pick its own IOPL and hand itself back everything the CLI/STI gate two
-// tests up exists to deny, in two instructions.
+// These are CPL0-only on hardware and none of the four forms checked. SYSRETQ also loads rflags
+// wholesale from R11, so a ring 3 guest could pick its own IOPL in two instructions.
 TEST(KuberaScalar, SysretDoesNotLetRingThreeRaiseItsOwnIopl) {
   seven::Executor executor{};
   seven::CpuState state{};
@@ -645,10 +628,8 @@ TEST(KuberaScalar, SysretqStillReturnsAtCplZero) {
 }
 
 TEST(KuberaScalar, WrfsbaseRejectsNonCanonicalAddress) {
-  // WRFSBASE/WRGSBASE never route through the ordinary memory-operand fault path (they write
-  // FS.base/GS.base directly, not memory), so they need their own canonical-address check --
-  // real hardware #GP(0)s on a non-canonical operand here just like it does for any other
-  // 4-level-paging address.
+  // These write FS.base/GS.base directly rather than memory, so they never reach the ordinary
+  // operand fault path and need their own canonical check. Hardware #GP(0)s here too.
   seven::Executor executor{};
   seven::CpuState state{};
   seven::Memory memory{};
@@ -693,10 +674,8 @@ TEST(KuberaScalar, RdsspReportsNoShadowStack) {
 TEST(KuberaScalar, MovSegmentRegisterToAndFromMemoryUsesTheM16Form) {
   constexpr std::uint64_t kData = 0x4000;
 
-  // 8C 03 -- mov word ptr [rbx], es. Default operand size in 64-bit mode makes this
-  // MOV_R32M16_SREG, whose handler used to write the register named by op 0 regardless of whether
-  // op 0 was a register at all. For a memory operand iced leaves op_register(0) as NONE, which
-  // write_register maps to gpr[0], so this stored nothing and destroyed rax instead.
+  // mov word ptr [rbx], es. The handler wrote op 0 as a register regardless of its kind, and a
+  // memory operand leaves op_register(0) as NONE, which maps to gpr[0]. It destroyed rax.
   run_single(seven::parse_hex_bytes("8C 03"),
              [](seven::CpuState& state, seven::Memory& memory) {
                memory.map(kData, 0x1000);
@@ -773,11 +752,9 @@ TEST(KuberaScalar, MovSegmentRegisterFromMemoryReadsOnlyTwoBytes) {
 }
 
 TEST(KuberaScalar, FnsaveWritesOnlyTheArchitecturalImage) {
-  // fsave() ignored the size its handler passed and always validated and wrote 160 bytes: a
-  // 24-byte private environment plus eight 16-byte ST slots. The architectural FNSAVE image is
-  // 108 bytes (a 28-byte environment plus eight 10-byte slots) for the 32-bit form and 94 for the
-  // 16-bit one, so this scribbled 52 bytes of unrelated guest memory past the end of a correctly
-  // sized buffer, and refused a 108-byte buffer that ended on a page boundary.
+  // fsave() ignored the size its handler passed and always wrote 160 bytes where the architectural
+  // image is 108, so it scribbled 52 bytes past a correctly sized buffer and refused one ending on
+  // a page boundary.
   constexpr std::uint64_t kSave = 0x4000;
   seven::Executor executor{};
   seven::CpuState state{};
@@ -801,10 +778,8 @@ TEST(KuberaScalar, FnsaveWritesOnlyTheArchitecturalImage) {
 }
 
 TEST(KuberaScalar, FnsaveFrstorRoundTripKeepsTheStackWhenTopIsNotZero) {
-  // The environment's tag word is two bits per PHYSICAL register, but the data slots are
-  // top-relative. The old code built the tag word by physical index and then read and wrote the
-  // slots by ST index, so after an fld1 (which leaves TOP at 7) the save wrote ST0's data into a
-  // slot the restore then read as a different register, and ST(0) came back empty.
+  // The tag word is per physical register but the data slots are top-relative, and the old code
+  // mixed the two, so after an fld1 (TOP at 7) a round trip came back with ST(0) empty.
   constexpr std::uint64_t kSave = 0x4000;
   seven::Executor executor{};
   seven::CpuState state{};
@@ -858,11 +833,9 @@ TEST(KuberaScalar, FnstenvWritesOnlyTheRequestedEnvironmentSize) {
 }
 
 TEST(KuberaScalar, FstpTbyteWritesTheArchitecturalEightyBitEncoding) {
-  // softfloat's extFloat80M swaps its two fields on LITTLEENDIAN, and the build only defined that
-  // for softfloat's own sources. seven_core therefore disagreed with the library it links about
-  // where signif and signExp live, so every direct field access read the wrong offset: 1.0 came
-  // out of encode_ext80 as ff3f followed by eight zero bytes instead of the real encoding. That
-  // corrupts every 80-bit memory format the guest can see, fstp tbyte included.
+  // extFloat80M swaps its fields on LITTLEENDIAN, which the build only defined for softfloat's own
+  // sources, so seven_core disagreed with the library it links about where signif and signExp live.
+  // Every 80-bit memory format the guest can see was corrupt.
   constexpr std::uint64_t kData = 0x4000;
   seven::Executor executor{};
   seven::CpuState state{};
@@ -885,11 +858,9 @@ TEST(KuberaScalar, FstpTbyteWritesTheArchitecturalEightyBitEncoding) {
 }
 
 TEST(KuberaScalar, LoopWithoutAnAddressSizePrefixCountsDownTheFullRcx) {
-  // E2 FE -- loop $-0. In 64-bit mode the default address size is 64, so this decrements RCX and
-  // branches while RCX is still nonzero. The counter register is chosen by the ADDRESS size, not
-  // the operand size, and iced's Jb2 decode handler was reading operand_size -- which is 32 here
-  // for want of a REX.W that LOOP can never have. That made the plain form decode as the ECX
-  // variant, so a 33-bit count collapsed to zero after one iteration instead of counting down.
+  // E2 FE -- loop $-0. The counter register comes from the ADDRESS size, not the operand size, and
+  // iced's Jb2 handler read operand_size, which is 32 here for want of a REX.W that LOOP can never
+  // carry. The plain form decoded as the ECX variant, collapsing a 33-bit count after one pass.
   run_single(seven::parse_hex_bytes("E2 FE"),
              [](seven::CpuState& state, seven::Memory&) { state.gpr[1] = 0x0000'0001'0000'0001ull; },
              [](const seven::ExecutionResult&, const seven::CpuState& state, const seven::Memory&) {
@@ -923,10 +894,8 @@ TEST(KuberaScalar, NearIndirectJumpThroughMemoryReadsAFullEightByteTarget) {
   constexpr std::uint64_t kData = 0x4000;
   constexpr std::uint64_t kTarget = 0x0000'0007'1234'5000ull;
 
-  // FF 27 -- jmp qword ptr [rdi]. FF /2 and FF /4 have a forced 64-bit operand size in long mode,
-  // but iced's Evj decode handler picked the code straight off operand_size, which is 32 without a
-  // REX.W these forms can never carry. That reported an RM32 form with a 4-byte memory size, so a
-  // target above 4GB came back truncated to its low half.
+  // jmp qword ptr [rdi]. FF /2 and /4 force a 64-bit operand size in long mode, but the decoder
+  // read operand_size, which is 32 without a REX.W these forms cannot carry. Targets truncated.
   run_single(seven::parse_hex_bytes("FF 27"),
              [kData, kTarget](seven::CpuState& state, seven::Memory& memory) {
                memory.map(kData, 0x1000);
@@ -959,10 +928,8 @@ TEST(KuberaScalar, NearIndirectCallThroughARegisterUsesTheFullSixtyFourBits) {
 }
 
 TEST(KuberaScalar, XaddWithTheSameRegisterTwiceDoublesItRatherThanCancelling) {
-  // 4D 0F C1 FF -- xadd r15, r15. Intel's order is TEMP := SRC + DEST; SRC := DEST; DEST := TEMP,
-  // so the destination write lands last and the register ends up doubled. Writing the source
-  // afterwards instead put the original value straight back and the instruction did nothing at
-  // all. Hardware and Unicorn both double it; seven was the odd one out.
+  // xadd r15, r15. Intel writes the destination last, so the register doubles; writing the source
+  // afterwards put the original straight back and the instruction did nothing at all.
   run_single(seven::parse_hex_bytes("4D 0F C1 FF"),
              [](seven::CpuState& state, seven::Memory&) { state.gpr[15] = 0xE8C842B14C7FFB7Aull; },
              [](const seven::ExecutionResult&, const seven::CpuState& state, const seven::Memory&) {
@@ -993,10 +960,8 @@ TEST(KuberaScalar, XaddWithTheSameRegisterTwiceDoublesItRatherThanCancelling) {
 TEST(KuberaScalar, MovToAnAbsoluteMoffsAddressStoresTheAccumulator) {
   constexpr std::uint64_t kData = 0x4000;
 
-  // A2 00 40 00 00 00 00 00 00 -- mov byte ptr [0x4000], al. The A0/A1 load forms read operand 1
-  // and write operand 0, and the A2/A3 store forms had simply been given the same shape with the
-  // indices swapped, which makes them load as well: the store never happened and the accumulator
-  // was overwritten with whatever the address held.
+  // mov byte ptr [0x4000], al. The A2/A3 store forms were given the A0/A1 load shape with the
+  // indices swapped, which loads as well, so the store never happened and al was clobbered.
   run_single(seven::parse_hex_bytes("A2 00 40 00 00 00 00 00 00"),
              [](seven::CpuState& state, seven::Memory& memory) {
                memory.map(kData, 0x1000);
@@ -1030,11 +995,9 @@ TEST(KuberaScalar, Crc32OverMemorySourcesUsesTheOperandsRealWidth) {
   constexpr std::uint64_t kValue = 0x0123456789ABCDEFull;
   constexpr std::uint32_t kSeed = 0xB0051228u;
 
-  // F2 0F 38 F1 57 00 -- crc32 edx, dword ptr [rdi]. operand_width fed read_operand a width taken
-  // from a double-converted memory_size: 4 bytes came back as 8 and 8 came back as 64. The 64 case
-  // is the sharp one -- read_operand copies that many bytes into a uint64_t on its own stack, so
-  // `crc32 r64, qword ptr [mem]` overran the frame and took the process down with an access
-  // violation. Guest bytes, host stack.
+  // crc32 edx, dword ptr [rdi]. A double-converted memory_size gave read_operand a width of 8 for
+  // 4 and 64 for 8, and it copies that many bytes into a uint64_t on its own stack -- so the 64-bit
+  // form overran the frame. Guest bytes, host stack.
   run_single(seven::parse_hex_bytes("F2 0F 38 F1 57 00"),
              [kData, kSeed, kValue](seven::CpuState& state, seven::Memory& memory) {
                memory.map(kData, 0x1000);
@@ -1070,11 +1033,9 @@ TEST(KuberaScalar, Crc32OverMemorySourcesUsesTheOperandsRealWidth) {
              });
 }
 
-// sreg[1] is the only thing in this emulator that says what privilege level the guest is at, and
-// there are no descriptor tables, so a far branch writing it straight from a guest-supplied
-// selector hands the guest ring 0. Every CPL gate in the tree is derived from the same field, so
-// one RETF voids all of them at once. Real hardware faults instead: a far return can stay where it
-// is or move outward, never inward, and it validates the selector through the GDT/LDT to get there.
+// sreg[1] is the only record of privilege level here, so a far branch writing it from a guest
+// selector hands the guest ring 0 and voids every CPL gate in the tree at once. Hardware only lets
+// a far return move outward, and validates the selector through the GDT/LDT.
 
 TEST(KuberaScalar, AFarReturnCannotLowerTheCurrentPrivilegeLevel) {
   seven::Executor executor{};
@@ -1115,10 +1076,8 @@ constexpr std::uint64_t kX87Data = 0x4000;
 
 }  // namespace
 
-// seven::ldexp used to add FSCALE's shift count to the biased exponent as an int, and the shift is
-// whatever the guest left in ST(1). It also fell back to std::ldexp on a double for the subnormal
-// and underflow cases, which are exactly the values a double cannot hold, so a result that should
-// have been a representable denormal came back as zero or infinity.
+// ldexp added FSCALE's guest-supplied shift to the biased exponent as a plain int, and fell back to
+// std::ldexp on a double for exactly the subnormal cases a double cannot hold.
 TEST(KuberaScalar, FscaleReachesTheDenormalRangeInsteadOfFlushing) {
   seven::Executor executor{};
   seven::CpuState state{};
@@ -1680,10 +1639,8 @@ TEST(KuberaScalar, FxamReportsTheSignOfAnEmptyRegisterAndTheUnsupportedClass) {
   }
 }
 
-// The RDTSC counter used to be a function-local static, so every guest in the process shared it.
-// Two Executors that are meant to be isolated could watch each other's progress through it, and on
-// separate threads they raced on the increment. RDTSCP read a hardcoded 0 at the same time, so a
-// guest using both saw the clock jump backwards.
+// The RDTSC counter was a function-local static, so every guest in the process shared it and raced
+// on the increment. RDTSCP read a hardcoded 0, so a guest using both saw the clock go backwards.
 TEST(KuberaScalar, TheTimestampCounterIsPerGuestNotPerProcess) {
   const auto run_one = [](seven::CpuState& state, seven::Memory& memory, seven::Executor& executor) {
     state.mode = seven::ExecutionMode::long64;
@@ -1725,10 +1682,8 @@ TEST(KuberaScalar, TheTimestampCounterIsPerGuestNotPerProcess) {
   EXPECT_EQ(state_c.gpr[0] & 0xFFFFFFFFull, 2u) << "rdmsr 0x10 must report the same counter";
 }
 
-// MOV to a segment register writes sreg[] by index, and index 1 is CS, the only place this
-// emulator records the current privilege level. There is no MOV CS encoding on hardware and iced
-// declines to decode one, so this pins both halves: the decoder rejects it, and if it ever stopped
-// rejecting it the handler would too.
+// sreg index 1 is CS, the only place the privilege level lives. Hardware has no MOV CS encoding, so
+// this pins both halves: the decoder rejects it, and the handler would too if it stopped.
 TEST(KuberaScalar, MovToCsCannotSetThePrivilegeLevel) {
   seven::Executor executor{};
   seven::CpuState state{};
@@ -1744,10 +1699,8 @@ TEST(KuberaScalar, MovToCsCannotSetThePrivilegeLevel) {
   EXPECT_EQ(state.sreg[1] & 0x3u, 3u) << "CPL must not have dropped";
 }
 
-// validate_memory_span exists so the x87 image stores can check the whole 108-byte image before
-// touching any of it. It computed base + offset as plain uint64, so a destination near the top of
-// the address space wrapped and it happily validated page 0, then the store itself faulted partway
-// through on Memory's own wrap check, leaving a half-written image behind.
+// validate_memory_span computed base + offset as plain uint64, so a destination near the top of the
+// address space wrapped and validated page 0, then faulted partway through the store.
 TEST(KuberaScalar, AnX87ImageStoreThatWrapsTheAddressSpaceFaultsBeforeWritingAnything) {
   seven::Executor executor{};
   seven::CpuState state{};
@@ -1775,11 +1728,9 @@ TEST(KuberaScalar, AnX87ImageStoreThatWrapsTheAddressSpaceFaultsBeforeWritingAny
   }
 }
 
-// sreg[1] is this emulator's only record of the current privilege level, and dispatch_interrupt
-// assigns it straight from the gate's code selector. Hardware only permits that for INT n, INT3 and
-// INTO when the gate's DPL is at least the caller's CPL; without that check a guest the embedder
-// put at ring 3 walks into any present vector and comes out at whatever ring the gate names, which
-// voids every CPL gate in the tree at once (MOV CR, WRMSR, SWAPGS, CLTS, XSETBV, CLI/STI).
+// dispatch_interrupt assigns sreg[1], the only record of privilege level, straight from the gate's
+// code selector. Hardware requires the gate's DPL to be at least the caller's CPL; without that a
+// ring-3 guest walks into any present vector and comes out at whatever ring it names.
 TEST(KuberaScalar, ASoftwareInterruptCannotEnterAGateItLacksThePrivilegeFor) {
   seven::Executor executor{};
   seven::CpuState state{};
@@ -1867,12 +1818,9 @@ TEST(KuberaScalar, IretDoesNotLetRingThreeRewriteItsOwnIopl) {
   EXPECT_EQ((state.rflags >> 12) & 0x3u, 0u) << "IOPL is writable only from CPL 0";
 }
 
-// iced's decoder value-initializes Instruction, and OpKind::REGISTER and Register::NONE are both 0,
-// so reading an operand slot the decoder never wrote comes back as (REGISTER, NONE) -- which passes
-// an `op_kind(i) != REGISTER` guard. Several x87 handlers read operand 1 (or operands 0 and 1) on
-// instructions that carry fewer than that, and x87_st_index(NONE) then underflows to a huge value
-// that x87_phys_index masks down to ST(7). The mask is what keeps it memory-safe; it is also what
-// hid it.
+// OpKind::REGISTER and Register::NONE are both 0, so an operand the decoder never wrote reads back
+// as (REGISTER, NONE) and passes an `op_kind(i) != REGISTER` guard. x87_st_index(NONE) then
+// underflows and gets masked to ST(7) -- memory-safe, which is also what hid it.
 
 TEST(KuberaScalar, FpremDoesNotFaultOnAnInstructionWithNoOperands) {
   seven::Executor executor{};
@@ -1953,10 +1901,8 @@ TEST(KuberaScalar, FcomppComparesTheTopTwoStackSlots) {
   EXPECT_NE(state.x87_status_word & (1u << 8), 0u) << "C0: ST(0) is less than ST(1)";
 }
 
-// fnstcw/fldcw is the most common x87 idiom there is -- every _controlfp, every MSVC __ftol2, every
-// rounding-mode save/restore. Real hardware ignores the reserved control-word bits rather than
-// validating them, and the architectural default 0x037F has bit 6 set, so a reserved-bit check that
-// includes bit 6 faults on the value the FPU resets to.
+// Hardware ignores the reserved control-word bits rather than validating them, and the default
+// 0x037F has bit 6 set, so a check including bit 6 faults on the value the FPU resets to.
 TEST(KuberaScalar, FldcwAcceptsTheArchitecturalDefaultControlWord) {
   constexpr std::uint64_t kSlot = 0x4000;
   seven::Executor executor{};
@@ -2000,10 +1946,8 @@ TEST(KuberaScalar, FxrstorKeepsTheControlWordFxsaveWrote) {
   EXPECT_EQ(state.get_x87_control_word(), 0x037Fu) << "the restore cleared bits the save wrote";
 }
 
-// Hardware puts ST(i) in fxsave slot i while the abridged tag word is indexed by physical register.
-// fsave/frstor already pair the two conventions correctly; fxsave/fxrstor used physical for both,
-// so any image taken with TOP != 0 had its registers in the wrong slots. Only observable from
-// outside the round trip, which is why a save/restore pair alone never caught it.
+// fxsave slot i holds ST(i) while the abridged tag word is indexed physically. fxsave/fxrstor used
+// physical for both, so any image taken with TOP != 0 had its registers in the wrong slots.
 TEST(KuberaScalar, FxsaveWritesTheStackTopRelative) {
   constexpr std::uint64_t kSave = 0x4000;
   seven::Executor executor{};
@@ -2029,10 +1973,8 @@ TEST(KuberaScalar, FxsaveWritesTheStackTopRelative) {
       << "slot 0 must hold ST(0), not physical register 0";
 }
 
-// Overflowing the x87 stack sets SF and C1 alongside IE, which is how a guest tells an overflow
-// from an underflow. FLD1/FLDZ/FLDPI, the integer loads and the BCD load all go through
-// x87_stack_overflow; the plain FLD forms did not -- the memory form raised a bare invalid
-// exception, and the register form reported a page fault on an instruction with no memory operand.
+// A stack overflow sets SF and C1 alongside IE, which is how a guest tells it from an underflow. The
+// plain FLD forms skipped x87_stack_overflow: one raised a bare #IA, the other a page fault.
 TEST(KuberaScalar, OverflowingTheStackWithFldReportsAStackFault) {
   constexpr std::uint64_t kData = 0x4000;
   const auto fill_then = [&](const std::string& tail_hex) {
@@ -2224,10 +2166,8 @@ TEST(KuberaScalar, XaddLeavesFlagsAloneWhenTheStoreFaults) {
       << "a store that never landed must not have published CF/ZF/PF/AF";
 }
 
-// A push is a fault, not a trap: hardware aborts it and leaves rsp exactly where it was, which is
-// the only reason a guard page can grow a stack -- the handler maps the page and the same push runs
-// again. Decrementing rsp before the store meant every retry started one slot lower, so a stack that
-// faulted twice ended up 16 bytes down with nothing written.
+// A push is a fault, so hardware leaves rsp where it was and the retry works, which is what lets a
+// guard page grow a stack. Decrementing first meant every retry started one slot lower.
 TEST(KuberaScalar, APushThatFaultsDoesNotMoveTheStackPointer) {
   seven::Executor executor{};
   seven::CpuState state{};
@@ -2404,10 +2344,8 @@ TEST(KuberaScalar, AnIndirectCallToANonCanonicalTargetPushesNothing) {
   EXPECT_EQ(slot, 0u) << "the return address was written before the target was checked";
 }
 
-// ENTER's nesting level used to be discarded outright, so a level-3 frame came out with the display
-// pointers missing and rsp three slots too high -- silently the wrong frame rather than a refused
-// one. Level counts the frame pointer itself, so level 3 copies two enclosing pointers and then
-// pushes the new frame pointer on top.
+// ENTER's nesting level was discarded, so a level-3 frame lost its display pointers and left rsp
+// three slots high. Level counts the frame pointer, so 3 copies two and pushes the new one.
 TEST(KuberaScalar, EnterBuildsTheDisplayForANonZeroNestingLevel) {
   seven::Executor executor{};
   seven::CpuState state{};
@@ -2484,10 +2422,8 @@ bool is_x87_indefinite(const seven::X87Scalar& value) {
 
 }  // namespace
 
-// A masked stack overflow is not a no-op on hardware: TOP still moves and the new top gets the QNaN
-// indefinite. seven raised the exception and left TOP alone, so from there on every ST(i) the guest
-// named resolved to a different physical register than the one hardware would have used -- the
-// whole register file was off by one for the rest of the program.
+// A masked stack overflow still moves TOP and writes the indefinite. Leaving TOP alone put every
+// later ST(i) on the wrong physical register for the rest of the program.
 TEST(KuberaScalar, MaskedStackOverflowStillMovesTheStackTop) {
   const auto fill_then_overflow = [](std::uint16_t control_word) {
     seven::Executor executor{};
@@ -2787,10 +2723,8 @@ TEST(KuberaScalar, FxtractSplitsTheExponentFromTheSignificand) {
   EXPECT_EQ(static_cast<double>(state.x87_get(1)), 3.0) << "the unbiased exponent stays below it";
 }
 
-// Hardware derives the tag from the register's own bits, so anything that is not a plain normalized
-// number reads back as SPECIAL. x87_set and x87_push settled it with `(value == 0) ? zero : valid`,
-// which is what a guest saw through FNSTENV and FNSAVE for every infinity, NaN, denormal and
-// unnormal it had ever written.
+// The tag comes from the register's own bits, so anything not plainly normalized reads back as
+// SPECIAL. `(value == 0) ? zero : valid` is what FNSTENV showed for every NaN and denormal.
 TEST(KuberaScalar, TheTagWordReportsSpecialForEverythingThatIsNotAnOrdinaryNumber) {
   {
     X87Fixture f;

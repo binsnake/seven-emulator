@@ -7,22 +7,17 @@
 
 namespace seven {
 
-// One instruction within a basic block being lifted for the backward flag-liveness pass. `instr`
-// must already be decoded; `dead_flags_mask` is an out-param the pass fills in with the subset of
-// kAluStatusFlagsMask that this instruction writes but nothing later in the block (or anything
-// past the block, since live-out-of-block is always conservatively "everything live") ever reads.
+// One instruction in a lifted block. `instr` must already be decoded, and `dead_flags_mask` is
+// filled in with the flags this instruction writes that nothing later in the block reads.
 struct FlagLivenessInstr {
   const iced_x86::Instruction* instr = nullptr;
   std::uint64_t dead_flags_mask = 0;
 };
 
-// Backward liveness dataflow over the six ALU status flags, each treated as an independent
-// variable. `insts` is in program order and every dead_flags_mask is overwritten in place.
-//
-// This only ever skips a provably unobservable write, never changing a value that is actually read.
-// The caller decides whether skipping writes is sound at all: instruction, code and memory-access
-// hooks can observe rflags mid-block through ExecutionContext, so this must not run while any are
-// registered. Trap and execution hooks do not have that problem.
+// Backward liveness over the six ALU status flags as independent variables. `insts` is in program
+// order and every dead_flags_mask is overwritten in place. This only skips a provably unobservable
+// write, but the caller decides whether skipping is sound at all: instruction, code and access hooks
+// can read rflags mid-block, so it must not run while any are registered.
 void compute_flag_liveness(std::span<FlagLivenessInstr> insts) noexcept;
 
 // Whether this decoded instruction can fault (memory operand, DIV/IDIV, or implicit stack access

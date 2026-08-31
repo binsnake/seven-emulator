@@ -126,12 +126,10 @@ bool write_any(ExecutionContext& ctx, std::uint32_t operand_index, big_uint valu
   return false;
 }
 
-// require_alignment defaults to false since full_move backs ~80 instructions spanning the
-// unaligned-safe moves (MOVUPS/MOVDQU/LDDQU/...) and the explicitly-aligned ones
-// (MOVAPS/MOVAPD/MOVDQA/MOVNTDQA) -- callers opt in rather than this function guessing from the
-// Code enum. The alignment those need is the operand width, not a flat 16 bytes, and it survives
-// into the VEX and EVEX encodings: only exception classes 2 and 4 drop the requirement under VEX,
-// and the aligned moves are class 1.
+// full_move backs about 80 instructions spanning both the unaligned-safe moves and the explicitly
+// aligned ones, so callers opt in rather than this guessing from the Code. The requirement is the
+// operand width, not a flat 16 bytes, and it survives into VEX and EVEX since those moves are
+// exception class 1.
 ExecutionResult full_move(ExecutionContext& ctx, std::uint32_t dst, std::uint32_t src, bool zero_upper,
                           bool require_alignment = false) {
   if (detail::has_active_opmask(ctx.instr)) return detail::unsupported_opmask(ctx);
@@ -259,11 +257,9 @@ ExecutionResult movhlps_legacy(ExecutionContext& ctx) {
   return {};
 }
 
-// Both of these are register-only forms, but this decoder hands back an
-// EVEX_VMOVLHPS_XMM_XMM_XMM for a VEX 0F 16 encoding with mod != 3, with op2 still marked
-// MEMORY. op_register on that slot is Register::NONE, which resolves to a vector index of zero,
-// so the handler would quietly operate on XMM0 and never touch the memory operand. Refuse the
-// shape here rather than depend on the decoder tables to never produce it.
+// Both are register-only forms, but the decoder returns EVEX_VMOVLHPS_XMM_XMM_XMM for a VEX 0F 16
+// with mod != 3 and op2 still marked MEMORY, whose NONE register resolves to XMM0. Refuse the shape
+// here rather than trust the decoder tables never to produce it.
 [[nodiscard]] ExecutionResult unsupported_shape(ExecutionContext& ctx) {
   return {StopReason::unsupported_instruction, 0,
           ExceptionInfo{StopReason::unsupported_instruction, ctx.state.rip, 0}, ctx.instr.code()};

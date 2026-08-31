@@ -4,14 +4,10 @@ namespace seven::handlers {
 
 namespace {
 
-// ENTER's second operand used to be discarded. A non-zero nesting level copies that many pointers
-// from the enclosing frames onto the new frame before the frame pointer moves, so ignoring it left
-// rsp `level * width` slots too high and every display slot unwritten -- a silently wrong frame
-// rather than a refused one, which is the worst of the three options for a guest that then indexes
-// through it. Level is taken mod 32 by the instruction itself.
-//
-// The whole thing runs off locals and commits rsp/rbp only at the end, so a copy that faults
-// partway leaves the registers where they were and the instruction restarts cleanly.
+// ENTER's nesting level copies that many pointers from the enclosing frames before the frame pointer
+// moves, and discarding it left rsp `level * width` slots high with every display slot unwritten.
+// Level is taken mod 32 by the instruction. Everything runs off locals and commits rsp/rbp at the
+// end, so a copy that faults partway restarts cleanly.
 ExecutionResult enter_common(ExecutionContext& ctx, std::size_t width, iced_x86::Register sp_reg,
                              iced_x86::Register bp_reg) {
   const auto mask = mask_for_width(width);

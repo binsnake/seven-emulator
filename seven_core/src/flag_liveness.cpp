@@ -9,13 +9,9 @@ namespace seven {
 
 namespace {
 
-// Per-instruction ALU flag read/written sets, hand-verified against seven's own handlers, since
-// iced_x86's rflags_read/rflags_written are stubs in this fork.
-//
-// `written` may only list a bit GUARANTEED written when the handler completes normally, never a
-// conditionally written one -- shift/rotate by CL or imm8 skip every flag write at a masked count of
-// zero, so they are written=none. `read` is safe to overclaim. Anything absent defaults to fully
-// conservative {read=all, written=0}.
+// Per-instruction ALU flag sets, hand-verified against seven's handlers since iced_x86's are stubs
+// here. `written` may only list a bit GUARANTEED written, never a conditional one; `read` is safe to
+// overclaim; anything absent defaults to {read=all, written=0}.
 struct FlagsInfo {
   std::uint64_t read = kAluStatusFlagsMask;
   std::uint64_t written = 0;
@@ -35,10 +31,7 @@ struct FlagsInfo {
   constexpr std::uint64_t kLahfSahfFlags = kFlagSF | kFlagZF | kFlagAF | kFlagPF | kFlagCF;
 
   switch (code) {
-    // ADD, SUB, CMP, AND, OR, XOR, TEST, XADD, CMPXCHG, NEG, MUL, IMUL, POPCNT, TZCNT, LZCNT,
-    // BMI1 (VEX_BLSI/BLSR/BLSMSK/ANDN/BZHI/BEXTR), SHL/SAL/SHR/SAR "_1" forms, POPFQ -- all
-    // unconditionally overwrite every ALU status flag via set_add_flags/set_sub_flags/
-    // set_logic_flags/set_multiply_flags/an equivalent, with no incoming-flag dependency.
+    // All overwrite every ALU status flag unconditionally, with no incoming-flag dependency.
     case Code::ADD_RM8_R8: case Code::ADD_RM16_R16: case Code::ADD_RM32_R32: case Code::ADD_RM64_R64:
     case Code::ADD_R8_RM8: case Code::ADD_R16_RM16: case Code::ADD_R32_RM32: case Code::ADD_R64_RM64:
     case Code::ADD_RM8_IMM8: case Code::ADD_RM8_IMM8_82: case Code::ADD_RM16_IMM16: case Code::ADD_RM32_IMM32:
@@ -115,10 +108,8 @@ struct FlagsInfo {
     case Code::DEC_RM8: case Code::DEC_RM16: case Code::DEC_RM32: case Code::DEC_RM64:
       return {kNone, kIncDecFlags};
 
-    // No flag write at all: NOT; shift/rotate/SHLD/SHRD "_CL"/"_IMM8" forms (count can mask to
-    // zero at runtime, which skips the flag write entirely -- must not be modeled as a write);
-    // DIV/IDIV (undefined-per-spec, and this handler simply never touches them); CRC32; plain
-    // LOOP/JECXZ/JRCXZ (decrement/test a GPR, no flag involvement).
+    // No flag write at all. The CL/imm8 shift forms are here because a count masking to zero skips
+    // the write entirely, so they must not be modelled as writing.
     case Code::NOT_RM8: case Code::NOT_RM16: case Code::NOT_RM32: case Code::NOT_RM64:
     case Code::SHL_RM8_CL: case Code::SHL_RM16_CL: case Code::SHL_RM32_CL: case Code::SHL_RM64_CL:
     case Code::SHL_RM8_IMM8: case Code::SHL_RM16_IMM8: case Code::SHL_RM32_IMM8: case Code::SHL_RM64_IMM8:
@@ -269,22 +260,15 @@ struct FlagsInfo {
 
 }  // namespace
 
-// Whether this decoded instruction can fault. A masked write is only safe if the instruction
-// covering it is guaranteed to run, and a fault partway through the span breaks that -- a fault
-// hook or the caller can observe rflags first, which is routine given guard pages and SEH.
-//
-// Register-only forms have no fallible path here, so this only checks for a memory operand plus the
-// explicit divide-error sources. Checking the decoded instruction rather than the Code is what makes
-// it precise: an RM form only faults on the encodings that actually resolved to memory.
+// Whether this instruction can fault, which keeps liveness conservative across it since a fault
+// means the covering instruction never runs. Taking the decoded instruction rather than the Code is
+// what makes it precise.
 bool can_fault(const iced_x86::Instruction& instr) noexcept {
   const auto op_count = instr.op_count();
   for (std::uint32_t i = 0; i < op_count; ++i) {
-    // Every memory operand kind, not just OpKind::MEMORY. iced gives the implicit rsi/rdi operands
-    // their own kinds (MEMORY_SEG_SI through MEMORY_ESRDI) which are distinct enum values, so a
-    // plain == MEMORY comparison missed the string instructions and MASKMOVDQU/MASKMOVQ entirely
-    // even though addressing guest memory is the whole point of them. The memory kinds sit at the
-    // top of the enum, 15 through 24 with MEMORY last, so one comparison covers all of them and
-    // there is no per-opcode list left to fall behind.
+    // Every memory operand kind, not just OpKind::MEMORY: the implicit rsi/rdi operands have their
+    // own distinct kinds, so == MEMORY missed the string instructions entirely. They sit together at
+    // the top of the enum with MEMORY last, so one comparison covers all of them.
     if (instr.op_kind(i) >= iced_x86::OpKind::MEMORY_SEG_SI) {
       return true;
     }
@@ -294,19 +278,14 @@ bool can_fault(const iced_x86::Instruction& instr) noexcept {
     case iced_x86::Code::DIV_RM32: case iced_x86::Code::DIV_RM64:
     case iced_x86::Code::IDIV_RM8: case iced_x86::Code::IDIV_RM16:
     case iced_x86::Code::IDIV_RM32: case iced_x86::Code::IDIV_RM64:
-    // AAM divides AL by its immediate and raises #DE when that immediate is zero (see aam.cpp),
-    // which makes it the third divide-error source and the only one that was missing here. Its
-    // flags entry claims it writes CF/AF/ZF/SF/PF unconditionally, so liveness happily masked an
-    // earlier instruction's write to those five as covered -- and on `aam 0` the handler returns
-    // before setting any of them, leaving the guest's #DE handler reading the pre-write values.
+    // AAM raises #DE on a zero immediate, making it the third divide-error source. Its flags entry
+    // claims an unconditional write, so liveness masked earlier writes as covered while `aam 0`
+    // returns before setting any of them.
     case iced_x86::Code::AAM_IMM8:
       return true;  // divide error is a property of the VALUE, independent of operand kind
 
-    // CALL/RET push/pop the return address on the stack as an implicit side effect -- the operand
-    // loop above only sees the branch target (BRANCH-kind for direct forms, REGISTER-kind for a
-    // register-indirect call), never the stack access itself, so this needs its own list the same
-    // way DIV/IDIV does. Far-through-memory forms (CALL_M16xx) already have an explicit MEMORY
-    // operand and are caught above; listed here anyway would just be a harmless duplicate.
+    // CALL/RET touch the stack implicitly: the operand loop only sees the branch target, never the
+    // push or pop, so they need their own list.
     case iced_x86::Code::CALL_REL16: case iced_x86::Code::CALL_REL32_32: case iced_x86::Code::CALL_REL32_64:
     case iced_x86::Code::CALL_RM16: case iced_x86::Code::CALL_RM32: case iced_x86::Code::CALL_RM64:
     case iced_x86::Code::CALL_PTR1616: case iced_x86::Code::CALL_PTR1632:
@@ -316,11 +295,9 @@ bool can_fault(const iced_x86::Instruction& instr) noexcept {
     case iced_x86::Code::RETFW_IMM16: case iced_x86::Code::RETFD_IMM16: case iced_x86::Code::RETFQ_IMM16:
       return true;
 
-    // MASKMOVDQU's destination is an implicit ES:[rDI] operand, and the vendored decoder is not
-    // consistent about it: OpCodeHandler_rDI_VX_RX gives the non-VEX form OpKind::MEMORY_SEG_RDI,
-    // which the loop above catches, while OpCodeHandler_VEX_rDI_VX_RX gives the VEX form a plain
-    // REGISTER operand holding RDI. Both handlers write up to 16 bytes of guest memory through
-    // Memory::write, so the VEX one needs saying out loud rather than relying on the decoder.
+    // The decoder is inconsistent about MASKMOVDQU's implicit ES:[rDI] destination: the non-VEX form
+    // gets a memory kind the loop catches, the VEX form gets a plain REGISTER holding RDI. Both
+    // write up to 16 bytes of guest memory.
     case iced_x86::Code::VEX_VMASKMOVDQU_R_DI_XMM_XMM:
       return true;
 
@@ -335,42 +312,33 @@ bool can_fault(const iced_x86::Instruction& instr) noexcept {
     case iced_x86::Code::ENTERW_IMM16_IMM8: case iced_x86::Code::ENTERD_IMM16_IMM8: case iced_x86::Code::ENTERQ_IMM16_IMM8:
     case iced_x86::Code::LEAVEW: case iced_x86::Code::LEAVED: case iced_x86::Code::LEAVEQ:
     case iced_x86::Code::XLAT_M8:
-    // PUSHF/POPF push and pop through rsp with op_count() == 0, so neither the operand loop nor the
-    // PUSH/POP list above ever saw them. Both genuinely fault: handle_code_PUSHFQ writes 8 bytes at
-    // rsp and handle_code_POPFQ reads 8, each returning memory_fault. Leaving them out also made
-    // POPFQ callout-eligible in the JIT, which is how a guest could set rflags.TF in the middle of a
-    // compiled block -- see the mask on the Jcc path's popfq for why that mattered.
+    // PUSHF/POPF touch rsp with op_count() == 0, so neither the operand loop nor the PUSH/POP list
+    // saw them. Leaving them out also made POPFQ callout-eligible, which let a guest set rflags.TF
+    // mid-block.
     case iced_x86::Code::PUSHFW: case iced_x86::Code::PUSHFD: case iced_x86::Code::PUSHFQ:
     case iced_x86::Code::POPFW: case iced_x86::Code::POPFD: case iced_x86::Code::POPFQ:
       return true;
 
-    // MOV to/from a control or debug register operates on two REGISTER-kind operands -- no
-    // OpKind::MEMORY for the loop above to catch -- but both directions can fault: CPL>0 raises
-    // #GP, and (for CR) a reserved register encoding or (for DR) DR4/DR5 with CR4.DE set raises
-    // #UD. Same implicit-fault gap the CALL/RET/PUSH/POP cases above exist to close.
+    // Two REGISTER-kind operands, so the loop cannot see them, but both directions fault: #GP at
+    // CPL>0, and #UD for a reserved CR or for DR4/DR5 with CR4.DE set.
     case iced_x86::Code::MOV_R32_CR: case iced_x86::Code::MOV_R64_CR:
     case iced_x86::Code::MOV_CR_R32: case iced_x86::Code::MOV_CR_R64:
     case iced_x86::Code::MOV_R32_DR: case iced_x86::Code::MOV_R64_DR:
     case iced_x86::Code::MOV_DR_R32: case iced_x86::Code::MOV_DR_R64:
       return true;
 
-    // Same implicit-fault gap as the CR/DR moves above -- these read their operands from fixed
-    // registers (ECX/EAX/EDX) or state, never an explicit OpKind::MEMORY operand, but now #GP at
-    // CPL>0 (see clts.cpp/swapgs.cpp/wrmsr.cpp/rdmsr.cpp/xsetbv.cpp).
+    // Same gap: fixed-register operands with no memory kind, but #GP at CPL>0.
     case iced_x86::Code::CLTS: case iced_x86::Code::SWAPGS:
     case iced_x86::Code::WRMSR: case iced_x86::Code::WRMSRNS: case iced_x86::Code::WRMSRLIST:
     case iced_x86::Code::RDMSR: case iced_x86::Code::RDMSRLIST:
     case iced_x86::Code::XSETBV:
     case iced_x86::Code::CLI: case iced_x86::Code::STI:
     case iced_x86::Code::WRFSBASE_R64: case iced_x86::Code::WRGSBASE_R64:
-    // The kernel's return-to-user forms, now CPL0-only for the same reason. SYSRET is the sharp
-    // one of the group: it writes the whole of rflags, so liveness would happily treat a flag
-    // write before it as covered, and a #GP at CPL>0 means that cover never happens.
+    // CPL0-only for the same reason. SYSRET is the sharp one: it writes all of rflags, so liveness
+    // treats earlier writes as covered by a cover that a #GP means never happens.
     case iced_x86::Code::SYSRETD: case iced_x86::Code::SYSRETQ:
     case iced_x86::Code::SYSEXITD: case iced_x86::Code::SYSEXITQ:
-    // The three cache/halt instructions that kept their unconditional bodies the longest. Their
-    // effects are not modelled, so the CPL check is the only thing they do, which makes it the
-    // only reason they can fault.
+    // Their effects are not modelled, so the CPL check is both all they do and their only fault.
     case iced_x86::Code::INVD: case iced_x86::Code::WBINVD: case iced_x86::Code::HLT:
       return true;
     default:
@@ -378,22 +346,16 @@ bool can_fault(const iced_x86::Instruction& instr) noexcept {
   }
 }
 
-// Whether a fault can strike AFTER this instruction wrote its flags, which is what makes that write
-// observable despite something later overwriting it. Handlers set flags before writing the result,
-// so this is only true when the destination is memory -- a fault on a memory SOURCE never reaches
-// the flag computation, which matters since register-destination is the common shape.
-//
-// Operand 0 is the destination for every flag-writing memory form. No string instruction both writes
-// memory and writes flags, so none need listing.
+// Whether a fault can strike AFTER the flags were written, making that write observable despite
+// something later overwriting it. Handlers set flags before the result, so this is only true for a
+// memory destination; a fault on a memory SOURCE never reaches the flag computation.
 [[nodiscard]] bool faults_after_writing_flags(const iced_x86::Instruction& instr) noexcept {
   return instr.op_count() > 0 && instr.op_kind(0) >= iced_x86::OpKind::MEMORY_SEG_SI;
 }
 
-// The other reason an instruction's own flag write has to stay live: a rep-prefixed CMPS or SCAS
-// tests the ZF its own compare just wrote to decide whether to run another iteration. The flags
-// table already declares that ZF read, but `read` is folded into the live set only after this
-// instruction's mask has been computed, so it protects the instruction BEFORE it and not itself.
-// CMPS happens to be covered by the memory-destination test above; SCAS writes AL, so it was not.
+// The other reason a write must stay live: rep CMPS/SCAS test the ZF their own compare wrote. The
+// table declares that read, but `read` folds into the live set only after this instruction's mask is
+// computed, so it protects the one before it. CMPS is covered above; SCAS writes AL, so it was not.
 [[nodiscard]] bool rereads_own_flag_write(iced_x86::Code code) noexcept {
   using Code = iced_x86::Code;
   switch (code) {
@@ -408,22 +370,16 @@ bool can_fault(const iced_x86::Instruction& instr) noexcept {
 }
 
 void compute_flag_liveness(std::span<FlagLivenessInstr> insts) noexcept {
-  // Live-out of the block is conservatively "every ALU status flag" -- Phase 1 does no
-  // cross-block liveness, so whatever comes after this block
-  // (another block, the plain interpreter, a hook) might read any of them.
+  // Live-out is every flag: there is no cross-block liveness, so whatever runs next might read any.
   std::uint64_t live = kAluStatusFlagsMask;
   for (auto it = insts.rbegin(); it != insts.rend(); ++it) {
     const auto info = flags_info_for_code(it->instr->code());
     const auto written = info.written & kAluStatusFlagsMask;
-    // A fault-capable instruction is treated as if it reads every flag, purely for this
-    // computation -- not because it actually does, but because nothing after it in the block is
-    // guaranteed to run. That forces `live` back to "everything live" at this point, which
-    // prevents any earlier write from being masked across it. See can_fault()'s comment.
+    // A fault-capable instruction counts as reading every flag, not because it does but because
+    // nothing after it is guaranteed to run. That keeps earlier writes from being masked across it.
     const auto read = (info.read | (can_fault(*it->instr) ? kAluStatusFlagsMask : 0)) & kAluStatusFlagsMask;
-    // The line above keeps an EARLIER write from being masked across a possible fault. This one
-    // covers the faulting instruction's own write, which needs the same protection and was not
-    // getting it: the boost went into `live` for the next iteration only, after the current
-    // instruction's mask had already been computed.
+    // The line above protects earlier writes; this one protects the faulting instruction's own,
+    // which the boost missed by only reaching `live` on the next iteration.
     const auto own = (faults_after_writing_flags(*it->instr) ||
                       rereads_own_flag_write(it->instr->code()))
                          ? kAluStatusFlagsMask
